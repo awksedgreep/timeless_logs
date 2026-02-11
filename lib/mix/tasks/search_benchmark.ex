@@ -114,11 +114,13 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
     Exqlite.Sqlite3.execute(db, """
     CREATE TABLE IF NOT EXISTS blocks (
       block_id INTEGER PRIMARY KEY,
-      file_path TEXT NOT NULL,
+      file_path TEXT,
       byte_size INTEGER NOT NULL,
       entry_count INTEGER NOT NULL,
       ts_min INTEGER NOT NULL,
       ts_max INTEGER NOT NULL,
+      data BLOB,
+      format TEXT NOT NULL DEFAULT 'zstd',
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
     """)
@@ -166,9 +168,11 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
 
     {:ok, block_stmt} =
       Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
       """)
+
+    format_str = Atom.to_string(Map.get(meta, :format, :raw))
 
     Exqlite.Sqlite3.bind(block_stmt, [
       meta.block_id,
@@ -176,7 +180,8 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       meta.byte_size,
       meta.entry_count,
       meta.ts_min,
-      meta.ts_max
+      meta.ts_max,
+      format_str
     ])
 
     Exqlite.Sqlite3.step(db, block_stmt)

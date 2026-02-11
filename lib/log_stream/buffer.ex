@@ -26,7 +26,7 @@ defmodule LogStream.Buffer do
 
     :logger.add_handler(LogStream.Handler.handler_id(), LogStream.Handler, %{level: :all})
 
-    {:ok, %{buffer: [], data_dir: data_dir, flush_interval: interval}}
+    {:ok, %{buffer: [], buffer_size: 0, data_dir: data_dir, flush_interval: interval}}
   end
 
   @impl true
@@ -40,19 +40,20 @@ defmodule LogStream.Buffer do
   def handle_cast({:log, entry}, state) do
     broadcast_to_subscribers(entry)
     buffer = [entry | state.buffer]
+    size = state.buffer_size + 1
 
-    if length(buffer) >= LogStream.Config.max_buffer_size() do
+    if size >= LogStream.Config.max_buffer_size() do
       do_flush(buffer, state.data_dir)
-      {:noreply, %{state | buffer: []}}
+      {:noreply, %{state | buffer: [], buffer_size: 0}}
     else
-      {:noreply, %{state | buffer: buffer}}
+      {:noreply, %{state | buffer: buffer, buffer_size: size}}
     end
   end
 
   @impl true
   def handle_call(:flush, _from, state) do
     do_flush(state.buffer, state.data_dir)
-    {:reply, :ok, %{state | buffer: []}}
+    {:reply, :ok, %{state | buffer: [], buffer_size: 0}}
   end
 
   @impl true
@@ -62,7 +63,7 @@ defmodule LogStream.Buffer do
     end
 
     schedule_flush(state.flush_interval)
-    {:noreply, %{state | buffer: []}}
+    {:noreply, %{state | buffer: [], buffer_size: 0}}
   end
 
   defp do_flush([], _data_dir), do: :ok

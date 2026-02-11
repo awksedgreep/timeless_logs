@@ -18,7 +18,12 @@ defmodule LogStream.Index do
 
   @spec query(keyword()) :: {:ok, LogStream.Result.t()}
   def query(filters) do
-    GenServer.call(__MODULE__, {:query, filters}, LogStream.Config.query_timeout())
+    # Phase 1: GenServer does the cheap SQLite lookup only
+    {block_ids, storage, pagination, search_filters} =
+      GenServer.call(__MODULE__, {:query_plan, filters}, LogStream.Config.query_timeout())
+
+    # Phase 2: Parallel decompression + filtering in the caller's process
+    do_query_parallel(block_ids, storage, pagination, search_filters)
   end
 
   @spec delete_blocks_before(integer()) :: non_neg_integer()
@@ -98,9 +103,12 @@ defmodule LogStream.Index do
   end
 
   @impl true
-  def handle_call({:query, filters}, _from, state) do
-    result = do_query(state.db, state.storage, filters)
-    {:reply, result, state}
+  def handle_call({:query_plan, filters}, _from, state) do
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :desc)
+    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
+    {:reply, {block_ids, state.storage, pagination, search_filters}, state}
   end
 
   @impl true
@@ -335,43 +343,70 @@ defmodule LogStream.Index do
     |> Enum.uniq()
   end
 
-  defp do_query(db, storage, filters) do
+  defp do_query_parallel(block_ids, storage, pagination, search_filters) do
     start_time = System.monotonic_time()
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
 
     limit = Keyword.get(pagination, :limit, @default_limit)
     offset = Keyword.get(pagination, :offset, @default_offset)
     order = Keyword.get(pagination, :order, :desc)
-
-    block_ids = find_matching_blocks(db, term_filters, time_filters, order)
     blocks_read = length(block_ids)
 
+    # Parallel block decompression + filtering across cores
     all_matching =
-      Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
-        format_atom = to_format_atom(format)
+      if storage == :disk and blocks_read > 1 do
+        block_ids
+        |> Task.async_stream(
+          fn {_block_id, file_path, format} ->
+            format_atom = to_format_atom(format)
 
-        read_result =
-          case storage do
-            :disk -> LogStream.Writer.read_block(file_path, format_atom)
-            :memory -> read_block_from_db(db, block_id)
+            case LogStream.Writer.read_block(file_path, format_atom) do
+              {:ok, entries} ->
+                entries
+                |> LogStream.Filter.filter(search_filters)
+                |> Enum.map(&LogStream.Entry.from_map/1)
+
+              {:error, reason} ->
+                LogStream.Telemetry.event(
+                  [:log_stream, :block, :error],
+                  %{},
+                  %{file_path: file_path, reason: reason}
+                )
+
+                []
+            end
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false
+        )
+        |> Enum.flat_map(fn {:ok, entries} -> entries end)
+      else
+        # Memory storage or single block — sequential (memory blocks need GenServer)
+        Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
+          format_atom = to_format_atom(format)
+
+          read_result =
+            case storage do
+              :disk -> LogStream.Writer.read_block(file_path, format_atom)
+              :memory -> read_block_data(block_id)
+            end
+
+          case read_result do
+            {:ok, entries} ->
+              entries
+              |> LogStream.Filter.filter(search_filters)
+              |> Enum.map(&LogStream.Entry.from_map/1)
+
+            {:error, reason} ->
+              LogStream.Telemetry.event(
+                [:log_stream, :block, :error],
+                %{},
+                %{file_path: file_path, reason: reason}
+              )
+
+              []
           end
-
-        case read_result do
-          {:ok, entries} ->
-            filtered = LogStream.Filter.filter(entries, search_filters)
-            Enum.map(filtered, &LogStream.Entry.from_map/1)
-
-          {:error, reason} ->
-            LogStream.Telemetry.event(
-              [:log_stream, :block, :error],
-              %{},
-              %{file_path: file_path, reason: reason}
-            )
-
-            []
-        end
-      end)
+        end)
+      end
 
     sorted =
       case order do
@@ -386,7 +421,7 @@ defmodule LogStream.Index do
     LogStream.Telemetry.event(
       [:log_stream, :query, :stop],
       %{duration: duration, total: total, blocks_read: blocks_read},
-      %{filters: filters}
+      %{filters: search_filters}
     )
 
     {:ok,
