@@ -4,7 +4,7 @@ defmodule LogStream.MixProject do
   def project do
     [
       app: :log_stream,
-      version: "0.5.0",
+      version: "0.5.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
