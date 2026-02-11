@@ -46,7 +46,11 @@ defmodule LogStream.Index do
     GenServer.call(__MODULE__, {:read_block_data, block_id}, LogStream.Config.query_timeout())
   end
 
-  @spec raw_block_stats() :: %{entry_count: integer(), block_count: integer(), oldest_created_at: integer() | nil}
+  @spec raw_block_stats() :: %{
+          entry_count: integer(),
+          block_count: integer(),
+          oldest_created_at: integer() | nil
+        }
   def raw_block_stats do
     GenServer.call(__MODULE__, :raw_block_stats, LogStream.Config.query_timeout())
   end
@@ -209,7 +213,11 @@ defmodule LogStream.Index do
   defp collect_format_stats(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [format, count, bytes, entries]} ->
-        Map.put(collect_format_stats(db, stmt), format, %{blocks: count, bytes: bytes, entries: entries})
+        Map.put(collect_format_stats(db, stmt), format, %{
+          blocks: count,
+          bytes: bytes,
+          entries: entries
+        })
 
       :done ->
         %{}
@@ -256,7 +264,10 @@ defmodule LogStream.Index do
     Exqlite.Sqlite3.release(db, stmt)
 
     unless "format" in columns do
-      Exqlite.Sqlite3.execute(db, "ALTER TABLE blocks ADD COLUMN format TEXT NOT NULL DEFAULT 'zstd'")
+      Exqlite.Sqlite3.execute(
+        db,
+        "ALTER TABLE blocks ADD COLUMN format TEXT NOT NULL DEFAULT 'zstd'"
+      )
     end
   end
 
