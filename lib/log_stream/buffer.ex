@@ -3,14 +3,17 @@ defmodule LogStream.Buffer do
 
   use GenServer
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @spec log(map()) :: :ok
   def log(entry) do
     GenServer.cast(__MODULE__, {:log, entry})
   end
 
+  @spec flush() :: :ok
   def flush do
     GenServer.call(__MODULE__, :flush, LogStream.Config.query_timeout())
   end
@@ -35,6 +38,7 @@ defmodule LogStream.Buffer do
 
   @impl true
   def handle_cast({:log, entry}, state) do
+    broadcast_to_subscribers(entry)
     buffer = [entry | state.buffer]
 
     if length(buffer) >= LogStream.Config.max_buffer_size() do
@@ -67,14 +71,20 @@ defmodule LogStream.Buffer do
     entries = Enum.reverse(buffer)
     start_time = System.monotonic_time()
 
-    case LogStream.Writer.write_block(entries, data_dir) do
+    write_target = if LogStream.Config.storage() == :memory, do: :memory, else: data_dir
+
+    case LogStream.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
         LogStream.Index.index_block(block_meta, entries)
         duration = System.monotonic_time() - start_time
 
         LogStream.Telemetry.event(
           [:log_stream, :flush, :stop],
-          %{duration: duration, entry_count: block_meta.entry_count, byte_size: block_meta.byte_size},
+          %{
+            duration: duration,
+            entry_count: block_meta.entry_count,
+            byte_size: block_meta.byte_size
+          },
           %{block_id: block_meta.block_id}
         )
 
@@ -85,5 +95,34 @@ defmodule LogStream.Buffer do
 
   defp schedule_flush(interval) do
     Process.send_after(self(), :flush_timer, interval)
+  end
+
+  defp broadcast_to_subscribers(entry) do
+    entry_struct = LogStream.Entry.from_map(entry)
+
+    Registry.dispatch(LogStream.Registry, :log_entries, fn subscribers ->
+      for {pid, opts} <- subscribers do
+        if matches_subscription?(entry, opts) do
+          send(pid, {:log_stream, :entry, entry_struct})
+        end
+      end
+    end)
+  end
+
+  defp matches_subscription?(_entry, []), do: true
+
+  defp matches_subscription?(entry, opts) do
+    Enum.all?(opts, fn
+      {:level, level} ->
+        entry.level == level
+
+      {:metadata, map} ->
+        Enum.all?(map, fn {k, v} ->
+          Map.get(entry.metadata, to_string(k)) == to_string(v)
+        end)
+
+      _ ->
+        true
+    end)
   end
 end

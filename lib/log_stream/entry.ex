@@ -12,6 +12,7 @@ defmodule LogStream.Entry do
           metadata: %{String.t() => String.t()}
         }
 
+  @spec from_map(map()) :: t()
   def from_map(%{timestamp: ts, level: level, message: message, metadata: metadata}) do
     %__MODULE__{
       timestamp: ts,

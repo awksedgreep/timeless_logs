@@ -5,10 +5,12 @@ defmodule LogStream.Retention do
 
   require Logger
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @spec run_now() :: :noop | {:ok, non_neg_integer()}
   def run_now do
     GenServer.call(__MODULE__, :run_now, 60_000)
   end

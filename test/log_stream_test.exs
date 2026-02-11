@@ -69,21 +69,22 @@ defmodule LogStreamTest do
       assert length(results) == 2
     end
 
-    test "blocks are compressed with zstd" do
-      for i <- 1..100 do
+    test "blocks are initially written as raw" do
+      for i <- 1..10 do
         Logger.info("log entry number #{i}", iteration: "#{i}")
       end
 
       LogStream.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
-      block_files = Path.wildcard(Path.join(blocks_dir, "*.zst"))
-      assert length(block_files) >= 1
+      raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
+      assert length(raw_files) >= 1
 
-      file = hd(block_files)
-      compressed = File.read!(file)
-      raw = :erlang.term_to_binary(for i <- 1..100, do: %{message: "log entry number #{i}"})
-      assert byte_size(compressed) < byte_size(raw)
+      # Raw blocks use term_to_binary without zstd compression
+      file = hd(raw_files)
+      data = File.read!(file)
+      assert {:ok, entries} = LogStream.Writer.decompress_block(data, :raw)
+      assert length(entries) >= 1
     end
 
     test "time range filtering" do

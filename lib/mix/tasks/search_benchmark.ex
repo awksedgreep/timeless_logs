@@ -28,46 +28,31 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
     IO.puts("Running search benchmarks (5 iterations each)...\n")
 
     queries = [
-      {"level=error (indexed, ~2% of logs)",
-       [level: :error, limit: 100]},
-
-      {"level=error, limit 10 (paginated)",
-       [level: :error, limit: 10]},
-
+      {"level=error (indexed, ~2% of logs)", [level: :error, limit: 100]},
+      {"level=error, limit 10 (paginated)", [level: :error, limit: 10]},
       {"level=error + metadata service=api (indexed intersection)",
        [level: :error, metadata: %{module: "Phoenix.Logger"}, limit: 100]},
-
-      {"message substring 'timeout' (scan, no index)",
-       [message: "timeout", limit: 100]},
-
-      {"message 'Healthcheck' (common, scan)",
-       [message: "Healthcheck", limit: 100]},
-
+      {"message substring 'timeout' (scan, no index)", [message: "timeout", limit: 100]},
+      {"message 'Healthcheck' (common, scan)", [message: "Healthcheck", limit: 100]},
       {"last 1 hour (time range, ~0.6% of blocks)",
        [since: System.system_time(:second) - 3600, limit: 100]},
-
       {"last 1 hour + level=error (time + index)",
        [since: System.system_time(:second) - 3600, level: :error, limit: 100]},
-
       {"last 24 hours (time range, ~14% of blocks)",
        [since: System.system_time(:second) - 86400, limit: 100]},
-
       {"needle in haystack: specific request_id",
        [metadata: %{request_id: pick_request_id(entries)}, limit: 10]},
-
-      {"all logs, page 1 (no filters, worst case)",
-       [limit: 100]},
-
-      {"all logs, page 50 (deep pagination)",
-       [limit: 100, offset: 4900]}
+      {"all logs, page 1 (no filters, worst case)", [limit: 100]},
+      {"all logs, page 50 (deep pagination)", [limit: 100, offset: 4900]}
     ]
 
     results =
       Enum.map(queries, fn {label, filters} ->
-        times = for _ <- 1..5 do
-          {us, {:ok, result}} = :timer.tc(fn -> LogStream.Index.query(filters) end)
-          {us, result}
-        end
+        times =
+          for _ <- 1..5 do
+            {us, {:ok, result}} = :timer.tc(fn -> LogStream.Index.query(filters) end)
+            {us, result}
+          end
 
         latencies = Enum.map(times, fn {us, _} -> us end)
         {_, sample_result} = hd(times)
@@ -78,11 +63,14 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
         {label, median, min_l, max_l, sample_result.total}
       end)
 
-    IO.puts(String.pad_trailing("Query", 55) <>
-      String.pad_leading("Median", 10) <>
-      String.pad_leading("Min", 10) <>
-      String.pad_leading("Max", 10) <>
-      String.pad_leading("Matches", 10))
+    IO.puts(
+      String.pad_trailing("Query", 55) <>
+        String.pad_leading("Median", 10) <>
+        String.pad_leading("Min", 10) <>
+        String.pad_leading("Max", 10) <>
+        String.pad_leading("Matches", 10)
+    )
+
     IO.puts(String.duplicate("-", 95))
 
     for {label, median, min_l, max_l, total} <- results do
@@ -105,7 +93,11 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
     IO.puts("Blocks on disk:   #{fmt_bytes(dir_size(blocks_dir))}")
     IO.puts("SQLite index:     #{fmt_bytes(index_size)}")
     IO.puts("Total disk:       #{fmt_bytes(total_disk)}")
-    IO.puts("Index overhead:   #{:erlang.float_to_binary(index_size / max(total_disk, 1) * 100, decimals: 1)}%")
+
+    IO.puts(
+      "Index overhead:   #{:erlang.float_to_binary(index_size / max(total_disk, 1) * 100, decimals: 1)}%"
+    )
+
     IO.puts("Blocks:           #{total_blocks}")
     IO.puts("Entries:          #{fmt_number(entry_count)}")
 
@@ -151,6 +143,7 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
           {:ok, meta} ->
             index_block_direct(db, meta, chunk)
             count + 1
+
           _ ->
             count
         end
@@ -178,9 +171,14 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       """)
 
     Exqlite.Sqlite3.bind(block_stmt, [
-      meta.block_id, meta.file_path, meta.byte_size,
-      meta.entry_count, meta.ts_min, meta.ts_max
+      meta.block_id,
+      meta.file_path,
+      meta.byte_size,
+      meta.entry_count,
+      meta.ts_min,
+      meta.ts_max
     ])
+
     Exqlite.Sqlite3.step(db, block_stmt)
     Exqlite.Sqlite3.release(db, block_stmt)
 
@@ -194,7 +192,10 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       |> Enum.uniq()
 
     {:ok, term_stmt} =
-      Exqlite.Sqlite3.prepare(db, "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)")
+      Exqlite.Sqlite3.prepare(
+        db,
+        "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES (?1, ?2)"
+      )
 
     for term <- terms do
       Exqlite.Sqlite3.bind(term_stmt, [term, meta.block_id])
@@ -212,7 +213,10 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
     |> Enum.find_value(fn entry ->
       Map.get(entry.metadata, "request_id")
     end)
-    |> then(fn nil -> "nonexistent"; id -> id end)
+    |> then(fn
+      nil -> "nonexistent"
+      id -> id
+    end)
   end
 
   defp dir_size(path) do
@@ -253,17 +257,53 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       user_id = :rand.uniform(10_000)
 
       entries = [
-        %{timestamp: ts, level: :info, message: "#{method} #{path}",
-          metadata: %{"request_id" => req_id, "module" => "Phoenix.Endpoint", "user_id" => "#{user_id}"}},
-        %{timestamp: ts, level: :debug, message: ecto_query(path),
-          metadata: %{"request_id" => req_id, "module" => "Ecto.Adapters.SQL", "source" => random_table(), "query_time" => "#{:rand.uniform(50)}ms"}},
-        %{timestamp: ts, level: :info, message: "Sent #{status} in #{duration}ms",
-          metadata: %{"request_id" => req_id, "module" => "Phoenix.Logger", "status" => "#{status}", "duration" => "#{duration}"}}
+        %{
+          timestamp: ts,
+          level: :info,
+          message: "#{method} #{path}",
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Phoenix.Endpoint",
+            "user_id" => "#{user_id}"
+          }
+        },
+        %{
+          timestamp: ts,
+          level: :debug,
+          message: ecto_query(path),
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Ecto.Adapters.SQL",
+            "source" => random_table(),
+            "query_time" => "#{:rand.uniform(50)}ms"
+          }
+        },
+        %{
+          timestamp: ts,
+          level: :info,
+          message: "Sent #{status} in #{duration}ms",
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Phoenix.Logger",
+            "status" => "#{status}",
+            "duration" => "#{duration}"
+          }
+        }
       ]
 
       if :rand.uniform(3) == 1 do
-        extra = %{timestamp: ts, level: :debug, message: ecto_query(path),
-          metadata: %{"request_id" => req_id, "module" => "Ecto.Adapters.SQL", "source" => random_table(), "query_time" => "#{:rand.uniform(20)}ms"}}
+        extra = %{
+          timestamp: ts,
+          level: :debug,
+          message: ecto_query(path),
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Ecto.Adapters.SQL",
+            "source" => random_table(),
+            "query_time" => "#{:rand.uniform(20)}ms"
+          }
+        }
+
         [extra | entries]
       else
         entries
@@ -273,71 +313,137 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
   end
 
   defp maybe_add_error(entries, ts, req_id, status) when status >= 500 do
-    error = %{timestamp: ts, level: :error,
-      message: "Internal server error: #{Enum.random(["timeout", "connection_refused", "nxdomain", "pool_timeout", "deadlock_detected"])}",
-      metadata: %{"request_id" => req_id, "module" => "Phoenix.Logger",
-        "crash_reason" => Enum.random([
-          "%DBConnection.ConnectionError{message: \"connection not available\"}",
-          "%Postgrex.Error{postgres: %{code: :deadlock_detected}}",
-          "%RuntimeError{message: \"unexpected nil\"}"
-        ])}}
+    error = %{
+      timestamp: ts,
+      level: :error,
+      message:
+        "Internal server error: #{Enum.random(["timeout", "connection_refused", "nxdomain", "pool_timeout", "deadlock_detected"])}",
+      metadata: %{
+        "request_id" => req_id,
+        "module" => "Phoenix.Logger",
+        "crash_reason" =>
+          Enum.random([
+            "%DBConnection.ConnectionError{message: \"connection not available\"}",
+            "%Postgrex.Error{postgres: %{code: :deadlock_detected}}",
+            "%RuntimeError{message: \"unexpected nil\"}"
+          ])
+      }
+    }
+
     [error | entries]
   end
+
   defp maybe_add_error(entries, _ts, _req_id, _status), do: entries
 
   defp background_logs(ts, minute) do
     logs = [
-      %{timestamp: ts + 45, level: :debug, message: "Healthcheck OK",
-        metadata: %{"module" => "MyApp.Health", "memory_mb" => "#{256 + :rand.uniform(512)}", "process_count" => "#{200 + :rand.uniform(100)}"}}
+      %{
+        timestamp: ts + 45,
+        level: :debug,
+        message: "Healthcheck OK",
+        metadata: %{
+          "module" => "MyApp.Health",
+          "memory_mb" => "#{256 + :rand.uniform(512)}",
+          "process_count" => "#{200 + :rand.uniform(100)}"
+        }
+      }
     ]
 
-    logs = if rem(minute, 5) == 0 do
-      [%{timestamp: ts + 30, level: :info,
-        message: "Running scheduled job: #{Enum.random(~w(cleanup_sessions refresh_cache sync_data send_digests update_stats))}",
-        metadata: %{"module" => "MyApp.Scheduler", "job_id" => random_hex(8)}} | logs]
-    else
-      logs
-    end
+    logs =
+      if rem(minute, 5) == 0 do
+        [
+          %{
+            timestamp: ts + 30,
+            level: :info,
+            message:
+              "Running scheduled job: #{Enum.random(~w(cleanup_sessions refresh_cache sync_data send_digests update_stats))}",
+            metadata: %{"module" => "MyApp.Scheduler", "job_id" => random_hex(8)}
+          }
+          | logs
+        ]
+      else
+        logs
+      end
 
     if :rand.uniform(30) == 1 do
-      [%{timestamp: ts + :rand.uniform(59), level: :warning,
-        message: Enum.random(["Connection pool checkout timeout after 5000ms", "Slow query detected (>100ms)",
-          "Rate limit approaching for API key", "Certificate expiring in 7 days", "Memory usage above 80% threshold"]),
-        metadata: %{"module" => Enum.random(~w(DBConnection Ecto.Adapters.SQL MyApp.RateLimiter MyApp.Monitor))}} | logs]
+      [
+        %{
+          timestamp: ts + :rand.uniform(59),
+          level: :warning,
+          message:
+            Enum.random([
+              "Connection pool checkout timeout after 5000ms",
+              "Slow query detected (>100ms)",
+              "Rate limit approaching for API key",
+              "Certificate expiring in 7 days",
+              "Memory usage above 80% threshold"
+            ]),
+          metadata: %{
+            "module" =>
+              Enum.random(~w(DBConnection Ecto.Adapters.SQL MyApp.RateLimiter MyApp.Monitor))
+          }
+        }
+        | logs
+      ]
     else
       logs
     end
   end
 
   defp random_path do
-    Enum.random(["/api/v1/users", "/api/v1/users/#{:rand.uniform(10000)}", "/api/v1/posts",
-      "/api/v1/posts/#{:rand.uniform(50000)}", "/api/v1/posts/#{:rand.uniform(50000)}/comments",
-      "/api/v1/sessions", "/api/v1/notifications", "/api/v1/search?q=#{Enum.random(~w(elixir phoenix search))}",
-      "/dashboard", "/dashboard/metrics", "/health", "/live/updates", "/uploads/#{random_hex(8)}"])
+    Enum.random([
+      "/api/v1/users",
+      "/api/v1/users/#{:rand.uniform(10000)}",
+      "/api/v1/posts",
+      "/api/v1/posts/#{:rand.uniform(50000)}",
+      "/api/v1/posts/#{:rand.uniform(50000)}/comments",
+      "/api/v1/sessions",
+      "/api/v1/notifications",
+      "/api/v1/search?q=#{Enum.random(~w(elixir phoenix search))}",
+      "/dashboard",
+      "/dashboard/metrics",
+      "/health",
+      "/live/updates",
+      "/uploads/#{random_hex(8)}"
+    ])
   end
 
   defp random_status do
     case :rand.uniform(100) do
-      n when n <= 70 -> 200; n when n <= 80 -> 201; n when n <= 85 -> 204
-      n when n <= 88 -> 301; n when n <= 92 -> 304; n when n <= 95 -> 400
-      n when n <= 97 -> 404; n when n <= 98 -> 422; n when n <= 99 -> 500; _ -> 503
+      n when n <= 70 -> 200
+      n when n <= 80 -> 201
+      n when n <= 85 -> 204
+      n when n <= 88 -> 301
+      n when n <= 92 -> 304
+      n when n <= 95 -> 400
+      n when n <= 97 -> 404
+      n when n <= 98 -> 422
+      n when n <= 99 -> 500
+      _ -> 503
     end
   end
 
   defp random_duration do
     case :rand.uniform(100) do
-      n when n <= 60 -> 1 + :rand.uniform(20); n when n <= 85 -> 20 + :rand.uniform(80)
-      n when n <= 95 -> 100 + :rand.uniform(400); _ -> 500 + :rand.uniform(2000)
+      n when n <= 60 -> 1 + :rand.uniform(20)
+      n when n <= 85 -> 20 + :rand.uniform(80)
+      n when n <= 95 -> 100 + :rand.uniform(400)
+      _ -> 500 + :rand.uniform(2000)
     end
   end
 
   defp ecto_query(path) do
-    table = cond do
-      String.contains?(path, "users") -> "users"; String.contains?(path, "posts") -> "posts"
-      String.contains?(path, "comments") -> "comments"; String.contains?(path, "sessions") -> "sessions"
-      true -> "records"
-    end
+    table =
+      cond do
+        String.contains?(path, "users") -> "users"
+        String.contains?(path, "posts") -> "posts"
+        String.contains?(path, "comments") -> "comments"
+        String.contains?(path, "sessions") -> "sessions"
+        true -> "records"
+      end
+
     a = String.first(table)
+
     Enum.random([
       ~s|SELECT #{a}0."id", #{a}0."name" FROM "#{table}" AS #{a}0 WHERE (#{a}0."id" = $1) [#{:rand.uniform(10000)}]|,
       ~s|SELECT #{a}0."id" FROM "#{table}" AS #{a}0 WHERE (#{a}0."active" = $1) LIMIT $2 [true, 20]|,
@@ -350,10 +456,15 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
   defp random_hex(n), do: :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
 
   defp fmt_bytes(bytes) when bytes < 1024, do: "#{bytes} B"
-  defp fmt_bytes(bytes) when bytes < 1024 * 1024, do: "#{:erlang.float_to_binary(bytes / 1024, decimals: 1)} KB"
+
+  defp fmt_bytes(bytes) when bytes < 1024 * 1024,
+    do: "#{:erlang.float_to_binary(bytes / 1024, decimals: 1)} KB"
+
   defp fmt_bytes(bytes), do: "#{:erlang.float_to_binary(bytes / 1024 / 1024, decimals: 1)} MB"
 
-  defp fmt_number(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+  defp fmt_number(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_number(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_number(n), do: "#{n}"
 

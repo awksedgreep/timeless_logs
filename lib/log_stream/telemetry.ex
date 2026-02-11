@@ -22,6 +22,7 @@ defmodule LogStream.Telemetry do
   """
 
   @doc false
+  @spec span([atom()], map(), (-> {map(), map()})) :: {map(), map()}
   def span(event_prefix, meta, fun) do
     start_time = System.monotonic_time()
     result = fun.()
@@ -38,6 +39,7 @@ defmodule LogStream.Telemetry do
   end
 
   @doc false
+  @spec event([atom()], map(), map()) :: :ok
   def event(event_name, measurements, metadata) do
     :telemetry.execute(event_name, measurements, metadata)
   end

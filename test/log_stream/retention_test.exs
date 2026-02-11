@@ -102,7 +102,7 @@ defmodule LogStream.RetentionTest do
       LogStream.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
-      block_files_before = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      block_files_before = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files_before) == 1
 
       Application.put_env(:log_stream, :retention_max_age, 0)
@@ -110,7 +110,7 @@ defmodule LogStream.RetentionTest do
 
       LogStream.Retention.run_now()
 
-      block_files_after = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      block_files_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files_after) == 0
     end
   end

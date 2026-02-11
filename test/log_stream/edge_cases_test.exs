@@ -88,7 +88,7 @@ defmodule LogStream.EdgeCasesTest do
       {:ok, %LogStream.Result{total: 3}} = LogStream.query([])
 
       blocks_dir = Path.join(@data_dir, "blocks")
-      block_files = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      block_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files) == 3
     end
   end
@@ -108,7 +108,7 @@ defmodule LogStream.EdgeCasesTest do
 
       # There should be blocks on disk without calling flush
       blocks_dir = Path.join(@data_dir, "blocks")
-      block_files = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      block_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files) >= 1
     end
   end
@@ -156,12 +156,13 @@ defmodule LogStream.EdgeCasesTest do
 
   describe "entry struct" do
     test "from_map creates proper Entry struct" do
-      entry = LogStream.Entry.from_map(%{
-        timestamp: 12345,
-        level: :warning,
-        message: "test msg",
-        metadata: %{"key" => "val"}
-      })
+      entry =
+        LogStream.Entry.from_map(%{
+          timestamp: 12345,
+          level: :warning,
+          message: "test msg",
+          metadata: %{"key" => "val"}
+        })
 
       assert %LogStream.Entry{} = entry
       assert entry.timestamp == 12345
@@ -181,7 +182,7 @@ defmodule LogStream.EdgeCasesTest do
 
       # Corrupt the first block
       blocks_dir = Path.join(@data_dir, "blocks")
-      [first_block | _] = Path.wildcard(Path.join(blocks_dir, "*.zst")) |> Enum.sort()
+      [first_block | _] = Path.wildcard(Path.join(blocks_dir, "*.raw")) |> Enum.sort()
       File.write!(first_block, "corrupted")
 
       {:ok, %LogStream.Result{entries: entries}} = LogStream.query([])

@@ -3,19 +3,24 @@ defmodule LogStream.Handler do
 
   @handler_id :log_stream
 
+  @spec handler_id() :: atom()
   def handler_id, do: @handler_id
 
+  @spec adding_handler(map()) :: {:ok, map()}
   def adding_handler(config) do
     {:ok, config}
   end
 
+  @spec removing_handler(map()) :: :ok
   def removing_handler(_config) do
     :ok
   end
 
+  @spec changing_config(:set | :update, map(), map()) :: {:ok, map()}
   def changing_config(:set, _old, new), do: {:ok, new}
   def changing_config(:update, old, new), do: {:ok, Map.merge(old, new)}
 
+  @spec log(map(), map()) :: :ok
   def log(%{level: level, msg: msg, meta: meta}, _config) do
     timestamp =
       case meta do

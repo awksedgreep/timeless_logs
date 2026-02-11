@@ -4,12 +4,15 @@ defmodule LogStream.MixProject do
   def project do
     [
       app: :log_stream,
-      version: "0.1.0",
+      version: "0.5.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: "Embedded log compression and indexing for Elixir applications.",
-      source_url: "https://github.com/awksedgreep/log_stream"
+      source_url: "https://github.com/awksedgreep/log_stream",
+      homepage_url: "https://github.com/awksedgreep/log_stream",
+      package: package(),
+      docs: docs()
     ]
   end
 
@@ -23,7 +26,24 @@ defmodule LogStream.MixProject do
   defp deps do
     [
       {:exqlite, "~> 0.27"},
-      {:ezstd, "~> 1.2"}
+      {:ezstd, "~> 1.2"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      maintainers: ["Matt Cotner"],
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/awksedgreep/log_stream"},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "LICENSE"]
     ]
   end
 end

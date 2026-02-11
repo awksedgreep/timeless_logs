@@ -36,7 +36,11 @@ defmodule Mix.Tasks.LogStream.Benchmark do
     IO.puts("Raw size:         #{fmt_bytes(raw_size)}")
     IO.puts("Compressed size:  #{fmt_bytes(total_compressed)}")
     IO.puts("Ratio:            #{:erlang.float_to_binary(ratio, decimals: 1)}x")
-    IO.puts("Savings:          #{:erlang.float_to_binary((1 - total_compressed / raw_size) * 100, decimals: 1)}%")
+
+    IO.puts(
+      "Savings:          #{:erlang.float_to_binary((1 - total_compressed / raw_size) * 100, decimals: 1)}%"
+    )
+
     IO.puts("Time:             #{:erlang.float_to_binary(elapsed_s, decimals: 2)}s")
     IO.puts("Throughput:       #{fmt_number(round(entries_per_sec))} entries/sec")
     IO.puts("")
@@ -88,19 +92,33 @@ defmodule Mix.Tasks.LogStream.Benchmark do
           timestamp: ts,
           level: :info,
           message: "#{method} #{path}",
-          metadata: %{"request_id" => req_id, "module" => "Phoenix.Endpoint", "user_id" => "#{user_id}"}
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Phoenix.Endpoint",
+            "user_id" => "#{user_id}"
+          }
         },
         %{
           timestamp: ts,
           level: :debug,
           message: ecto_query(path),
-          metadata: %{"request_id" => req_id, "module" => "Ecto.Adapters.SQL", "source" => random_table(), "query_time" => "#{:rand.uniform(50)}ms"}
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Ecto.Adapters.SQL",
+            "source" => random_table(),
+            "query_time" => "#{:rand.uniform(50)}ms"
+          }
         },
         %{
           timestamp: ts,
           level: :info,
           message: "Sent #{status} in #{duration}ms",
-          metadata: %{"request_id" => req_id, "module" => "Phoenix.Logger", "status" => "#{status}", "duration" => "#{duration}"}
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Phoenix.Logger",
+            "status" => "#{status}",
+            "duration" => "#{duration}"
+          }
         }
       ]
 
@@ -110,8 +128,14 @@ defmodule Mix.Tasks.LogStream.Benchmark do
           timestamp: ts,
           level: :debug,
           message: ecto_query(path),
-          metadata: %{"request_id" => req_id, "module" => "Ecto.Adapters.SQL", "source" => random_table(), "query_time" => "#{:rand.uniform(20)}ms"}
+          metadata: %{
+            "request_id" => req_id,
+            "module" => "Ecto.Adapters.SQL",
+            "source" => random_table(),
+            "query_time" => "#{:rand.uniform(20)}ms"
+          }
         }
+
         [extra | entries]
       else
         entries
@@ -124,11 +148,18 @@ defmodule Mix.Tasks.LogStream.Benchmark do
     error = %{
       timestamp: ts,
       level: :error,
-      message: "Internal server error: #{Enum.random(["timeout", "connection_refused", "nxdomain", "pool_timeout", "deadlock_detected"])}",
-      metadata: %{"request_id" => req_id, "module" => "Phoenix.Logger", "crash_reason" => random_crash()}
+      message:
+        "Internal server error: #{Enum.random(["timeout", "connection_refused", "nxdomain", "pool_timeout", "deadlock_detected"])}",
+      metadata: %{
+        "request_id" => req_id,
+        "module" => "Phoenix.Logger",
+        "crash_reason" => random_crash()
+      }
     }
+
     [error | entries]
   end
+
   defp maybe_add_error(entries, _ts, _req_id, _status, _i), do: entries
 
   defp background_logs(ts, minute) do
@@ -137,12 +168,16 @@ defmodule Mix.Tasks.LogStream.Benchmark do
     # Periodic job every 5 minutes
     logs =
       if rem(minute, 5) == 0 do
-        [%{
-          timestamp: ts + 30,
-          level: :info,
-          message: "Running scheduled job: #{Enum.random(~w(cleanup_sessions refresh_cache sync_data send_digests update_stats))}",
-          metadata: %{"module" => "MyApp.Scheduler", "job_id" => random_hex(8)}
-        } | logs]
+        [
+          %{
+            timestamp: ts + 30,
+            level: :info,
+            message:
+              "Running scheduled job: #{Enum.random(~w(cleanup_sessions refresh_cache sync_data send_digests update_stats))}",
+            metadata: %{"module" => "MyApp.Scheduler", "job_id" => random_hex(8)}
+          }
+          | logs
+        ]
       else
         logs
       end
@@ -153,25 +188,36 @@ defmodule Mix.Tasks.LogStream.Benchmark do
         timestamp: ts + 45,
         level: :debug,
         message: "Healthcheck OK",
-        metadata: %{"module" => "MyApp.Health", "memory_mb" => "#{256 + :rand.uniform(512)}", "process_count" => "#{200 + :rand.uniform(100)}"}
+        metadata: %{
+          "module" => "MyApp.Health",
+          "memory_mb" => "#{256 + :rand.uniform(512)}",
+          "process_count" => "#{200 + :rand.uniform(100)}"
+        }
       }
       | logs
     ]
 
     # Occasional warnings
     if :rand.uniform(30) == 1 do
-      [%{
-        timestamp: ts + :rand.uniform(59),
-        level: :warning,
-        message: Enum.random([
-          "Connection pool checkout timeout after 5000ms",
-          "Slow query detected (>100ms)",
-          "Rate limit approaching for API key",
-          "Certificate expiring in 7 days",
-          "Memory usage above 80% threshold"
-        ]),
-        metadata: %{"module" => Enum.random(~w(DBConnection Ecto.Adapters.SQL MyApp.RateLimiter MyApp.Monitor))}
-      } | logs]
+      [
+        %{
+          timestamp: ts + :rand.uniform(59),
+          level: :warning,
+          message:
+            Enum.random([
+              "Connection pool checkout timeout after 5000ms",
+              "Slow query detected (>100ms)",
+              "Rate limit approaching for API key",
+              "Certificate expiring in 7 days",
+              "Memory usage above 80% threshold"
+            ]),
+          metadata: %{
+            "module" =>
+              Enum.random(~w(DBConnection Ecto.Adapters.SQL MyApp.RateLimiter MyApp.Monitor))
+          }
+        }
+        | logs
+      ]
     else
       logs
     end
@@ -221,14 +267,15 @@ defmodule Mix.Tasks.LogStream.Benchmark do
   end
 
   defp ecto_query(path) do
-    table = cond do
-      String.contains?(path, "users") -> "users"
-      String.contains?(path, "posts") -> "posts"
-      String.contains?(path, "comments") -> "comments"
-      String.contains?(path, "sessions") -> "sessions"
-      String.contains?(path, "notifications") -> "notifications"
-      true -> "records"
-    end
+    table =
+      cond do
+        String.contains?(path, "users") -> "users"
+        String.contains?(path, "posts") -> "posts"
+        String.contains?(path, "comments") -> "comments"
+        String.contains?(path, "sessions") -> "sessions"
+        String.contains?(path, "notifications") -> "notifications"
+        true -> "records"
+      end
 
     a = String.first(table)
 
@@ -266,14 +313,19 @@ defmodule Mix.Tasks.LogStream.Benchmark do
   end
 
   defp fmt_bytes(bytes) when bytes < 1024, do: "#{bytes} B"
-  defp fmt_bytes(bytes) when bytes < 1024 * 1024, do: "#{:erlang.float_to_binary(bytes / 1024, decimals: 1)} KB"
+
+  defp fmt_bytes(bytes) when bytes < 1024 * 1024,
+    do: "#{:erlang.float_to_binary(bytes / 1024, decimals: 1)} KB"
+
   defp fmt_bytes(bytes), do: "#{:erlang.float_to_binary(bytes / 1024 / 1024, decimals: 1)} MB"
 
   defp fmt_number(n) when n >= 1_000_000 do
     "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
   end
+
   defp fmt_number(n) when n >= 1_000 do
     "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   end
+
   defp fmt_number(n), do: "#{n}"
 end

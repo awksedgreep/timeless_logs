@@ -25,9 +25,10 @@ defmodule LogStream.TelemetryTest do
 
   describe "flush telemetry" do
     test "emits [:log_stream, :flush, :stop] on flush" do
-      ref = :telemetry_test.attach_event_handlers(self(), [
-        [:log_stream, :flush, :stop]
-      ])
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:log_stream, :flush, :stop]
+        ])
 
       Logger.info("telemetry test")
       LogStream.flush()
@@ -45,9 +46,10 @@ defmodule LogStream.TelemetryTest do
       Logger.info("query telemetry test")
       LogStream.flush()
 
-      ref = :telemetry_test.attach_event_handlers(self(), [
-        [:log_stream, :query, :stop]
-      ])
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:log_stream, :query, :stop]
+        ])
 
       LogStream.query(level: :info)
 
@@ -66,12 +68,13 @@ defmodule LogStream.TelemetryTest do
       LogStream.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
-      [block_file] = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      [block_file] = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       File.write!(block_file, "corrupt data")
 
-      ref = :telemetry_test.attach_event_handlers(self(), [
-        [:log_stream, :block, :error]
-      ])
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:log_stream, :block, :error]
+        ])
 
       LogStream.query([])
 
