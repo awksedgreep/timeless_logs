@@ -26,14 +26,20 @@ defmodule LogStream.Config do
     Application.get_env(:log_stream, :query_timeout, 30_000)
   end
 
+  # 7 days in seconds
+  @default_retention_max_age 7 * 86_400
+
+  # 512 MB
+  @default_retention_max_size 512 * 1_048_576
+
   @spec retention_max_age() :: pos_integer() | nil
   def retention_max_age do
-    Application.get_env(:log_stream, :retention_max_age, nil)
+    Application.get_env(:log_stream, :retention_max_age, @default_retention_max_age)
   end
 
   @spec retention_max_size() :: pos_integer() | nil
   def retention_max_size do
-    Application.get_env(:log_stream, :retention_max_size, nil)
+    Application.get_env(:log_stream, :retention_max_size, @default_retention_max_size)
   end
 
   @spec retention_check_interval() :: pos_integer()
