@@ -97,8 +97,7 @@ defmodule LogStream.Index do
 
     create_tables(db)
 
-    {:ok,
-     %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
+    {:ok, %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
   end
 
   @impl true
