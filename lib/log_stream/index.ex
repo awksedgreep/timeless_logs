@@ -75,6 +75,11 @@ defmodule LogStream.Index do
     GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
   end
 
+  @spec backup(String.t()) :: :ok | {:error, term()}
+  def backup(target_path) do
+    GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
+  end
+
   # Flush pending index operations after this interval
   @index_flush_interval 100
 
@@ -179,6 +184,19 @@ defmodule LogStream.Index do
     state = flush_pending(state)
     result = do_compact_blocks(state.db, old_ids, new_meta, new_entries, state.storage)
     {:reply, result, state}
+  end
+
+  def handle_call({:backup, target_path}, _from, state) do
+    state = flush_pending(state)
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, "VACUUM INTO ?1")
+    Exqlite.Sqlite3.bind(stmt, [target_path])
+    result = Exqlite.Sqlite3.step(state.db, stmt)
+    Exqlite.Sqlite3.release(state.db, stmt)
+
+    case result do
+      :done -> {:reply, :ok, state}
+      {:error, _} = err -> {:reply, err, state}
+    end
   end
 
   @impl true

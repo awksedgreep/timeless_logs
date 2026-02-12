@@ -158,4 +158,75 @@ defmodule LogStream do
   def unsubscribe do
     Registry.unregister(LogStream.Registry, :log_entries)
   end
+
+  @doc """
+  Create a consistent online backup of the log store.
+
+  Flushes all in-flight data, then uses SQLite's `VACUUM INTO` to snapshot
+  the index database and copies block files to the target directory.
+
+  ## Parameters
+
+    * `target_dir` - Directory to write backup files into (will be created)
+
+  ## Returns
+
+      {:ok, %{path: target_dir, files: [filenames], total_bytes: integer()}}
+
+  ## Examples
+
+      LogStream.backup("/tmp/log_backup_2024")
+  """
+  @spec backup(String.t()) :: {:ok, map()} | {:error, term()}
+  def backup(target_dir) do
+    flush()
+
+    File.mkdir_p!(target_dir)
+
+    # Backup index DB via VACUUM INTO
+    index_target = Path.join(target_dir, "index.db")
+
+    case LogStream.Index.backup(index_target) do
+      :ok ->
+        # Copy block files in parallel
+        data_dir = LogStream.Config.data_dir()
+        blocks_src = Path.join(data_dir, "blocks")
+        blocks_dst = Path.join(target_dir, "blocks")
+
+        block_bytes = copy_block_files(blocks_src, blocks_dst)
+        index_bytes = File.stat!(index_target).size
+
+        {:ok,
+         %{
+           path: target_dir,
+           files: ["index.db", "blocks"],
+           total_bytes: index_bytes + block_bytes
+         }}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp copy_block_files(src_dir, dst_dir) do
+    case File.ls(src_dir) do
+      {:ok, files} ->
+        File.mkdir_p!(dst_dir)
+
+        files
+        |> Task.async_stream(
+          fn file ->
+            src = Path.join(src_dir, file)
+            dst = Path.join(dst_dir, file)
+            File.cp!(src, dst)
+            File.stat!(dst).size
+          end,
+          max_concurrency: System.schedulers_online()
+        )
+        |> Enum.reduce(0, fn {:ok, size}, acc -> acc + size end)
+
+      {:error, :enoent} ->
+        0
+    end
+  end
 end
