@@ -4,7 +4,7 @@ defmodule LogStream.MixProject do
   def project do
     [
       app: :log_stream,
-      version: "0.5.2",
+      version: "0.6.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -27,6 +27,9 @@ defmodule LogStream.MixProject do
     [
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
+      {:bandit, "~> 1.6"},
+      {:plug, "~> 1.16"},
+      {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

@@ -13,15 +13,24 @@ defmodule LogStream.Application do
       File.mkdir_p!(blocks_dir)
     end
 
-    children = [
-      {Registry, keys: :duplicate, name: LogStream.Registry},
-      {LogStream.Index, data_dir: data_dir, storage: storage},
-      {LogStream.Buffer, data_dir: data_dir},
-      {LogStream.Compactor, data_dir: data_dir, storage: storage},
-      {LogStream.Retention, []}
-    ]
+    children =
+      [
+        {Registry, keys: :duplicate, name: LogStream.Registry},
+        {LogStream.Index, data_dir: data_dir, storage: storage},
+        {LogStream.Buffer, data_dir: data_dir},
+        {LogStream.Compactor, data_dir: data_dir, storage: storage},
+        {LogStream.Retention, []}
+      ] ++ http_child()
 
     opts = [strategy: :one_for_one, name: LogStream.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  defp http_child do
+    case Application.get_env(:log_stream, :http, false) do
+      false -> []
+      true -> [{LogStream.HTTP, []}]
+      opts when is_list(opts) -> [{LogStream.HTTP, opts}]
+    end
   end
 end
