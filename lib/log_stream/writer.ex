@@ -22,8 +22,11 @@ defmodule LogStream.Writer do
 
     data =
       case format do
-        :raw -> binary
-        :zstd -> :ezstd.compress(binary, Keyword.get(opts, :level, LogStream.Config.compression_level()))
+        :raw ->
+          binary
+
+        :zstd ->
+          :ezstd.compress(binary, Keyword.get(opts, :level, LogStream.Config.compression_level()))
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
@@ -48,8 +51,14 @@ defmodule LogStream.Writer do
 
     {data, ext} =
       case format do
-        :raw -> {binary, "raw"}
-        :zstd -> {:ezstd.compress(binary, Keyword.get(opts, :level, LogStream.Config.compression_level())), "zst"}
+        :raw ->
+          {binary, "raw"}
+
+        :zstd ->
+          {:ezstd.compress(
+             binary,
+             Keyword.get(opts, :level, LogStream.Config.compression_level())
+           ), "zst"}
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
