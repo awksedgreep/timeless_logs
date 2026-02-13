@@ -26,7 +26,10 @@ defmodule TimelessLogs.Writer do
           binary
 
         :zstd ->
-          :ezstd.compress(binary, Keyword.get(opts, :level, TimelessLogs.Config.compression_level()))
+          :ezstd.compress(
+            binary,
+            Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
+          )
       end
 
     block_id = System.unique_integer([:positive, :monotonic])

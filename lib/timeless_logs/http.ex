@@ -36,9 +36,9 @@ defmodule TimelessLogs.HTTP do
 
   @max_body_bytes 10 * 1024 * 1024
 
-  plug :match
-  plug :authenticate
-  plug :dispatch
+  plug(:match)
+  plug(:authenticate)
+  plug(:dispatch)
 
   def child_spec(opts) do
     port = Keyword.get(opts, :port, 9428)
@@ -162,7 +162,12 @@ defmodule TimelessLogs.HTTP do
         body =
           entries
           |> Enum.map_join("\n", fn entry ->
-            map = %{"_time" => format_timestamp(entry.timestamp), "_msg" => entry.message, "level" => to_string(entry.level)}
+            map = %{
+              "_time" => format_timestamp(entry.timestamp),
+              "_msg" => entry.message,
+              "level" => to_string(entry.level)
+            }
+
             map = Map.merge(map, stringify_metadata(entry.metadata))
             Jason.encode!(map)
           end)
@@ -182,32 +187,39 @@ defmodule TimelessLogs.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{
-      total_blocks: stats.total_blocks,
-      total_entries: stats.total_entries,
-      total_bytes: stats.total_bytes,
-      disk_size: stats.disk_size,
-      index_size: stats.index_size,
-      oldest_timestamp: stats.oldest_timestamp,
-      newest_timestamp: stats.newest_timestamp,
-      raw_blocks: stats.raw_blocks,
-      raw_bytes: stats.raw_bytes,
-      zstd_blocks: stats.zstd_blocks,
-      zstd_bytes: stats.zstd_bytes
-    }))
+    |> send_resp(
+      200,
+      Jason.encode!(%{
+        total_blocks: stats.total_blocks,
+        total_entries: stats.total_entries,
+        total_bytes: stats.total_bytes,
+        disk_size: stats.disk_size,
+        index_size: stats.index_size,
+        oldest_timestamp: stats.oldest_timestamp,
+        newest_timestamp: stats.newest_timestamp,
+        raw_blocks: stats.raw_blocks,
+        raw_bytes: stats.raw_bytes,
+        zstd_blocks: stats.zstd_blocks,
+        zstd_bytes: stats.zstd_bytes
+      })
+    )
   end
 
   # Online backup
   post "/api/v1/backup" do
     parsed_path =
       case Plug.Conn.read_body(conn, length: 64_000) do
-        {:ok, "", _} -> nil
+        {:ok, "", _} ->
+          nil
+
         {:ok, body, _} ->
           case Jason.decode(body) do
             {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
             _ -> nil
           end
-        _ -> nil
+
+        _ ->
+          nil
       end
 
     target_dir = parsed_path || default_backup_dir()
@@ -216,12 +228,15 @@ defmodule TimelessLogs.HTTP do
       {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{
-          status: "ok",
-          path: result.path,
-          files: result.files,
-          total_bytes: result.total_bytes
-        }))
+        |> send_resp(
+          200,
+          Jason.encode!(%{
+            status: "ok",
+            path: result.path,
+            files: result.files,
+            total_bytes: result.total_bytes
+          })
+        )
 
       {:error, reason} ->
         json_error(conn, 500, inspect(reason))
@@ -274,7 +289,8 @@ defmodule TimelessLogs.HTTP do
             |> Map.drop([msg_field, time_field, "level"])
             |> Map.new(fn {k, v} -> {String.to_atom(k), v} end)
 
-          {:ok, %{timestamp: timestamp, level: level, message: to_string(message), metadata: metadata}}
+          {:ok,
+           %{timestamp: timestamp, level: level, message: to_string(message), metadata: metadata}}
 
         _ ->
           :error
@@ -292,13 +308,17 @@ defmodule TimelessLogs.HTTP do
   defp parse_level(_), do: :info
 
   defp parse_ingest_time(nil), do: System.os_time(:microsecond)
+
   defp parse_ingest_time(val) when is_integer(val) do
     # Unix seconds → microseconds
     val * 1_000_000
   end
+
   defp parse_ingest_time(val) when is_binary(val) do
     case DateTime.from_iso8601(val) do
-      {:ok, dt, _offset} -> DateTime.to_unix(dt, :microsecond)
+      {:ok, dt, _offset} ->
+        DateTime.to_unix(dt, :microsecond)
+
       _ ->
         case Integer.parse(val) do
           {n, _} -> n * 1_000_000
@@ -306,6 +326,7 @@ defmodule TimelessLogs.HTTP do
         end
     end
   end
+
   defp parse_ingest_time(_), do: System.os_time(:microsecond)
 
   defp build_query_filters(params) do
@@ -337,7 +358,9 @@ defmodule TimelessLogs.HTTP do
 
     filters =
       case params["limit"] do
-        nil -> filters
+        nil ->
+          filters
+
         limit ->
           case Integer.parse(limit) do
             {n, _} -> [{:limit, n} | filters]
@@ -347,7 +370,9 @@ defmodule TimelessLogs.HTTP do
 
     filters =
       case params["offset"] do
-        nil -> filters
+        nil ->
+          filters
+
         offset ->
           case Integer.parse(offset) do
             {n, _} -> [{:offset, n} | filters]
@@ -367,7 +392,9 @@ defmodule TimelessLogs.HTTP do
 
   defp parse_query_time(val) when is_binary(val) do
     case DateTime.from_iso8601(val) do
-      {:ok, dt, _offset} -> DateTime.to_unix(dt, :microsecond)
+      {:ok, dt, _offset} ->
+        DateTime.to_unix(dt, :microsecond)
+
       _ ->
         case Integer.parse(val) do
           {n, _} -> n
@@ -377,6 +404,7 @@ defmodule TimelessLogs.HTTP do
   end
 
   defp format_timestamp(nil), do: nil
+
   defp format_timestamp(ts) when is_integer(ts) do
     ts
     |> DateTime.from_unix!(:microsecond)
@@ -384,6 +412,7 @@ defmodule TimelessLogs.HTTP do
   end
 
   defp stringify_metadata(nil), do: %{}
+
   defp stringify_metadata(metadata) when is_map(metadata) do
     Map.new(metadata, fn {k, v} -> {to_string(k), v} end)
   end

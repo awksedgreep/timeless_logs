@@ -51,7 +51,8 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "POST /insert/jsonline" do
     test "ingests NDJSON lines" do
-      body = ~s({"_msg":"hello world","level":"info","app":"test"}\n{"_msg":"oh no","level":"error","app":"test"})
+      body =
+        ~s({"_msg":"hello world","level":"info","app":"test"}\n{"_msg":"oh no","level":"error","app":"test"})
 
       conn =
         conn(:post, "/insert/jsonline", body)
@@ -156,11 +157,14 @@ defmodule TimelessLogs.HTTPTest do
   describe "GET /select/logsql/query" do
     setup do
       lines =
-        Enum.join([
-          ~s({"_msg":"info one","level":"info","service":"api"}),
-          ~s({"_msg":"error boom","level":"error","service":"api"}),
-          ~s({"_msg":"info two","level":"info","service":"web"})
-        ], "\n")
+        Enum.join(
+          [
+            ~s({"_msg":"info one","level":"info","service":"api"}),
+            ~s({"_msg":"error boom","level":"error","service":"api"}),
+            ~s({"_msg":"info two","level":"info","service":"web"})
+          ],
+          "\n"
+        )
 
       conn(:post, "/insert/jsonline", lines)
       |> put_req_header("content-type", "application/x-ndjson")
