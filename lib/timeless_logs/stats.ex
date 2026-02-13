@@ -1,4 +1,4 @@
-defmodule LogStream.Stats do
+defmodule TimelessLogs.Stats do
   @moduledoc """
   Aggregate statistics about stored log data.
   """

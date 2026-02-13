@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.LogStream.Benchmark do
+defmodule Mix.Tasks.TimelessLogs.Benchmark do
   @moduledoc "Benchmark compression rates with realistic Phoenix log data"
   use Mix.Task
 
@@ -324,7 +324,7 @@ defmodule Mix.Tasks.LogStream.Benchmark do
     entries
     |> Enum.chunk_every(1000)
     |> Enum.reduce({0, 0}, fn chunk, {total_size, block_count} ->
-      case LogStream.Writer.write_block(chunk, data_dir, :zstd) do
+      case TimelessLogs.Writer.write_block(chunk, data_dir, :zstd) do
         {:ok, meta} -> {total_size + meta.byte_size, block_count + 1}
         _ -> {total_size, block_count}
       end

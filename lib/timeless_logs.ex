@@ -1,14 +1,14 @@
-defmodule LogStream do
+defmodule TimelessLogs do
   @moduledoc """
   Embedded log compression and indexing for Elixir applications.
 
-  LogStream plugs into Elixir's Logger as a handler, compresses log entries
+  TimelessLogs plugs into Elixir's Logger as a handler, compresses log entries
   into zstd blocks, and indexes them in SQLite for fast querying.
 
   ## Setup
 
       # config/config.exs
-      config :log_stream,
+      config :timeless_logs,
         data_dir: "priv/log_stream"
 
   The handler is installed automatically when the application starts.
@@ -16,17 +16,17 @@ defmodule LogStream do
   ## Querying
 
       # Find error logs from the last hour
-      LogStream.query(level: :error, since: DateTime.add(DateTime.utc_now(), -3600))
+      TimelessLogs.query(level: :error, since: DateTime.add(DateTime.utc_now(), -3600))
 
       # Paginated results
-      LogStream.query(level: :info, limit: 50, offset: 100, order: :asc)
+      TimelessLogs.query(level: :info, limit: 50, offset: 100, order: :asc)
 
       # Search log messages with metadata
-      LogStream.query(message: "timeout", metadata: %{service: "api"})
+      TimelessLogs.query(message: "timeout", metadata: %{service: "api"})
   """
 
   @doc """
-  Query stored logs. Returns a `LogStream.Result` struct.
+  Query stored logs. Returns a `TimelessLogs.Result` struct.
 
   ## Filters
 
@@ -44,15 +44,15 @@ defmodule LogStream do
 
   ## Examples
 
-      LogStream.query(level: :error)
-      #=> {:ok, %LogStream.Result{entries: [...], total: 42, limit: 100, offset: 0}}
+      TimelessLogs.query(level: :error)
+      #=> {:ok, %TimelessLogs.Result{entries: [...], total: 42, limit: 100, offset: 0}}
 
-      LogStream.query(level: :warning, limit: 10, offset: 20)
-      LogStream.query(message: "connection refused", metadata: %{service: "api"})
+      TimelessLogs.query(level: :warning, limit: 10, offset: 20)
+      TimelessLogs.query(message: "connection refused", metadata: %{service: "api"})
   """
-  @spec query(keyword()) :: {:ok, LogStream.Result.t()} | {:error, term()}
+  @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()} | {:error, term()}
   def query(filters \\ []) do
-    LogStream.Index.query(filters)
+    TimelessLogs.Index.query(filters)
   end
 
   @doc """
@@ -60,13 +60,13 @@ defmodule LogStream do
   """
   @spec flush() :: :ok
   def flush do
-    LogStream.Buffer.flush()
+    TimelessLogs.Buffer.flush()
   end
 
   @doc """
   Lazily stream matching log entries without loading all results into memory.
 
-  Returns an Elixir `Stream` that yields `%LogStream.Entry{}` structs.
+  Returns an Elixir `Stream` that yields `%TimelessLogs.Entry{}` structs.
   Blocks are decompressed on demand as the stream is consumed.
 
   Entries are returned in block order (oldest blocks first by default).
@@ -77,33 +77,33 @@ defmodule LogStream do
 
   ## Examples
 
-      LogStream.stream(level: :error)
+      TimelessLogs.stream(level: :error)
       |> Enum.take(10)
 
-      LogStream.stream(since: DateTime.add(DateTime.utc_now(), -3600))
+      TimelessLogs.stream(since: DateTime.add(DateTime.utc_now(), -3600))
       |> Stream.filter(& &1.message =~ "timeout")
       |> Enum.to_list()
   """
   @spec stream(keyword()) :: Enumerable.t()
   def stream(filters \\ []) do
-    block_ids = LogStream.Index.matching_block_ids(filters)
+    block_ids = TimelessLogs.Index.matching_block_ids(filters)
     search_filters = Keyword.drop(filters, [:limit, :offset, :order])
-    storage = LogStream.Config.storage()
+    storage = TimelessLogs.Config.storage()
 
     Stream.flat_map(block_ids, fn {block_id, file_path, format} ->
       format_atom = if is_binary(format), do: String.to_existing_atom(format), else: format
 
       read_result =
         case storage do
-          :disk -> LogStream.Writer.read_block(file_path, format_atom)
-          :memory -> LogStream.Index.read_block_data(block_id)
+          :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
+          :memory -> TimelessLogs.Index.read_block_data(block_id)
         end
 
       case read_result do
         {:ok, entries} ->
           entries
-          |> LogStream.Filter.filter(search_filters)
-          |> Enum.map(&LogStream.Entry.from_map/1)
+          |> TimelessLogs.Filter.filter(search_filters)
+          |> Enum.map(&TimelessLogs.Entry.from_map/1)
 
         {:error, _reason} ->
           []
@@ -116,21 +116,21 @@ defmodule LogStream do
 
   ## Examples
 
-      {:ok, stats} = LogStream.stats()
+      {:ok, stats} = TimelessLogs.stats()
       stats.total_blocks   #=> 42
       stats.total_entries   #=> 50000
       stats.disk_size       #=> 24_000_000
   """
-  @spec stats() :: {:ok, LogStream.Stats.t()}
+  @spec stats() :: {:ok, TimelessLogs.Stats.t()}
   def stats do
-    LogStream.Index.stats()
+    TimelessLogs.Index.stats()
   end
 
   @doc """
   Subscribe the calling process to receive new log entries as they arrive.
 
   The subscriber receives messages of the form:
-  `{:log_stream, :entry, %LogStream.Entry{}}`.
+  `{:timeless_logs, :entry, %TimelessLogs.Entry{}}`.
 
   ## Options
 
@@ -139,16 +139,16 @@ defmodule LogStream do
 
   ## Examples
 
-      LogStream.subscribe()
+      TimelessLogs.subscribe()
       receive do
-        {:log_stream, :entry, entry} -> IO.inspect(entry)
+        {:timeless_logs, :entry, entry} -> IO.inspect(entry)
       end
 
-      LogStream.subscribe(level: :error)
+      TimelessLogs.subscribe(level: :error)
   """
   @spec subscribe(keyword()) :: {:ok, pid()}
   def subscribe(opts \\ []) do
-    Registry.register(LogStream.Registry, :log_entries, opts)
+    Registry.register(TimelessLogs.Registry, :log_entries, opts)
   end
 
   @doc """
@@ -156,7 +156,7 @@ defmodule LogStream do
   """
   @spec unsubscribe() :: :ok
   def unsubscribe do
-    Registry.unregister(LogStream.Registry, :log_entries)
+    Registry.unregister(TimelessLogs.Registry, :log_entries)
   end
 
   @doc """
@@ -175,7 +175,7 @@ defmodule LogStream do
 
   ## Examples
 
-      LogStream.backup("/tmp/log_backup_2024")
+      TimelessLogs.backup("/tmp/log_backup_2024")
   """
   @spec backup(String.t()) :: {:ok, map()} | {:error, term()}
   def backup(target_dir) do
@@ -186,10 +186,10 @@ defmodule LogStream do
     # Backup index DB via VACUUM INTO
     index_target = Path.join(target_dir, "index.db")
 
-    case LogStream.Index.backup(index_target) do
+    case TimelessLogs.Index.backup(index_target) do
       :ok ->
         # Copy block files in parallel
-        data_dir = LogStream.Config.data_dir()
+        data_dir = TimelessLogs.Config.data_dir()
         blocks_src = Path.join(data_dir, "blocks")
         blocks_dst = Path.join(target_dir, "blocks")
 

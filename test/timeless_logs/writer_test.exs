@@ -1,4 +1,4 @@
-defmodule LogStream.WriterTest do
+defmodule TimelessLogs.WriterTest do
   use ExUnit.Case, async: true
 
   @data_dir "test/tmp/writer_#{System.unique_integer([:positive])}"
@@ -17,7 +17,7 @@ defmodule LogStream.WriterTest do
         %{timestamp: 1001, level: :error, message: "boom", metadata: %{"key" => "val"}}
       ]
 
-      assert {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :raw)
+      assert {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :raw)
       assert meta.entry_count == 2
       assert meta.ts_min == 1000
       assert meta.ts_max == 1001
@@ -33,7 +33,7 @@ defmodule LogStream.WriterTest do
         %{timestamp: 1001, level: :error, message: "boom", metadata: %{"key" => "val"}}
       ]
 
-      assert {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :zstd)
+      assert {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :zstd)
       assert meta.format == :zstd
       assert File.exists?(meta.file_path)
       assert String.ends_with?(meta.file_path, ".zst")
@@ -50,14 +50,14 @@ defmodule LogStream.WriterTest do
           }
         end
 
-      {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :zstd)
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :zstd)
       raw_size = byte_size(:erlang.term_to_binary(entries))
       assert meta.byte_size < raw_size
     end
 
     test "returns error for invalid directory" do
       entries = [%{timestamp: 1, level: :info, message: "x", metadata: %{}}]
-      assert {:error, _reason} = LogStream.Writer.write_block(entries, "/nonexistent/path")
+      assert {:error, _reason} = TimelessLogs.Writer.write_block(entries, "/nonexistent/path")
     end
   end
 
@@ -68,8 +68,8 @@ defmodule LogStream.WriterTest do
         %{timestamp: 1001, level: :error, message: "world", metadata: %{}}
       ]
 
-      {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :raw)
-      assert {:ok, read_entries} = LogStream.Writer.read_block(meta.file_path, :raw)
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :raw)
+      assert {:ok, read_entries} = TimelessLogs.Writer.read_block(meta.file_path, :raw)
       assert read_entries == entries
     end
 
@@ -79,31 +79,31 @@ defmodule LogStream.WriterTest do
         %{timestamp: 1001, level: :error, message: "world", metadata: %{}}
       ]
 
-      {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :zstd)
-      assert {:ok, read_entries} = LogStream.Writer.read_block(meta.file_path, :zstd)
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :zstd)
+      assert {:ok, read_entries} = TimelessLogs.Writer.read_block(meta.file_path, :zstd)
       assert read_entries == entries
     end
 
     test "returns error for missing file" do
-      assert {:error, :enoent} = LogStream.Writer.read_block("/nonexistent/file.zst")
+      assert {:error, :enoent} = TimelessLogs.Writer.read_block("/nonexistent/file.zst")
     end
 
     test "returns error for corrupt zstd file" do
       corrupt_path = Path.join([@data_dir, "blocks", "corrupt.zst"])
       File.write!(corrupt_path, "not valid zstd data")
 
-      assert {:error, :corrupt_block} = LogStream.Writer.read_block(corrupt_path, :zstd)
+      assert {:error, :corrupt_block} = TimelessLogs.Writer.read_block(corrupt_path, :zstd)
     end
 
     test "returns error for truncated zstd file" do
       entries = [%{timestamp: 1, level: :info, message: "test", metadata: %{}}]
-      {:ok, meta} = LogStream.Writer.write_block(entries, @data_dir, :zstd)
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, @data_dir, :zstd)
 
       # Truncate the file
       data = File.read!(meta.file_path)
       File.write!(meta.file_path, binary_part(data, 0, div(byte_size(data), 2)))
 
-      assert {:error, :corrupt_block} = LogStream.Writer.read_block(meta.file_path, :zstd)
+      assert {:error, :corrupt_block} = TimelessLogs.Writer.read_block(meta.file_path, :zstd)
     end
   end
 end

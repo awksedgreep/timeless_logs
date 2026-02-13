@@ -1,7 +1,7 @@
-defmodule LogStream.Handler do
+defmodule TimelessLogs.Handler do
   @moduledoc false
 
-  @handler_id :log_stream
+  @handler_id :timeless_logs
 
   @spec handler_id() :: atom()
   def handler_id, do: @handler_id
@@ -37,7 +37,7 @@ defmodule LogStream.Handler do
       metadata: extract_metadata(meta)
     }
 
-    LogStream.Buffer.log(entry)
+    TimelessLogs.Buffer.log(entry)
   end
 
   defp format_msg({:string, msg}), do: IO.chardata_to_string(msg)

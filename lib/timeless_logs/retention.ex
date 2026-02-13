@@ -1,4 +1,4 @@
-defmodule LogStream.Retention do
+defmodule TimelessLogs.Retention do
   @moduledoc false
 
   use GenServer
@@ -17,7 +17,7 @@ defmodule LogStream.Retention do
 
   @impl true
   def init(_opts) do
-    schedule(LogStream.Config.retention_check_interval())
+    schedule(TimelessLogs.Config.retention_check_interval())
     {:ok, %{}}
   end
 
@@ -30,7 +30,7 @@ defmodule LogStream.Retention do
   @impl true
   def handle_info(:retention_check, state) do
     do_cleanup()
-    schedule(LogStream.Config.retention_check_interval())
+    schedule(TimelessLogs.Config.retention_check_interval())
     {:noreply, state}
   end
 
@@ -39,8 +39,8 @@ defmodule LogStream.Retention do
   end
 
   defp do_cleanup do
-    max_age = LogStream.Config.retention_max_age()
-    max_size = LogStream.Config.retention_max_size()
+    max_age = TimelessLogs.Config.retention_max_age()
+    max_size = TimelessLogs.Config.retention_max_size()
 
     if is_nil(max_age) and is_nil(max_size) do
       :noop
@@ -51,8 +51,8 @@ defmodule LogStream.Retention do
       total_deleted = deleted_age + deleted_size
       duration = System.monotonic_time() - start_time
 
-      LogStream.Telemetry.event(
-        [:log_stream, :retention, :stop],
+      TimelessLogs.Telemetry.event(
+        [:timeless_logs, :retention, :stop],
         %{duration: duration, blocks_deleted: total_deleted},
         %{}
       )
@@ -63,10 +63,10 @@ defmodule LogStream.Retention do
 
   defp cleanup_by_age(max_age_seconds) do
     cutoff = System.system_time(:second) - max_age_seconds
-    LogStream.Index.delete_blocks_before(cutoff)
+    TimelessLogs.Index.delete_blocks_before(cutoff)
   end
 
   defp cleanup_by_size(max_bytes) do
-    LogStream.Index.delete_blocks_over_size(max_bytes)
+    TimelessLogs.Index.delete_blocks_over_size(max_bytes)
   end
 end

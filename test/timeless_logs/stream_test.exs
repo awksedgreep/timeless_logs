@@ -1,4 +1,4 @@
-defmodule LogStream.StreamTest do
+defmodule TimelessLogs.StreamTest do
   use ExUnit.Case, async: false
 
   require Logger
@@ -6,17 +6,17 @@ defmodule LogStream.StreamTest do
   @data_dir "test/tmp/stream"
 
   setup do
-    Application.stop(:log_stream)
+    Application.stop(:timeless_logs)
     File.rm_rf!(@data_dir)
-    Application.put_env(:log_stream, :data_dir, @data_dir)
-    Application.put_env(:log_stream, :flush_interval, 60_000)
-    Application.put_env(:log_stream, :max_buffer_size, 10_000)
-    Application.put_env(:log_stream, :retention_max_age, nil)
-    Application.put_env(:log_stream, :retention_max_size, nil)
-    Application.ensure_all_started(:log_stream)
+    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    Application.put_env(:timeless_logs, :flush_interval, 60_000)
+    Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_logs, :retention_max_age, nil)
+    Application.put_env(:timeless_logs, :retention_max_size, nil)
+    Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
-      Application.stop(:log_stream)
+      Application.stop(:timeless_logs)
       File.rm_rf!(@data_dir)
     end)
 
@@ -28,19 +28,19 @@ defmodule LogStream.StreamTest do
       Logger.info("stream entry #{i}")
     end
 
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    entries = LogStream.stream([]) |> Enum.to_list()
+    entries = TimelessLogs.stream([]) |> Enum.to_list()
     assert length(entries) == 20
-    assert %LogStream.Entry{} = hd(entries)
+    assert %TimelessLogs.Entry{} = hd(entries)
   end
 
   test "stream/1 with level filter" do
     Logger.info("good")
     Logger.error("bad")
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    errors = LogStream.stream(level: :error) |> Enum.to_list()
+    errors = TimelessLogs.stream(level: :error) |> Enum.to_list()
     assert length(errors) == 1
     assert hd(errors).level == :error
   end
@@ -50,30 +50,30 @@ defmodule LogStream.StreamTest do
       Logger.info("entry #{i}")
     end
 
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    first_five = LogStream.stream([]) |> Enum.take(5)
+    first_five = TimelessLogs.stream([]) |> Enum.take(5)
     assert length(first_five) == 5
   end
 
   test "stream/1 across multiple blocks" do
     Logger.info("block 1")
-    LogStream.flush()
+    TimelessLogs.flush()
     Logger.info("block 2")
-    LogStream.flush()
+    TimelessLogs.flush()
     Logger.info("block 3")
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    entries = LogStream.stream([]) |> Enum.to_list()
+    entries = TimelessLogs.stream([]) |> Enum.to_list()
     assert length(entries) == 3
   end
 
   test "stream/1 with message filter" do
     Logger.info("timeout occurred")
     Logger.info("all good")
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    results = LogStream.stream(message: "timeout") |> Enum.to_list()
+    results = TimelessLogs.stream(message: "timeout") |> Enum.to_list()
     assert length(results) == 1
     assert hd(results).message =~ "timeout"
   end
@@ -81,15 +81,15 @@ defmodule LogStream.StreamTest do
   test "stream/1 with metadata filter" do
     Logger.info("api call", service: "api")
     Logger.info("web call", service: "web")
-    LogStream.flush()
+    TimelessLogs.flush()
 
-    results = LogStream.stream(metadata: %{service: "api"}) |> Enum.to_list()
+    results = TimelessLogs.stream(metadata: %{service: "api"}) |> Enum.to_list()
     assert length(results) == 1
     assert hd(results).metadata["service"] == "api"
   end
 
   test "stream/1 on empty state returns empty" do
-    entries = LogStream.stream([]) |> Enum.to_list()
+    entries = TimelessLogs.stream([]) |> Enum.to_list()
     assert entries == []
   end
 end

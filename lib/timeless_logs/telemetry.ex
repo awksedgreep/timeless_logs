@@ -1,22 +1,22 @@
-defmodule LogStream.Telemetry do
+defmodule TimelessLogs.Telemetry do
   @moduledoc """
-  Telemetry events emitted by LogStream.
+  Telemetry events emitted by TimelessLogs.
 
   ## Events
 
-    * `[:log_stream, :flush, :stop]` - A buffer flush completed.
+    * `[:timeless_logs, :flush, :stop]` - A buffer flush completed.
       * Measurements: `%{duration: native_time, entry_count: integer, byte_size: integer}`
       * Metadata: `%{block_id: integer}`
 
-    * `[:log_stream, :query, :stop]` - A query completed.
+    * `[:timeless_logs, :query, :stop]` - A query completed.
       * Measurements: `%{duration: native_time, total: integer, blocks_read: integer}`
       * Metadata: `%{filters: keyword}`
 
-    * `[:log_stream, :retention, :stop]` - A retention cleanup completed.
+    * `[:timeless_logs, :retention, :stop]` - A retention cleanup completed.
       * Measurements: `%{duration: native_time, blocks_deleted: integer}`
       * Metadata: `%{}`
 
-    * `[:log_stream, :block, :error]` - A block read failed (corrupt or missing).
+    * `[:timeless_logs, :block, :error]` - A block read failed (corrupt or missing).
       * Measurements: `%{}`
       * Metadata: `%{file_path: string, reason: atom}`
   """

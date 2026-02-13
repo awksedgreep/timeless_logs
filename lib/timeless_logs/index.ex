@@ -1,4 +1,4 @@
-defmodule LogStream.Index do
+defmodule TimelessLogs.Index do
   @moduledoc false
 
   use GenServer
@@ -11,21 +11,21 @@ defmodule LogStream.Index do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec index_block(LogStream.Writer.block_meta(), [map()]) :: :ok
+  @spec index_block(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def index_block(block_meta, entries) do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries})
   end
 
-  @spec index_block_async(LogStream.Writer.block_meta(), [map()]) :: :ok
+  @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
     GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
   end
 
-  @spec query(keyword()) :: {:ok, LogStream.Result.t()}
+  @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()}
   def query(filters) do
     # Phase 1: GenServer does the cheap SQLite lookup only
     {block_ids, storage, pagination, search_filters} =
-      GenServer.call(__MODULE__, {:query_plan, filters}, LogStream.Config.query_timeout())
+      GenServer.call(__MODULE__, {:query_plan, filters}, TimelessLogs.Config.query_timeout())
 
     # Phase 2: Parallel decompression + filtering in the caller's process
     do_query_parallel(block_ids, storage, pagination, search_filters)
@@ -41,19 +41,19 @@ defmodule LogStream.Index do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
   end
 
-  @spec stats() :: {:ok, LogStream.Stats.t()}
+  @spec stats() :: {:ok, TimelessLogs.Stats.t()}
   def stats do
-    GenServer.call(__MODULE__, :stats, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :stats, TimelessLogs.Config.query_timeout())
   end
 
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
   def matching_block_ids(filters) do
-    GenServer.call(__MODULE__, {:matching_block_ids, filters}, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, {:matching_block_ids, filters}, TimelessLogs.Config.query_timeout())
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
   def read_block_data(block_id) do
-    GenServer.call(__MODULE__, {:read_block_data, block_id}, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, {:read_block_data, block_id}, TimelessLogs.Config.query_timeout())
   end
 
   @spec raw_block_stats() :: %{
@@ -62,15 +62,15 @@ defmodule LogStream.Index do
           oldest_created_at: integer() | nil
         }
   def raw_block_stats do
-    GenServer.call(__MODULE__, :raw_block_stats, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :raw_block_stats, TimelessLogs.Config.query_timeout())
   end
 
   @spec raw_block_ids() :: [{integer(), String.t() | nil}]
   def raw_block_ids do
-    GenServer.call(__MODULE__, :raw_block_ids, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :raw_block_ids, TimelessLogs.Config.query_timeout())
   end
 
-  @spec compact_blocks([integer()], LogStream.Writer.block_meta(), [map()]) :: :ok
+  @spec compact_blocks([integer()], TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def compact_blocks(old_block_ids, new_meta, new_entries) do
     GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
   end
@@ -252,7 +252,7 @@ defmodule LogStream.Index do
       end
 
     {:ok,
-     %LogStream.Stats{
+     %TimelessLogs.Stats{
        total_blocks: total_blocks,
        total_entries: total_entries,
        total_bytes: total_bytes,
@@ -452,15 +452,15 @@ defmodule LogStream.Index do
           fn {_block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
-            case LogStream.Writer.read_block(file_path, format_atom) do
+            case TimelessLogs.Writer.read_block(file_path, format_atom) do
               {:ok, entries} ->
                 entries
-                |> LogStream.Filter.filter(search_filters)
-                |> Enum.map(&LogStream.Entry.from_map/1)
+                |> TimelessLogs.Filter.filter(search_filters)
+                |> Enum.map(&TimelessLogs.Entry.from_map/1)
 
               {:error, reason} ->
-                LogStream.Telemetry.event(
-                  [:log_stream, :block, :error],
+                TimelessLogs.Telemetry.event(
+                  [:timeless_logs, :block, :error],
                   %{},
                   %{file_path: file_path, reason: reason}
                 )
@@ -479,19 +479,19 @@ defmodule LogStream.Index do
 
           read_result =
             case storage do
-              :disk -> LogStream.Writer.read_block(file_path, format_atom)
+              :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
               :memory -> read_block_data(block_id)
             end
 
           case read_result do
             {:ok, entries} ->
               entries
-              |> LogStream.Filter.filter(search_filters)
-              |> Enum.map(&LogStream.Entry.from_map/1)
+              |> TimelessLogs.Filter.filter(search_filters)
+              |> Enum.map(&TimelessLogs.Entry.from_map/1)
 
             {:error, reason} ->
-              LogStream.Telemetry.event(
-                [:log_stream, :block, :error],
+              TimelessLogs.Telemetry.event(
+                [:timeless_logs, :block, :error],
                 %{},
                 %{file_path: file_path, reason: reason}
               )
@@ -511,14 +511,14 @@ defmodule LogStream.Index do
     page = sorted |> Enum.drop(offset) |> Enum.take(limit)
     duration = System.monotonic_time() - start_time
 
-    LogStream.Telemetry.event(
-      [:log_stream, :query, :stop],
+    TimelessLogs.Telemetry.event(
+      [:timeless_logs, :query, :stop],
       %{duration: duration, total: total, blocks_read: blocks_read},
       %{filters: search_filters}
     )
 
     {:ok,
-     %LogStream.Result{
+     %TimelessLogs.Result{
        entries: page,
        total: total,
        limit: limit,
@@ -535,7 +535,7 @@ defmodule LogStream.Index do
     result =
       case Exqlite.Sqlite3.step(db, stmt) do
         {:row, [data, format]} when is_binary(data) ->
-          LogStream.Writer.decompress_block(data, to_format_atom(format))
+          TimelessLogs.Writer.decompress_block(data, to_format_atom(format))
 
         {:row, [nil, _format]} ->
           {:error, :no_data}

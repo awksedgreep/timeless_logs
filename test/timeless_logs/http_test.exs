@@ -1,4 +1,4 @@
-defmodule LogStream.HTTPTest do
+defmodule TimelessLogs.HTTPTest do
   use ExUnit.Case, async: false
 
   import Plug.Test
@@ -8,16 +8,16 @@ defmodule LogStream.HTTPTest do
   @data_dir "test/tmp/http_test"
 
   setup do
-    Application.stop(:log_stream)
+    Application.stop(:timeless_logs)
     File.rm_rf!(@data_dir)
-    Application.put_env(:log_stream, :data_dir, @data_dir)
-    Application.put_env(:log_stream, :flush_interval, 60_000)
-    Application.put_env(:log_stream, :max_buffer_size, 10_000)
-    Application.put_env(:log_stream, :http, false)
-    Application.ensure_all_started(:log_stream)
+    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    Application.put_env(:timeless_logs, :flush_interval, 60_000)
+    Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_logs, :http, false)
+    Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
-      Application.stop(:log_stream)
+      Application.stop(:timeless_logs)
       File.rm_rf!(@data_dir)
     end)
 
@@ -25,7 +25,7 @@ defmodule LogStream.HTTPTest do
   end
 
   defp call(conn, opts \\ []) do
-    LogStream.HTTP.call(conn, LogStream.HTTP.init(opts))
+    TimelessLogs.HTTP.call(conn, TimelessLogs.HTTP.init(opts))
   end
 
   defp json_body(conn) do
@@ -60,9 +60,9 @@ defmodule LogStream.HTTPTest do
 
       assert conn.status == 204
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{entries: entries}} = LogStream.query([])
+      {:ok, %{entries: entries}} = TimelessLogs.query([])
       assert length(entries) == 2
       messages = Enum.map(entries, & &1.message)
       assert "hello world" in messages
@@ -79,9 +79,9 @@ defmodule LogStream.HTTPTest do
 
       assert conn.status == 204
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{entries: entries}} = LogStream.query(level: :warning)
+      {:ok, %{entries: entries}} = TimelessLogs.query(level: :warning)
       assert length(entries) == 1
       assert hd(entries).message == "custom msg"
     end
@@ -110,9 +110,9 @@ defmodule LogStream.HTTPTest do
 
       assert conn.status == 204
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{entries: [entry]}} = LogStream.query([])
+      {:ok, %{entries: [entry]}} = TimelessLogs.query([])
       assert entry.metadata[:service] == "api"
       assert entry.metadata[:region] == "us-east"
     end
@@ -127,9 +127,9 @@ defmodule LogStream.HTTPTest do
 
       assert conn.status == 204
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{entries: [entry]}} = LogStream.query([])
+      {:ok, %{entries: [entry]}} = TimelessLogs.query([])
       # 2024-01-15T10:30:00Z as microseconds
       assert entry.timestamp == 1_705_314_600_000_000
     end
@@ -144,9 +144,9 @@ defmodule LogStream.HTTPTest do
 
       assert conn.status == 204
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{entries: [entry]}} = LogStream.query([])
+      {:ok, %{entries: [entry]}} = TimelessLogs.query([])
       assert entry.timestamp == 1_700_000_000_000_000
     end
   end
@@ -166,7 +166,7 @@ defmodule LogStream.HTTPTest do
       |> put_req_header("content-type", "application/x-ndjson")
       |> call()
 
-      LogStream.flush()
+      TimelessLogs.flush()
       :ok
     end
 
@@ -234,7 +234,7 @@ defmodule LogStream.HTTPTest do
       |> put_req_header("content-type", "application/x-ndjson")
       |> call()
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
       conn = conn(:get, "/select/logsql/stats") |> call()
       stats = json_body(conn)
@@ -264,7 +264,7 @@ defmodule LogStream.HTTPTest do
       |> put_req_header("content-type", "application/x-ndjson")
       |> call()
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
       conn =
         conn(:post, "/api/v1/backup", "")
@@ -290,7 +290,7 @@ defmodule LogStream.HTTPTest do
       |> put_req_header("content-type", "application/x-ndjson")
       |> call()
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
       conn =
         conn(:post, "/api/v1/backup", Jason.encode!(%{path: backup_dir}))

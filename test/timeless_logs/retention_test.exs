@@ -1,4 +1,4 @@
-defmodule LogStream.RetentionTest do
+defmodule TimelessLogs.RetentionTest do
   use ExUnit.Case, async: false
 
   require Logger
@@ -6,20 +6,20 @@ defmodule LogStream.RetentionTest do
   @data_dir "test/tmp/retention"
 
   setup do
-    Application.stop(:log_stream)
+    Application.stop(:timeless_logs)
     File.rm_rf!(@data_dir)
-    Application.put_env(:log_stream, :data_dir, @data_dir)
-    Application.put_env(:log_stream, :flush_interval, 60_000)
-    Application.put_env(:log_stream, :max_buffer_size, 10_000)
-    Application.put_env(:log_stream, :retention_max_age, nil)
-    Application.put_env(:log_stream, :retention_max_size, nil)
-    Application.put_env(:log_stream, :retention_check_interval, 600_000)
-    Application.ensure_all_started(:log_stream)
+    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    Application.put_env(:timeless_logs, :flush_interval, 60_000)
+    Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_logs, :retention_max_age, nil)
+    Application.put_env(:timeless_logs, :retention_max_size, nil)
+    Application.put_env(:timeless_logs, :retention_check_interval, 600_000)
+    Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
-      Application.stop(:log_stream)
-      Application.put_env(:log_stream, :retention_max_age, nil)
-      Application.put_env(:log_stream, :retention_max_size, nil)
+      Application.stop(:timeless_logs)
+      Application.put_env(:timeless_logs, :retention_max_age, nil)
+      Application.put_env(:timeless_logs, :retention_max_size, nil)
       File.rm_rf!(@data_dir)
     end)
 
@@ -31,34 +31,34 @@ defmodule LogStream.RetentionTest do
       # Create some log entries
       Logger.info("old log")
       Logger.info("another old log")
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %{total: before_count}} = LogStream.query([])
+      {:ok, %{total: before_count}} = TimelessLogs.query([])
       assert before_count == 2
 
       # Set max age to 0 seconds (everything is "old")
-      Application.put_env(:log_stream, :retention_max_age, 0)
+      Application.put_env(:timeless_logs, :retention_max_age, 0)
 
       # Wait a second so the blocks are definitely older than 0
       Process.sleep(1100)
 
-      assert {:ok, deleted} = LogStream.Retention.run_now()
+      assert {:ok, deleted} = TimelessLogs.Retention.run_now()
       assert deleted >= 1
 
-      {:ok, %{total: after_count}} = LogStream.query([])
+      {:ok, %{total: after_count}} = TimelessLogs.query([])
       assert after_count == 0
     end
 
     test "keeps blocks within max_age" do
       Logger.info("fresh log")
-      LogStream.flush()
+      TimelessLogs.flush()
 
       # Set max age to 1 hour - blocks should be kept
-      Application.put_env(:log_stream, :retention_max_age, 3600)
+      Application.put_env(:timeless_logs, :retention_max_age, 3600)
 
-      assert {:ok, 0} = LogStream.Retention.run_now()
+      assert {:ok, 0} = TimelessLogs.Retention.run_now()
 
-      {:ok, %{total: count}} = LogStream.query([])
+      {:ok, %{total: count}} = TimelessLogs.query([])
       assert count == 1
     end
   end
@@ -68,19 +68,19 @@ defmodule LogStream.RetentionTest do
       # Create multiple blocks
       for i <- 1..5 do
         Logger.info("block #{i} entry", batch: "#{i}")
-        LogStream.flush()
+        TimelessLogs.flush()
       end
 
-      {:ok, %{total: before_count}} = LogStream.query([])
+      {:ok, %{total: before_count}} = TimelessLogs.query([])
       assert before_count == 5
 
       # Set a very small size limit to force deletion
-      Application.put_env(:log_stream, :retention_max_size, 1)
+      Application.put_env(:timeless_logs, :retention_max_size, 1)
 
-      assert {:ok, deleted} = LogStream.Retention.run_now()
+      assert {:ok, deleted} = TimelessLogs.Retention.run_now()
       assert deleted >= 1
 
-      {:ok, %{total: after_count}} = LogStream.query([])
+      {:ok, %{total: after_count}} = TimelessLogs.query([])
       assert after_count < before_count
     end
   end
@@ -88,27 +88,27 @@ defmodule LogStream.RetentionTest do
   describe "no retention configured" do
     test "does nothing when both max_age and max_size are nil" do
       Logger.info("keeper")
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      assert :noop = LogStream.Retention.run_now()
+      assert :noop = TimelessLogs.Retention.run_now()
 
-      {:ok, %{total: 1}} = LogStream.query([])
+      {:ok, %{total: 1}} = TimelessLogs.query([])
     end
   end
 
   describe "block file cleanup" do
     test "removes block files from disk when deleting" do
       Logger.info("will be deleted")
-      LogStream.flush()
+      TimelessLogs.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
       block_files_before = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files_before) == 1
 
-      Application.put_env(:log_stream, :retention_max_age, 0)
+      Application.put_env(:timeless_logs, :retention_max_age, 0)
       Process.sleep(1100)
 
-      LogStream.Retention.run_now()
+      TimelessLogs.Retention.run_now()
 
       block_files_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(block_files_after) == 0

@@ -1,4 +1,4 @@
-defmodule LogStream.Compactor do
+defmodule TimelessLogs.Compactor do
   @moduledoc false
 
   use GenServer
@@ -18,8 +18,8 @@ defmodule LogStream.Compactor do
   @impl true
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
-    data_dir = Keyword.get(opts, :data_dir, LogStream.Config.data_dir())
-    interval = LogStream.Config.compaction_interval()
+    data_dir = Keyword.get(opts, :data_dir, TimelessLogs.Config.data_dir())
+    interval = TimelessLogs.Config.compaction_interval()
     schedule(interval)
 
     {:ok, %{storage: storage, data_dir: data_dir, interval: interval}}
@@ -43,9 +43,9 @@ defmodule LogStream.Compactor do
   end
 
   defp maybe_compact(state) do
-    stats = LogStream.Index.raw_block_stats()
-    threshold = LogStream.Config.compaction_threshold()
-    max_age = LogStream.Config.compaction_max_raw_age()
+    stats = TimelessLogs.Index.raw_block_stats()
+    threshold = TimelessLogs.Config.compaction_threshold()
+    max_age = TimelessLogs.Config.compaction_max_raw_age()
     now = System.system_time(:second)
 
     age_exceeded =
@@ -62,15 +62,15 @@ defmodule LogStream.Compactor do
 
   defp do_compact(state) do
     start_time = System.monotonic_time()
-    raw_blocks = LogStream.Index.raw_block_ids()
+    raw_blocks = TimelessLogs.Index.raw_block_ids()
 
     # Read all entries from raw blocks
     all_entries =
       Enum.flat_map(raw_blocks, fn {block_id, file_path} ->
         read_result =
           case state.storage do
-            :disk -> LogStream.Writer.read_block(file_path, :raw)
-            :memory -> LogStream.Index.read_block_data(block_id)
+            :disk -> TimelessLogs.Writer.read_block(file_path, :raw)
+            :memory -> TimelessLogs.Index.read_block_data(block_id)
           end
 
         case read_result do
@@ -88,15 +88,15 @@ defmodule LogStream.Compactor do
       # Write as single compressed block
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
-      case LogStream.Writer.write_block(sorted, write_target, :zstd) do
+      case TimelessLogs.Writer.write_block(sorted, write_target, :zstd) do
         {:ok, new_meta} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
-          LogStream.Index.compact_blocks(old_ids, new_meta, sorted)
+          TimelessLogs.Index.compact_blocks(old_ids, new_meta, sorted)
 
           duration = System.monotonic_time() - start_time
 
-          LogStream.Telemetry.event(
-            [:log_stream, :compaction, :stop],
+          TimelessLogs.Telemetry.event(
+            [:timeless_logs, :compaction, :stop],
             %{
               duration: duration,
               raw_blocks: length(raw_blocks),
@@ -109,7 +109,7 @@ defmodule LogStream.Compactor do
           :ok
 
         {:error, reason} ->
-          Logger.warning("LogStream: compaction failed: #{inspect(reason)}")
+          Logger.warning("TimelessLogs: compaction failed: #{inspect(reason)}")
           :noop
       end
     end

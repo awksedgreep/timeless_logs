@@ -1,4 +1,4 @@
-defmodule LogStreamTest do
+defmodule TimelessLogsTest do
   use ExUnit.Case, async: false
 
   require Logger
@@ -7,15 +7,15 @@ defmodule LogStreamTest do
 
   setup do
     # Stop app so we can reconfigure with test data dir
-    Application.stop(:log_stream)
+    Application.stop(:timeless_logs)
     File.rm_rf!(@data_dir)
-    Application.put_env(:log_stream, :data_dir, @data_dir)
-    Application.put_env(:log_stream, :flush_interval, 60_000)
-    Application.put_env(:log_stream, :max_buffer_size, 10_000)
-    Application.ensure_all_started(:log_stream)
+    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    Application.put_env(:timeless_logs, :flush_interval, 60_000)
+    Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
+    Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
-      Application.stop(:log_stream)
+      Application.stop(:timeless_logs)
       File.rm_rf!(@data_dir)
     end)
 
@@ -28,17 +28,17 @@ defmodule LogStreamTest do
       Logger.error("something broke", request_id: "req-123")
       Logger.warning("disk almost full", service: "storage")
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: errors, total: 1}} =
-        LogStream.query(level: :error)
+      {:ok, %TimelessLogs.Result{entries: errors, total: 1}} =
+        TimelessLogs.query(level: :error)
 
       assert length(errors) == 1
       assert hd(errors).message =~ "something broke"
-      assert %LogStream.Entry{} = hd(errors)
+      assert %TimelessLogs.Entry{} = hd(errors)
 
-      {:ok, %LogStream.Result{entries: all, total: 3}} =
-        LogStream.query([])
+      {:ok, %TimelessLogs.Result{entries: all, total: 3}} =
+        TimelessLogs.query([])
 
       assert length(all) == 3
     end
@@ -47,10 +47,10 @@ defmodule LogStreamTest do
       Logger.error("timeout", service: "api", request_id: "abc")
       Logger.error("timeout", service: "web", request_id: "def")
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: results}} =
-        LogStream.query(level: :error, metadata: %{service: "api"})
+      {:ok, %TimelessLogs.Result{entries: results}} =
+        TimelessLogs.query(level: :error, metadata: %{service: "api"})
 
       assert length(results) == 1
       assert hd(results).metadata["request_id"] == "abc"
@@ -61,10 +61,10 @@ defmodule LogStreamTest do
       Logger.info("user logged out")
       Logger.info("database connection established")
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: results, total: 2}} =
-        LogStream.query(message: "logged")
+      {:ok, %TimelessLogs.Result{entries: results, total: 2}} =
+        TimelessLogs.query(message: "logged")
 
       assert length(results) == 2
     end
@@ -74,7 +74,7 @@ defmodule LogStreamTest do
         Logger.info("log entry number #{i}", iteration: "#{i}")
       end
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
       raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
@@ -83,7 +83,7 @@ defmodule LogStreamTest do
       # Raw blocks use term_to_binary without zstd compression
       file = hd(raw_files)
       data = File.read!(file)
-      assert {:ok, entries} = LogStream.Writer.decompress_block(data, :raw)
+      assert {:ok, entries} = TimelessLogs.Writer.decompress_block(data, :raw)
       assert length(entries) >= 1
     end
 
@@ -91,15 +91,15 @@ defmodule LogStreamTest do
       now = System.system_time(:second)
 
       Logger.info("recent log")
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: results}} =
-        LogStream.query(since: now - 10)
+      {:ok, %TimelessLogs.Result{entries: results}} =
+        TimelessLogs.query(since: now - 10)
 
       assert length(results) >= 1
 
-      {:ok, %LogStream.Result{entries: []}} =
-        LogStream.query(since: now + 3600)
+      {:ok, %TimelessLogs.Result{entries: []}} =
+        TimelessLogs.query(since: now + 3600)
     end
 
     test "pagination with limit and offset" do
@@ -107,15 +107,15 @@ defmodule LogStreamTest do
         Logger.info("entry #{String.pad_leading(Integer.to_string(i), 2, "0")}")
       end
 
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: page1, total: 20, limit: 5, offset: 0}} =
-        LogStream.query(limit: 5)
+      {:ok, %TimelessLogs.Result{entries: page1, total: 20, limit: 5, offset: 0}} =
+        TimelessLogs.query(limit: 5)
 
       assert length(page1) == 5
 
-      {:ok, %LogStream.Result{entries: page2, total: 20, offset: 5}} =
-        LogStream.query(limit: 5, offset: 5)
+      {:ok, %TimelessLogs.Result{entries: page2, total: 20, offset: 5}} =
+        TimelessLogs.query(limit: 5, offset: 5)
 
       assert length(page2) == 5
       assert hd(page1).timestamp != hd(page2).timestamp || hd(page1).message != hd(page2).message
@@ -125,13 +125,13 @@ defmodule LogStreamTest do
       Logger.info("first")
       Process.sleep(1100)
       Logger.info("second")
-      LogStream.flush()
+      TimelessLogs.flush()
 
-      {:ok, %LogStream.Result{entries: desc}} =
-        LogStream.query(order: :desc)
+      {:ok, %TimelessLogs.Result{entries: desc}} =
+        TimelessLogs.query(order: :desc)
 
-      {:ok, %LogStream.Result{entries: asc}} =
-        LogStream.query(order: :asc)
+      {:ok, %TimelessLogs.Result{entries: asc}} =
+        TimelessLogs.query(order: :asc)
 
       assert hd(desc).timestamp >= hd(asc).timestamp
     end

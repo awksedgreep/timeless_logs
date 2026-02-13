@@ -1,4 +1,4 @@
-defmodule LogStream.Buffer do
+defmodule TimelessLogs.Buffer do
   @moduledoc false
 
   use GenServer
@@ -15,23 +15,23 @@ defmodule LogStream.Buffer do
 
   @spec flush() :: :ok
   def flush do
-    GenServer.call(__MODULE__, :flush, LogStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :flush, TimelessLogs.Config.query_timeout())
   end
 
   @impl true
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
-    interval = LogStream.Config.flush_interval()
+    interval = TimelessLogs.Config.flush_interval()
     schedule_flush(interval)
 
-    :logger.add_handler(LogStream.Handler.handler_id(), LogStream.Handler, %{level: :all})
+    :logger.add_handler(TimelessLogs.Handler.handler_id(), TimelessLogs.Handler, %{level: :all})
 
     {:ok, %{buffer: [], buffer_size: 0, data_dir: data_dir, flush_interval: interval}}
   end
 
   @impl true
   def terminate(_reason, state) do
-    :logger.remove_handler(LogStream.Handler.handler_id())
+    :logger.remove_handler(TimelessLogs.Handler.handler_id())
     do_flush(state.buffer, state.data_dir, sync: true)
     :ok
   end
@@ -42,7 +42,7 @@ defmodule LogStream.Buffer do
     buffer = [entry | state.buffer]
     size = state.buffer_size + 1
 
-    if size >= LogStream.Config.max_buffer_size() do
+    if size >= TimelessLogs.Config.max_buffer_size() do
       do_flush(buffer, state.data_dir)
       {:noreply, %{state | buffer: [], buffer_size: 0}}
     else
@@ -73,20 +73,20 @@ defmodule LogStream.Buffer do
     entries = Enum.reverse(buffer)
     start_time = System.monotonic_time()
 
-    write_target = if LogStream.Config.storage() == :memory, do: :memory, else: data_dir
+    write_target = if TimelessLogs.Config.storage() == :memory, do: :memory, else: data_dir
 
-    case LogStream.Writer.write_block(entries, write_target, :raw) do
+    case TimelessLogs.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
         if Keyword.get(opts, :sync, false) do
-          LogStream.Index.index_block(block_meta, entries)
+          TimelessLogs.Index.index_block(block_meta, entries)
         else
-          LogStream.Index.index_block_async(block_meta, entries)
+          TimelessLogs.Index.index_block_async(block_meta, entries)
         end
 
         duration = System.monotonic_time() - start_time
 
-        LogStream.Telemetry.event(
-          [:log_stream, :flush, :stop],
+        TimelessLogs.Telemetry.event(
+          [:timeless_logs, :flush, :stop],
           %{
             duration: duration,
             entry_count: block_meta.entry_count,
@@ -96,7 +96,7 @@ defmodule LogStream.Buffer do
         )
 
       {:error, reason} ->
-        IO.warn("LogStream: failed to write block: #{inspect(reason)}")
+        IO.warn("TimelessLogs: failed to write block: #{inspect(reason)}")
     end
   end
 
@@ -105,17 +105,17 @@ defmodule LogStream.Buffer do
   end
 
   defp broadcast_to_subscribers(entry) do
-    case Registry.count_match(LogStream.Registry, :log_entries, :_) do
+    case Registry.count_match(TimelessLogs.Registry, :log_entries, :_) do
       0 ->
         :ok
 
       _n ->
-        entry_struct = LogStream.Entry.from_map(entry)
+        entry_struct = TimelessLogs.Entry.from_map(entry)
 
-        Registry.dispatch(LogStream.Registry, :log_entries, fn subscribers ->
+        Registry.dispatch(TimelessLogs.Registry, :log_entries, fn subscribers ->
           for {pid, opts} <- subscribers do
             if matches_subscription?(entry, opts) do
-              send(pid, {:log_stream, :entry, entry_struct})
+              send(pid, {:timeless_logs, :entry, entry_struct})
             end
           end
         end)

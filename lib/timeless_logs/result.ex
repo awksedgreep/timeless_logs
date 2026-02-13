@@ -1,4 +1,4 @@
-defmodule LogStream.Result do
+defmodule TimelessLogs.Result do
   @moduledoc """
   Query result with pagination metadata.
   """
@@ -6,7 +6,7 @@ defmodule LogStream.Result do
   defstruct entries: [], total: 0, limit: 100, offset: 0
 
   @type t :: %__MODULE__{
-          entries: [LogStream.Entry.t()],
+          entries: [TimelessLogs.Entry.t()],
           total: non_neg_integer(),
           limit: pos_integer(),
           offset: non_neg_integer()

@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.LogStream.IngestBenchmark do
+defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
   @moduledoc "Benchmark ingestion throughput through the full pipeline"
   use Mix.Task
 
@@ -10,13 +10,13 @@ defmodule Mix.Tasks.LogStream.IngestBenchmark do
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    Application.put_env(:log_stream, :data_dir, data_dir)
-    Application.put_env(:log_stream, :storage, :disk)
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
+    Application.put_env(:timeless_logs, :storage, :disk)
     # Disable compaction during benchmark
-    Application.put_env(:log_stream, :compaction_interval, 600_000)
+    Application.put_env(:timeless_logs, :compaction_interval, 600_000)
     Mix.Task.run("app.start")
 
-    IO.puts("=== LogStream Ingestion Benchmark ===\n")
+    IO.puts("=== TimelessLogs Ingestion Benchmark ===\n")
 
     # Pre-generate entries to exclude generation time
     entry_count = 500_000
@@ -34,7 +34,7 @@ defmodule Mix.Tasks.LogStream.IngestBenchmark do
         entries
         |> Enum.chunk_every(1000)
         |> Enum.reduce(0, fn chunk, count ->
-          case LogStream.Writer.write_block(chunk, writer_dir, :raw) do
+          case TimelessLogs.Writer.write_block(chunk, writer_dir, :raw) do
             {:ok, _} -> count + 1
             _ -> count
           end
@@ -49,18 +49,18 @@ defmodule Mix.Tasks.LogStream.IngestBenchmark do
     IO.puts("--- Phase 2: Writer + Index (sync) ---")
     idx_dir = Path.join(data_dir, "idx_bench")
     File.mkdir_p!(Path.join(idx_dir, "blocks"))
-    Application.stop(:log_stream)
-    Application.put_env(:log_stream, :data_dir, idx_dir)
-    Application.ensure_all_started(:log_stream)
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, idx_dir)
+    Application.ensure_all_started(:timeless_logs)
 
     {idx_us, idx_blocks} =
       :timer.tc(fn ->
         entries
         |> Enum.chunk_every(1000)
         |> Enum.reduce(0, fn chunk, count ->
-          case LogStream.Writer.write_block(chunk, idx_dir, :raw) do
+          case TimelessLogs.Writer.write_block(chunk, idx_dir, :raw) do
             {:ok, meta} ->
-              LogStream.Index.index_block(meta, chunk)
+              TimelessLogs.Index.index_block(meta, chunk)
               count + 1
 
             _ ->
@@ -79,24 +79,24 @@ defmodule Mix.Tasks.LogStream.IngestBenchmark do
     IO.puts("--- Phase 3: Full pipeline (Buffer.log → Writer → Index) ---")
     pipe_dir = Path.join(data_dir, "pipe_bench")
     File.mkdir_p!(Path.join(pipe_dir, "blocks"))
-    Application.stop(:log_stream)
-    Application.put_env(:log_stream, :data_dir, pipe_dir)
-    Application.ensure_all_started(:log_stream)
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, pipe_dir)
+    Application.ensure_all_started(:timeless_logs)
 
     {pipe_us, _} =
       :timer.tc(fn ->
         for entry <- entries do
-          LogStream.Buffer.log(entry)
+          TimelessLogs.Buffer.log(entry)
         end
 
         # Flush remaining buffer
-        LogStream.Buffer.flush()
+        TimelessLogs.Buffer.flush()
         # Drain Index mailbox — stats call waits behind pending casts
-        LogStream.Index.stats()
+        TimelessLogs.Index.stats()
       end)
 
     pipe_eps = entry_count / (pipe_us / 1_000_000)
-    {:ok, stats} = LogStream.Index.stats()
+    {:ok, stats} = TimelessLogs.Index.stats()
 
     IO.puts("  #{stats.total_blocks} blocks, #{fmt_number(stats.total_entries)} entries indexed")
     IO.puts("  Wall time: #{fmt_ms(pipe_us)}")
@@ -108,7 +108,7 @@ defmodule Mix.Tasks.LogStream.IngestBenchmark do
     IO.puts("  Writer + Index:   #{fmt_number(round(idx_eps))} entries/sec")
     IO.puts("  Full pipeline:    #{fmt_number(round(pipe_eps))} entries/sec")
 
-    Application.stop(:log_stream)
+    Application.stop(:timeless_logs)
     File.rm_rf!(data_dir)
   end
 

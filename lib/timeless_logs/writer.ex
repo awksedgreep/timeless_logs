@@ -1,4 +1,4 @@
-defmodule LogStream.Writer do
+defmodule TimelessLogs.Writer do
   @moduledoc false
 
   require Logger
@@ -26,7 +26,7 @@ defmodule LogStream.Writer do
           binary
 
         :zstd ->
-          :ezstd.compress(binary, Keyword.get(opts, :level, LogStream.Config.compression_level()))
+          :ezstd.compress(binary, Keyword.get(opts, :level, TimelessLogs.Config.compression_level()))
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
@@ -57,7 +57,7 @@ defmodule LogStream.Writer do
         :zstd ->
           {:ezstd.compress(
              binary,
-             Keyword.get(opts, :level, LogStream.Config.compression_level())
+             Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
            ), "zst"}
       end
 
@@ -104,7 +104,7 @@ defmodule LogStream.Writer do
       {:ok, :erlang.binary_to_term(data)}
     rescue
       e ->
-        Logger.warning("LogStream: corrupt raw block data: #{inspect(e)}")
+        Logger.warning("TimelessLogs: corrupt raw block data: #{inspect(e)}")
         {:error, :corrupt_block}
     end
   end
@@ -115,7 +115,7 @@ defmodule LogStream.Writer do
       {:ok, :erlang.binary_to_term(binary)}
     rescue
       e ->
-        Logger.warning("LogStream: corrupt block data: #{inspect(e)}")
+        Logger.warning("TimelessLogs: corrupt block data: #{inspect(e)}")
         {:error, :corrupt_block}
     end
   end
@@ -127,7 +127,7 @@ defmodule LogStream.Writer do
         decompress_block(data, format)
 
       {:error, reason} ->
-        Logger.warning("LogStream: cannot read block #{file_path}: #{inspect(reason)}")
+        Logger.warning("TimelessLogs: cannot read block #{file_path}: #{inspect(reason)}")
         {:error, reason}
     end
   end

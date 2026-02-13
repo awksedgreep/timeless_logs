@@ -1,16 +1,16 @@
-defmodule LogStream.MixProject do
+defmodule TimelessLogs.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :log_stream,
+      app: :timeless_logs,
       version: "0.6.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: "Embedded log compression and indexing for Elixir applications.",
-      source_url: "https://github.com/awksedgreep/log_stream",
-      homepage_url: "https://github.com/awksedgreep/log_stream",
+      source_url: "https://github.com/awksedgreep/timeless_logs",
+      homepage_url: "https://github.com/awksedgreep/timeless_logs",
       package: package(),
       docs: docs()
     ]
@@ -19,7 +19,7 @@ defmodule LogStream.MixProject do
   def application do
     [
       extra_applications: [:logger],
-      mod: {LogStream.Application, []}
+      mod: {TimelessLogs.Application, []}
     ]
   end
 
@@ -38,7 +38,7 @@ defmodule LogStream.MixProject do
     [
       maintainers: ["Matt Cotner"],
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/awksedgreep/log_stream"},
+      links: %{"GitHub" => "https://github.com/awksedgreep/timeless_logs"},
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
     ]
   end

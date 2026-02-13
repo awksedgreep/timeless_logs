@@ -1,4 +1,4 @@
-defmodule LogStream.HTTP do
+defmodule TimelessLogs.HTTP do
   require Logger
 
   @moduledoc """
@@ -8,13 +8,13 @@ defmodule LogStream.HTTP do
 
   Add to your config:
 
-      config :log_stream, http: true                          # port 9428, no auth
-      config :log_stream, http: [port: 9500, bearer_token: "secret"]
+      config :timeless_logs, http: true                          # port 9428, no auth
+      config :timeless_logs, http: [port: 9500, bearer_token: "secret"]
 
   Or add to your supervision tree directly:
 
       children = [
-        {LogStream.HTTP, port: 9428}
+        {TimelessLogs.HTTP, port: 9428}
       ]
 
   ## Endpoints
@@ -58,7 +58,7 @@ defmodule LogStream.HTTP do
   @impl Plug
   def call(conn, opts) do
     conn
-    |> Plug.Conn.put_private(:log_stream_token, Keyword.get(opts, :bearer_token))
+    |> Plug.Conn.put_private(:timeless_logs_token, Keyword.get(opts, :bearer_token))
     |> super(opts)
   end
 
@@ -68,7 +68,7 @@ defmodule LogStream.HTTP do
   defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
 
   defp authenticate(conn, _opts) do
-    case conn.private[:log_stream_token] do
+    case conn.private[:timeless_logs_token] do
       nil -> conn
       expected -> check_token(conn, expected)
     end
@@ -107,7 +107,7 @@ defmodule LogStream.HTTP do
 
   # Health check
   get "/health" do
-    {:ok, stats} = LogStream.stats()
+    {:ok, stats} = TimelessLogs.stats()
 
     body =
       Jason.encode!(%{
@@ -157,7 +157,7 @@ defmodule LogStream.HTTP do
 
     filters = build_query_filters(params)
 
-    case LogStream.query(filters) do
+    case TimelessLogs.query(filters) do
       {:ok, %{entries: entries}} ->
         body =
           entries
@@ -178,7 +178,7 @@ defmodule LogStream.HTTP do
 
   # Storage statistics
   get "/select/logsql/stats" do
-    {:ok, stats} = LogStream.stats()
+    {:ok, stats} = TimelessLogs.stats()
 
     conn
     |> put_resp_content_type("application/json")
@@ -212,7 +212,7 @@ defmodule LogStream.HTTP do
 
     target_dir = parsed_path || default_backup_dir()
 
-    case LogStream.backup(target_dir) do
+    case TimelessLogs.backup(target_dir) do
       {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
@@ -230,7 +230,7 @@ defmodule LogStream.HTTP do
 
   # Force buffer flush
   get "/api/v1/flush" do
-    LogStream.flush()
+    TimelessLogs.flush()
 
     conn
     |> put_resp_content_type("application/json")
@@ -249,7 +249,7 @@ defmodule LogStream.HTTP do
     |> Enum.reduce({0, 0}, fn line, {count, errors} ->
       case parse_log_line(line, msg_field, time_field) do
         {:ok, entry} ->
-          LogStream.Buffer.log(entry)
+          TimelessLogs.Buffer.log(entry)
           {count + 1, errors}
 
         :error ->
@@ -389,7 +389,7 @@ defmodule LogStream.HTTP do
   end
 
   defp default_backup_dir do
-    data_dir = LogStream.Config.data_dir()
+    data_dir = TimelessLogs.Config.data_dir()
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 

@@ -1,4 +1,4 @@
-defmodule LogStream.Entry do
+defmodule TimelessLogs.Entry do
   @moduledoc """
   A single log entry.
   """

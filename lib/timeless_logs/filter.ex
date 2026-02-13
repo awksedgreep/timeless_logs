@@ -1,4 +1,4 @@
-defmodule LogStream.Filter do
+defmodule TimelessLogs.Filter do
   @moduledoc false
 
   @spec filter([map()], keyword()) :: [map()]

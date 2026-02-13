@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.LogStream.SearchBenchmark do
+defmodule Mix.Tasks.TimelessLogs.SearchBenchmark do
   @moduledoc "Benchmark search speed across query patterns on a week of indexed Phoenix logs"
   use Mix.Task
 
@@ -12,7 +12,7 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    IO.puts("=== LogStream Search Benchmark ===\n")
+    IO.puts("=== TimelessLogs Search Benchmark ===\n")
     IO.puts("Generating 1 week of Phoenix logs...")
 
     {entries, _raw_size} = generate_week_of_logs()
@@ -50,7 +50,7 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       Enum.map(queries, fn {label, filters} ->
         times =
           for _ <- 1..5 do
-            {us, {:ok, result}} = :timer.tc(fn -> LogStream.Index.query(filters) end)
+            {us, {:ok, result}} = :timer.tc(fn -> TimelessLogs.Index.query(filters) end)
             {us, result}
           end
 
@@ -141,7 +141,7 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
       entries
       |> Enum.chunk_every(1000)
       |> Enum.reduce(0, fn chunk, count ->
-        case LogStream.Writer.write_block(chunk, data_dir) do
+        case TimelessLogs.Writer.write_block(chunk, data_dir) do
           {:ok, meta} ->
             index_block_direct(db, meta, chunk)
             count + 1
@@ -155,9 +155,9 @@ defmodule Mix.Tasks.LogStream.SearchBenchmark do
 
     # Point the running Index GenServer at this data
     # We need to restart the app with this data_dir
-    Application.stop(:log_stream)
-    Application.put_env(:log_stream, :data_dir, data_dir)
-    Application.ensure_all_started(:log_stream)
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
+    Application.ensure_all_started(:timeless_logs)
 
     index_size = File.stat!(db_path).size
     {block_count, index_size}
