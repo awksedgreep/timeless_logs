@@ -91,8 +91,8 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
 
         # Flush remaining buffer
         TimelessLogs.Buffer.flush()
-        # Drain Index mailbox — stats call waits behind pending casts
-        TimelessLogs.Index.stats()
+        # Drain Index mailbox and publish cache
+        TimelessLogs.Index.sync()
       end)
 
     pipe_eps = entry_count / (pipe_us / 1_000_000)

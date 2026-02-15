@@ -6,6 +6,15 @@ defmodule TimelessLogs.Index do
   @default_limit 100
   @default_offset 0
 
+  # Flush pending index operations after this interval
+  @index_flush_interval 100
+
+  # Batch INSERT up to 400 terms per statement (800 params, under SQLite's 999 limit)
+  @terms_batch_size 400
+
+  @blocks_table :timeless_logs_blocks
+  @overflow_table :timeless_logs_index_overflow
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -13,235 +22,57 @@ defmodule TimelessLogs.Index do
 
   @spec index_block(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def index_block(block_meta, entries) do
-    GenServer.call(__MODULE__, {:index_block, block_meta, entries})
+    terms = extract_terms(entries)
+    GenServer.call(__MODULE__, {:index_block, block_meta, entries, terms})
   end
 
   @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
-    GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
+    terms = extract_terms(entries)
+    GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms})
   end
+
+  # --- Lock-free read functions (run in caller's process) ---
 
   @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()}
   def query(filters) do
-    # Phase 1: GenServer does the cheap SQLite lookup only
-    {block_ids, storage, pagination, search_filters} =
-      GenServer.call(__MODULE__, {:query_plan, filters}, TimelessLogs.Config.query_timeout())
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :desc)
+    block_ids = find_matching_blocks_ets(term_filters, time_filters, order)
+    storage = :persistent_term.get({__MODULE__, :storage})
 
-    # Phase 2: Parallel decompression + filtering in the caller's process
     do_query_parallel(block_ids, storage, pagination, search_filters)
-  end
-
-  @spec delete_blocks_before(integer()) :: non_neg_integer()
-  def delete_blocks_before(cutoff_timestamp) do
-    GenServer.call(__MODULE__, {:delete_before, cutoff_timestamp}, 60_000)
-  end
-
-  @spec delete_blocks_over_size(non_neg_integer()) :: non_neg_integer()
-  def delete_blocks_over_size(max_bytes) do
-    GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
   end
 
   @spec stats() :: {:ok, TimelessLogs.Stats.t()}
   def stats do
-    GenServer.call(__MODULE__, :stats, TimelessLogs.Config.query_timeout())
-  end
+    db_path = :persistent_term.get({__MODULE__, :db_path})
 
-  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
-  def matching_block_ids(filters) do
-    GenServer.call(
-      __MODULE__,
-      {:matching_block_ids, filters},
-      TimelessLogs.Config.query_timeout()
-    )
-  end
+    rows = :ets.tab2list(@blocks_table)
 
-  @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
-  def read_block_data(block_id) do
-    GenServer.call(__MODULE__, {:read_block_data, block_id}, TimelessLogs.Config.query_timeout())
-  end
+    {total_blocks, total_entries, total_bytes, oldest, newest, format_stats} =
+      Enum.reduce(
+        rows,
+        {0, 0, 0, nil, nil, %{}},
+        fn {_bid, _fp, byte_size, entry_count, ts_min, ts_max, format, _created_at},
+           {blocks, entries, bytes, old, new, fstats} ->
+          new_old = if old == nil or ts_min < old, do: ts_min, else: old
+          new_new = if new == nil or ts_max > new, do: ts_max, else: new
 
-  @spec raw_block_stats() :: %{
-          entry_count: integer(),
-          block_count: integer(),
-          oldest_created_at: integer() | nil
-        }
-  def raw_block_stats do
-    GenServer.call(__MODULE__, :raw_block_stats, TimelessLogs.Config.query_timeout())
-  end
+          fmt_key = Atom.to_string(format)
+          cur = Map.get(fstats, fmt_key, %{blocks: 0, bytes: 0, entries: 0})
 
-  @spec raw_block_ids() :: [{integer(), String.t() | nil}]
-  def raw_block_ids do
-    GenServer.call(__MODULE__, :raw_block_ids, TimelessLogs.Config.query_timeout())
-  end
+          updated = %{
+            blocks: cur.blocks + 1,
+            bytes: cur.bytes + byte_size,
+            entries: cur.entries + entry_count
+          }
 
-  @spec compact_blocks([integer()], [{TimelessLogs.Writer.block_meta(), [map()]}]) :: :ok
-  def compact_blocks(old_block_ids, meta_chunk_pairs) do
-    GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, meta_chunk_pairs}, 60_000)
-  end
-
-  @spec backup(String.t()) :: :ok | {:error, term()}
-  def backup(target_path) do
-    GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
-  end
-
-  # Flush pending index operations after this interval
-  @index_flush_interval 100
-
-  @impl true
-  def init(opts) do
-    storage = Keyword.get(opts, :storage, :disk)
-
-    {db, db_path} =
-      case storage do
-        :memory ->
-          {:ok, db} = Exqlite.Sqlite3.open(":memory:")
-          {db, nil}
-
-        :disk ->
-          data_dir = Keyword.fetch!(opts, :data_dir)
-          db_path = Path.join(data_dir, "index.db")
-          {:ok, db} = Exqlite.Sqlite3.open(db_path)
-          {db, db_path}
-      end
-
-    create_tables(db)
-
-    {:ok, %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    flush_pending(state)
-    Exqlite.Sqlite3.close(state.db)
-  end
-
-  @impl true
-  def handle_call({:index_block, meta, entries}, _from, state) do
-    # Sync call: flush any pending ops first, then index this block immediately
-    state = flush_pending(state)
-    result = do_index_block(state.db, meta, entries)
-    {:reply, result, state}
-  end
-
-  def handle_call({:query_plan, filters}, _from, state) do
-    state = flush_pending(state)
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :desc)
-    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
-    {:reply, {block_ids, state.storage, pagination, search_filters}, state}
-  end
-
-  @impl true
-  def handle_call({:delete_before, cutoff}, _from, state) do
-    state = flush_pending(state)
-    count = do_delete_before(state.db, cutoff, state.storage)
-    {:reply, count, state}
-  end
-
-  @impl true
-  def handle_call({:delete_over_size, max_bytes}, _from, state) do
-    state = flush_pending(state)
-    count = do_delete_over_size(state.db, max_bytes, state.storage)
-    {:reply, count, state}
-  end
-
-  @impl true
-  def handle_call({:matching_block_ids, filters}, _from, state) do
-    state = flush_pending(state)
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :asc)
-    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
-    {:reply, block_ids, state}
-  end
-
-  @impl true
-  def handle_call(:stats, _from, state) do
-    state = flush_pending(state)
-    result = do_stats(state.db, state.db_path)
-    {:reply, result, state}
-  end
-
-  @impl true
-  def handle_call({:read_block_data, block_id}, _from, state) do
-    state = flush_pending(state)
-    result = read_block_from_db(state.db, block_id)
-    {:reply, result, state}
-  end
-
-  @impl true
-  def handle_call(:raw_block_stats, _from, state) do
-    state = flush_pending(state)
-    result = do_raw_block_stats(state.db)
-    {:reply, result, state}
-  end
-
-  @impl true
-  def handle_call(:raw_block_ids, _from, state) do
-    state = flush_pending(state)
-    result = do_raw_block_ids(state.db)
-    {:reply, result, state}
-  end
-
-  def handle_call({:compact_blocks, old_ids, meta_chunk_pairs}, _from, state) do
-    state = flush_pending(state)
-    result = do_compact_blocks(state.db, old_ids, meta_chunk_pairs, state.storage)
-    {:reply, result, state}
-  end
-
-  def handle_call({:backup, target_path}, _from, state) do
-    state = flush_pending(state)
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, "VACUUM INTO ?1")
-    Exqlite.Sqlite3.bind(stmt, [target_path])
-    result = Exqlite.Sqlite3.step(state.db, stmt)
-    Exqlite.Sqlite3.release(state.db, stmt)
-
-    case result do
-      :done -> {:reply, :ok, state}
-      {:error, _} = err -> {:reply, err, state}
-    end
-  end
-
-  @impl true
-  def handle_cast({:index_block, meta, entries}, state) do
-    pending = [{meta, entries} | state.pending]
-    state = schedule_index_flush(%{state | pending: pending})
-    {:noreply, state}
-  end
-
-  @impl true
-  def handle_info(:flush_index, state) do
-    state = %{state | flush_timer: nil}
-    state = flush_pending(state)
-    {:noreply, state}
-  end
-
-  defp do_stats(db, db_path) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT
-        COUNT(*),
-        COALESCE(SUM(entry_count), 0),
-        COALESCE(SUM(byte_size), 0),
-        MIN(ts_min),
-        MAX(ts_max)
-      FROM blocks
-      """)
-
-    {:row, [total_blocks, total_entries, total_bytes, oldest, newest]} =
-      Exqlite.Sqlite3.step(db, stmt)
-
-    Exqlite.Sqlite3.release(db, stmt)
-
-    {:ok, fmt_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT format, COUNT(*), COALESCE(SUM(byte_size), 0), COALESCE(SUM(entry_count), 0)
-      FROM blocks GROUP BY format
-      """)
-
-    format_stats = collect_format_stats(db, fmt_stmt)
-    Exqlite.Sqlite3.release(db, fmt_stmt)
+          {blocks + 1, entries + entry_count, bytes + byte_size, new_old, new_new,
+           Map.put(fstats, fmt_key, updated)}
+        end
+      )
 
     index_size =
       case db_path do
@@ -273,23 +104,568 @@ defmodule TimelessLogs.Index do
      }}
   end
 
-  defp collect_format_stats(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [format, count, bytes, entries]} ->
-        Map.put(collect_format_stats(db, stmt), format, %{
-          blocks: count,
-          bytes: bytes,
-          entries: entries
-        })
+  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
+  def matching_block_ids(filters) do
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :asc)
+    find_matching_blocks_ets(term_filters, time_filters, order)
+  end
 
-      :done ->
-        %{}
+  @spec raw_block_stats() :: %{
+          entry_count: integer(),
+          block_count: integer(),
+          oldest_created_at: integer() | nil
+        }
+  def raw_block_stats do
+    rows = :ets.tab2list(@blocks_table)
+
+    Enum.reduce(
+      rows,
+      %{entry_count: 0, block_count: 0, oldest_created_at: nil},
+      fn {_bid, _fp, _bs, entry_count, _tsmin, _tsmax, format, created_at}, acc ->
+        if format == :raw do
+          oldest =
+            if acc.oldest_created_at == nil or created_at < acc.oldest_created_at,
+              do: created_at,
+              else: acc.oldest_created_at
+
+          %{
+            entry_count: acc.entry_count + entry_count,
+            block_count: acc.block_count + 1,
+            oldest_created_at: oldest
+          }
+        else
+          acc
+        end
+      end
+    )
+  end
+
+  @spec raw_block_ids() :: [{integer(), String.t() | nil}]
+  def raw_block_ids do
+    @blocks_table
+    |> :ets.tab2list()
+    |> Enum.filter(fn {_bid, _fp, _bs, _ec, _tsmin, _tsmax, format, _ca} -> format == :raw end)
+    |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
+    |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp} end)
+  end
+
+  # read_block_data stays as GenServer.call — reads BLOB from SQLite (memory mode only)
+  @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
+  def read_block_data(block_id) do
+    GenServer.call(
+      __MODULE__,
+      {:read_block_data, block_id},
+      TimelessLogs.Config.query_timeout()
+    )
+  end
+
+  @spec delete_blocks_before(integer()) :: non_neg_integer()
+  def delete_blocks_before(cutoff_timestamp) do
+    GenServer.call(__MODULE__, {:delete_before, cutoff_timestamp}, 60_000)
+  end
+
+  @spec delete_blocks_over_size(non_neg_integer()) :: non_neg_integer()
+  def delete_blocks_over_size(max_bytes) do
+    GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
+  end
+
+  @spec compact_blocks([integer()], [{TimelessLogs.Writer.block_meta(), [map()]}]) :: :ok
+  def compact_blocks(old_block_ids, meta_chunk_pairs) do
+    new_terms_list =
+      Enum.map(meta_chunk_pairs, fn {meta, entries} ->
+        {meta, entries, extract_terms(entries)}
+      end)
+
+    GenServer.call(
+      __MODULE__,
+      {:compact_blocks, old_block_ids, new_terms_list},
+      60_000
+    )
+  end
+
+  @spec backup(String.t()) :: :ok | {:error, term()}
+  def backup(target_path) do
+    GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
+  end
+
+  @spec sync() :: :ok
+  def sync, do: GenServer.call(__MODULE__, :sync, TimelessLogs.Config.query_timeout())
+
+  # --- GenServer callbacks ---
+
+  @impl true
+  def init(opts) do
+    storage = Keyword.get(opts, :storage, :disk)
+
+    {db, db_path} =
+      case storage do
+        :memory ->
+          {:ok, db} = Exqlite.Sqlite3.open(":memory:")
+          {db, nil}
+
+        :disk ->
+          data_dir = Keyword.fetch!(opts, :data_dir)
+          db_path = Path.join(data_dir, "index.db")
+          {:ok, db} = Exqlite.Sqlite3.open(db_path)
+          {db, db_path}
+      end
+
+    create_tables(db)
+
+    # Cache prepared statements for hot-path inserts
+    {:ok, block_insert_stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      """)
+
+    {:ok, terms_insert_stmt} = Exqlite.Sqlite3.prepare(db, build_terms_sql(@terms_batch_size))
+
+    # Initialize ETS tables
+    init_ets_tables()
+
+    # Store storage mode + db_path in persistent_term
+    :persistent_term.put({__MODULE__, :storage}, storage)
+    :persistent_term.put({__MODULE__, :db_path}, db_path)
+
+    # Bulk-load from SQLite into ETS/persistent_term
+    bulk_load_blocks(db)
+    bulk_load_term_index(db)
+
+    # Schedule publish timer
+    publish_interval = TimelessLogs.Config.index_publish_interval()
+    publish_ref = Process.send_after(self(), :publish, publish_interval)
+
+    {:ok,
+     %{
+       db: db,
+       db_path: db_path,
+       storage: storage,
+       pending: [],
+       flush_timer: nil,
+       block_insert_stmt: block_insert_stmt,
+       terms_insert_stmt: terms_insert_stmt,
+       publish_timer: publish_ref,
+       publish_interval: publish_interval,
+       dirty: false
+     }}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    flush_pending(state)
+
+    Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
+    Exqlite.Sqlite3.release(state.db, state.terms_insert_stmt)
+    Exqlite.Sqlite3.close(state.db)
+
+    # Clean up persistent_term keys
+    :persistent_term.erase({__MODULE__, :storage})
+    :persistent_term.erase({__MODULE__, :db_path})
+    :persistent_term.erase({__MODULE__, :term_index})
+
+    # Clean up ETS tables
+    safe_delete_ets(@blocks_table)
+    safe_delete_ets(@overflow_table)
+  end
+
+  # --- handle_call (grouped) ---
+
+  @impl true
+  def handle_call({:index_block, meta, entries, terms}, _from, state) do
+    state = flush_pending(state)
+    result = do_index_block(state, meta, entries, terms)
+    # Update cache after SQLite commit
+    insert_block_ets(meta)
+    insert_overflow(terms, meta.block_id)
+    {:reply, result, %{state | dirty: true}}
+  end
+
+  def handle_call({:delete_before, cutoff}, _from, state) do
+    state = flush_pending(state)
+
+    {count, deleted_ids, old_terms} =
+      do_delete_before(state.db, cutoff, state.storage)
+
+    remove_blocks_from_cache(deleted_ids, old_terms)
+    {:reply, count, %{state | dirty: false}}
+  end
+
+  def handle_call({:delete_over_size, max_bytes}, _from, state) do
+    state = flush_pending(state)
+
+    {count, deleted_ids, old_terms} =
+      do_delete_over_size(state.db, max_bytes, state.storage)
+
+    remove_blocks_from_cache(deleted_ids, old_terms)
+    {:reply, count, %{state | dirty: false}}
+  end
+
+  def handle_call({:read_block_data, block_id}, _from, state) do
+    state = flush_pending(state)
+    result = read_block_from_db(state.db, block_id)
+    {:reply, result, state}
+  end
+
+  def handle_call({:compact_blocks, old_ids, new_terms_list}, _from, state) do
+    state = flush_pending(state)
+
+    # Collect old terms for cache cleanup BEFORE SQLite delete
+    old_terms = collect_terms_for_blocks(state.db, old_ids)
+
+    result = do_compact_blocks(state, old_ids, new_terms_list)
+
+    # Update cache: remove old, add new
+    for id <- old_ids, do: :ets.delete(@blocks_table, id)
+    remove_block_ids_from_persistent_term(old_ids, old_terms)
+    clear_overflow_for_blocks(old_ids)
+
+    for {meta, _entries, terms} <- new_terms_list do
+      insert_block_ets(meta)
+      insert_overflow(terms, meta.block_id)
+    end
+
+    # Force immediate publish since compaction changes are significant
+    publish_overflow()
+
+    {:reply, result, %{state | dirty: false}}
+  end
+
+  def handle_call({:backup, target_path}, _from, state) do
+    state = flush_pending(state)
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, "VACUUM INTO ?1")
+    Exqlite.Sqlite3.bind(stmt, [target_path])
+    result = Exqlite.Sqlite3.step(state.db, stmt)
+    Exqlite.Sqlite3.release(state.db, stmt)
+
+    case result do
+      :done -> {:reply, :ok, state}
+      {:error, _} = err -> {:reply, err, state}
     end
   end
+
+  def handle_call(:sync, _from, state) do
+    state = flush_pending(state)
+    publish_overflow()
+    {:reply, :ok, %{state | dirty: false}}
+  end
+
+  # --- handle_cast ---
+
+  @impl true
+  def handle_cast({:index_block, meta, entries, terms}, state) do
+    pending = [{meta, entries, terms} | state.pending]
+    state = schedule_index_flush(%{state | pending: pending})
+    {:noreply, state}
+  end
+
+  # --- handle_info ---
+
+  @impl true
+  def handle_info(:flush_index, state) do
+    state = %{state | flush_timer: nil}
+    state = flush_pending(state)
+    {:noreply, state}
+  end
+
+  def handle_info(:publish, state) do
+    if state.dirty do
+      publish_overflow()
+    end
+
+    ref = Process.send_after(self(), :publish, state.publish_interval)
+    {:noreply, %{state | publish_timer: ref, dirty: false}}
+  end
+
+  # --- ETS/persistent_term initialization ---
+
+  defp init_ets_tables do
+    safe_delete_ets(@blocks_table)
+    safe_delete_ets(@overflow_table)
+
+    :ets.new(@blocks_table, [
+      :named_table,
+      :ordered_set,
+      :public,
+      read_concurrency: true
+    ])
+
+    :ets.new(@overflow_table, [
+      :named_table,
+      :duplicate_bag,
+      :public,
+      read_concurrency: true
+    ])
+
+    :persistent_term.put({__MODULE__, :term_index}, %{})
+  end
+
+  defp safe_delete_ets(table) do
+    try do
+      :ets.delete(table)
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  # --- Bulk loading from SQLite ---
+
+  defp bulk_load_blocks(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      SELECT block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at
+      FROM blocks
+      """)
+
+    bulk_load_blocks_rows(db, stmt)
+    Exqlite.Sqlite3.release(db, stmt)
+  end
+
+  defp bulk_load_blocks_rows(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at]} ->
+        :ets.insert(@blocks_table, {
+          block_id,
+          file_path,
+          byte_size,
+          entry_count,
+          ts_min,
+          ts_max,
+          to_format_atom(format),
+          created_at
+        })
+
+        bulk_load_blocks_rows(db, stmt)
+
+      :done ->
+        :ok
+    end
+  end
+
+  defp bulk_load_term_index(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, "SELECT term, block_id FROM block_terms")
+
+    term_map = bulk_load_term_rows(db, stmt, %{})
+    Exqlite.Sqlite3.release(db, stmt)
+    :persistent_term.put({__MODULE__, :term_index}, term_map)
+  end
+
+  defp bulk_load_term_rows(db, stmt, acc) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [term, block_id]} ->
+        updated =
+          Map.update(acc, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
+
+        bulk_load_term_rows(db, stmt, updated)
+
+      :done ->
+        acc
+    end
+  end
+
+  # --- Cache update helpers ---
+
+  defp insert_block_ets(meta) do
+    format = Map.get(meta, :format, :zstd)
+    created_at = System.system_time(:second)
+
+    :ets.insert(@blocks_table, {
+      meta.block_id,
+      meta[:file_path],
+      meta.byte_size,
+      meta.entry_count,
+      meta.ts_min,
+      meta.ts_max,
+      format,
+      created_at
+    })
+  end
+
+  defp insert_overflow(terms, block_id) do
+    for term <- terms do
+      :ets.insert(@overflow_table, {:term, term, block_id})
+    end
+  end
+
+  # --- Lock-free read helpers ---
+
+  defp term_block_ids(term) do
+    pt_set = Map.get(:persistent_term.get({__MODULE__, :term_index}), term, MapSet.new())
+
+    overflow_ids =
+      @overflow_table
+      |> :ets.match({:term, term, :"$1"})
+      |> List.flatten()
+      |> MapSet.new()
+
+    MapSet.union(pt_set, overflow_ids)
+  end
+
+  defp find_matching_blocks_ets(term_filters, time_filters, order) do
+    terms = build_query_terms(term_filters)
+
+    candidate_bids =
+      case terms do
+        [] ->
+          nil
+
+        _ ->
+          terms
+          |> Enum.map(&term_block_ids/1)
+          |> Enum.reduce(&MapSet.intersection/2)
+      end
+
+    # Collect all blocks from ETS, apply filters
+    all_blocks = :ets.tab2list(@blocks_table)
+
+    all_blocks
+    |> Enum.filter(fn {bid, _fp, _bs, _ec, ts_min, ts_max, _fmt, _ca} ->
+      term_match =
+        case candidate_bids do
+          nil -> true
+          bids -> MapSet.member?(bids, bid)
+        end
+
+      time_match =
+        Enum.all?(time_filters, fn
+          {:since, ts} -> ts_max >= to_unix(ts)
+          {:until, ts} -> ts_min <= to_unix(ts)
+        end)
+
+      term_match and time_match
+    end)
+    |> Enum.sort_by(
+      fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end,
+      if(order == :asc, do: :asc, else: :desc)
+    )
+    |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, fmt, _ca} -> {bid, fp, fmt} end)
+  end
+
+  # --- Publish: merge overflow into persistent_term ---
+
+  defp publish_overflow do
+    overflow_entries = :ets.tab2list(@overflow_table)
+
+    if overflow_entries != [] do
+      term_index = :persistent_term.get({__MODULE__, :term_index})
+
+      new_term_index =
+        Enum.reduce(overflow_entries, term_index, fn
+          {:term, term, block_id}, ti ->
+            Map.update(ti, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
+        end)
+
+      :persistent_term.put({__MODULE__, :term_index}, new_term_index)
+      :ets.delete_all_objects(@overflow_table)
+    end
+  end
+
+  # --- Cache cleanup helpers ---
+
+  defp collect_terms_for_blocks(db, block_ids) do
+    Enum.flat_map(block_ids, fn id ->
+      {:ok, stmt} =
+        Exqlite.Sqlite3.prepare(db, "SELECT term FROM block_terms WHERE block_id = ?1")
+
+      Exqlite.Sqlite3.bind(stmt, [id])
+      terms = collect_single_column(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+      Enum.map(terms, fn term -> {term, id} end)
+    end)
+  end
+
+  defp remove_block_ids_from_persistent_term(old_ids, old_terms) do
+    old_id_set = MapSet.new(old_ids)
+
+    term_index = :persistent_term.get({__MODULE__, :term_index})
+
+    new_term_index =
+      old_terms
+      |> Enum.map(fn {term, _id} -> term end)
+      |> Enum.uniq()
+      |> Enum.reduce(term_index, fn term, acc ->
+        case Map.get(acc, term) do
+          nil ->
+            acc
+
+          bids ->
+            cleaned = MapSet.difference(bids, old_id_set)
+
+            if MapSet.size(cleaned) == 0 do
+              Map.delete(acc, term)
+            else
+              Map.put(acc, term, cleaned)
+            end
+        end
+      end)
+
+    :persistent_term.put({__MODULE__, :term_index}, new_term_index)
+  end
+
+  defp clear_overflow_for_blocks(old_ids) do
+    old_id_set = MapSet.new(old_ids)
+
+    @overflow_table
+    |> :ets.tab2list()
+    |> Enum.each(fn {_type, _key, bid} = entry ->
+      if MapSet.member?(old_id_set, bid) do
+        :ets.delete_object(@overflow_table, entry)
+      end
+    end)
+  end
+
+  defp remove_blocks_from_cache(deleted_ids, old_terms) do
+    if deleted_ids != [] do
+      for id <- deleted_ids, do: :ets.delete(@blocks_table, id)
+      remove_block_ids_from_persistent_term(deleted_ids, old_terms)
+      clear_overflow_for_blocks(deleted_ids)
+    end
+  end
+
+  # --- Pending flush helpers ---
+
+  defp flush_pending(%{pending: []} = state), do: state
+
+  defp flush_pending(%{pending: pending} = state) do
+    Exqlite.Sqlite3.execute(state.db, "BEGIN")
+
+    for {meta, entries, terms} <- Enum.reverse(pending) do
+      insert_block_data(state, meta, entries, terms)
+    end
+
+    Exqlite.Sqlite3.execute(state.db, "COMMIT")
+
+    # Update ETS + overflow for all flushed entries
+    for {meta, _entries, terms} <- Enum.reverse(pending) do
+      insert_block_ets(meta)
+      insert_overflow(terms, meta.block_id)
+    end
+
+    if state.flush_timer do
+      Process.cancel_timer(state.flush_timer)
+    end
+
+    %{state | pending: [], flush_timer: nil, dirty: true}
+  end
+
+  defp schedule_index_flush(%{flush_timer: nil} = state) do
+    ref = Process.send_after(self(), :flush_index, @index_flush_interval)
+    %{state | flush_timer: ref}
+  end
+
+  defp schedule_index_flush(state), do: state
+
+  # --- Table creation ---
 
   defp create_tables(db) do
     Exqlite.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
     Exqlite.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
+    Exqlite.Sqlite3.execute(db, "PRAGMA cache_size = -16000")
+    Exqlite.Sqlite3.execute(db, "PRAGMA mmap_size = 134217728")
+    Exqlite.Sqlite3.execute(db, "PRAGMA temp_store = memory")
 
     Exqlite.Sqlite3.execute(db, """
     CREATE TABLE IF NOT EXISTS blocks (
@@ -341,50 +717,22 @@ defmodule TimelessLogs.Index do
     end
   end
 
-  defp flush_pending(%{pending: []} = state), do: state
+  # --- Indexing ---
 
-  defp flush_pending(%{pending: pending, db: db} = state) do
-    Exqlite.Sqlite3.execute(db, "BEGIN")
-
-    for {meta, entries} <- Enum.reverse(pending) do
-      index_block_inner(db, meta, entries)
-    end
-
-    Exqlite.Sqlite3.execute(db, "COMMIT")
-
-    if state.flush_timer do
-      Process.cancel_timer(state.flush_timer)
-    end
-
-    %{state | pending: [], flush_timer: nil}
-  end
-
-  defp schedule_index_flush(%{flush_timer: nil} = state) do
-    ref = Process.send_after(self(), :flush_index, @index_flush_interval)
-    %{state | flush_timer: ref}
-  end
-
-  defp schedule_index_flush(state), do: state
-
-  defp do_index_block(db, meta, entries) do
-    Exqlite.Sqlite3.execute(db, "BEGIN")
-    index_block_inner(db, meta, entries)
-    Exqlite.Sqlite3.execute(db, "COMMIT")
+  defp do_index_block(state, meta, entries, terms) do
+    Exqlite.Sqlite3.execute(state.db, "BEGIN")
+    insert_block_data(state, meta, entries, terms)
+    Exqlite.Sqlite3.execute(state.db, "COMMIT")
     :ok
   end
 
-  # Index a single block's metadata + terms (caller manages transaction)
-  defp index_block_inner(db, meta, entries) do
+  # Insert block data (caller manages transaction)
+  defp insert_block_data(state, meta, _entries, terms) do
     format = Map.get(meta, :format, :zstd)
     format_str = Atom.to_string(format)
+    db = state.db
 
-    {:ok, block_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      """)
-
-    Exqlite.Sqlite3.bind(block_stmt, [
+    Exqlite.Sqlite3.bind(state.block_insert_stmt, [
       meta.block_id,
       meta[:file_path],
       meta.byte_size,
@@ -395,35 +743,34 @@ defmodule TimelessLogs.Index do
       format_str
     ])
 
-    Exqlite.Sqlite3.step(db, block_stmt)
-    Exqlite.Sqlite3.release(db, block_stmt)
+    Exqlite.Sqlite3.step(db, state.block_insert_stmt)
+    Exqlite.Sqlite3.reset(state.block_insert_stmt)
 
-    terms = extract_terms(entries)
-    insert_terms_batch(db, terms, meta.block_id)
+    insert_terms_batch(state, terms, meta.block_id)
   end
 
-  # Batch INSERT up to 400 terms per statement (800 params, well under SQLite's 999 limit)
-  @terms_batch_size 400
+  defp insert_terms_batch(_state, [], _block_id), do: :ok
 
-  defp insert_terms_batch(_db, [], _block_id), do: :ok
+  defp insert_terms_batch(state, terms, block_id) do
+    db = state.db
 
-  defp insert_terms_batch(db, terms, block_id) do
     terms
     |> Enum.chunk_every(@terms_batch_size)
     |> Enum.each(fn batch ->
       n = length(batch)
-
-      placeholders =
-        Enum.map_join(1..n, ", ", fn i ->
-          "(?#{i * 2 - 1}, ?#{i * 2})"
-        end)
-
-      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
       params = Enum.flat_map(batch, fn term -> [term, block_id] end)
-      Exqlite.Sqlite3.bind(stmt, params)
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+
+      if n == @terms_batch_size do
+        Exqlite.Sqlite3.bind(state.terms_insert_stmt, params)
+        Exqlite.Sqlite3.step(db, state.terms_insert_stmt)
+        Exqlite.Sqlite3.reset(state.terms_insert_stmt)
+      else
+        sql = build_terms_sql(n)
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+        Exqlite.Sqlite3.bind(stmt, params)
+        Exqlite.Sqlite3.step(db, stmt)
+        Exqlite.Sqlite3.release(db, stmt)
+      end
     end)
   end
 
@@ -440,6 +787,17 @@ defmodule TimelessLogs.Index do
     |> Enum.uniq()
   end
 
+  defp build_terms_sql(n) do
+    placeholders =
+      Enum.map_join(1..n, ", ", fn i ->
+        "(?#{i * 2 - 1}, ?#{i * 2})"
+      end)
+
+    "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
+  end
+
+  # --- Querying (parallel, runs in caller's process) ---
+
   defp do_query_parallel(block_ids, storage, pagination, search_filters) do
     start_time = System.monotonic_time()
 
@@ -448,7 +806,6 @@ defmodule TimelessLogs.Index do
     order = Keyword.get(pagination, :order, :desc)
     blocks_read = length(block_ids)
 
-    # Parallel block decompression + filtering across cores
     all_matching =
       if storage == :disk and blocks_read > 1 do
         block_ids
@@ -477,7 +834,6 @@ defmodule TimelessLogs.Index do
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
       else
-        # Memory storage or single block — sequential (memory blocks need GenServer)
         Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
           format_atom = to_format_atom(format)
 
@@ -530,6 +886,8 @@ defmodule TimelessLogs.Index do
      }}
   end
 
+  # --- Block reading ---
+
   defp read_block_from_db(db, block_id) do
     {:ok, stmt} =
       Exqlite.Sqlite3.prepare(db, "SELECT data, format FROM blocks WHERE block_id = ?1")
@@ -552,35 +910,12 @@ defmodule TimelessLogs.Index do
     result
   end
 
-  defp do_raw_block_stats(db) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT
-        COALESCE(SUM(entry_count), 0),
-        COUNT(*),
-        MIN(created_at)
-      FROM blocks WHERE format = 'raw'
-      """)
+  # --- Compaction ---
 
-    {:row, [entry_count, block_count, oldest]} = Exqlite.Sqlite3.step(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
+  defp do_compact_blocks(state, old_ids, new_terms_list) do
+    db = state.db
+    storage = state.storage
 
-    %{entry_count: entry_count, block_count: block_count, oldest_created_at: oldest}
-  end
-
-  defp do_raw_block_ids(db) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT block_id, file_path FROM blocks WHERE format = 'raw' ORDER BY ts_min ASC
-      """)
-
-    rows = collect_rows_2(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    rows
-  end
-
-  defp do_compact_blocks(db, old_ids, meta_chunk_pairs, storage) do
-    # Collect file paths of old blocks before deleting (for disk cleanup)
     old_file_paths =
       if storage == :disk do
         Enum.flat_map(old_ids, fn id ->
@@ -604,7 +939,6 @@ defmodule TimelessLogs.Index do
 
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
-    # Delete old block terms and blocks
     for id <- old_ids do
       {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
       Exqlite.Sqlite3.bind(stmt, [id])
@@ -617,152 +951,18 @@ defmodule TimelessLogs.Index do
       Exqlite.Sqlite3.release(db, stmt)
     end
 
-    # Insert new compressed blocks
-    for {meta, entries} <- meta_chunk_pairs do
-      format_str = Atom.to_string(Map.get(meta, :format, :zstd))
-
-      {:ok, block_stmt} =
-        Exqlite.Sqlite3.prepare(db, """
-        INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        """)
-
-      Exqlite.Sqlite3.bind(block_stmt, [
-        meta.block_id,
-        meta[:file_path],
-        meta.byte_size,
-        meta.entry_count,
-        meta.ts_min,
-        meta.ts_max,
-        meta[:data],
-        format_str
-      ])
-
-      Exqlite.Sqlite3.step(db, block_stmt)
-      Exqlite.Sqlite3.release(db, block_stmt)
-
-      terms = extract_terms(entries)
-      insert_terms_batch(db, terms, meta.block_id)
+    for {meta, entries, terms} <- new_terms_list do
+      insert_block_data(state, meta, entries, terms)
     end
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
 
-    # Clean up old files after successful commit
     for path <- old_file_paths, do: File.rm(path)
 
     :ok
   end
 
-  defp split_pagination(filters) do
-    {pagination, search} =
-      Enum.split_with(filters, fn {k, _v} -> k in [:limit, :offset, :order] end)
-
-    {search, pagination}
-  end
-
-  defp split_filters(filters) do
-    term_filters =
-      filters
-      |> Enum.filter(fn {k, _v} -> k in [:level, :metadata] end)
-
-    time_filters =
-      filters
-      |> Enum.filter(fn {k, _v} -> k in [:since, :until] end)
-
-    {term_filters, time_filters}
-  end
-
-  defp find_matching_blocks(db, term_filters, time_filters, order) do
-    terms = build_query_terms(term_filters)
-
-    {where_clauses, params} = build_where(terms, time_filters)
-
-    order_dir = if order == :asc, do: "ASC", else: "DESC"
-
-    sql =
-      if where_clauses == [] do
-        "SELECT block_id, file_path, format FROM blocks ORDER BY ts_min #{order_dir}"
-      else
-        """
-        SELECT DISTINCT b.block_id, b.file_path, b.format FROM blocks b
-        #{if terms != [], do: "JOIN block_terms bt ON b.block_id = bt.block_id", else: ""}
-        WHERE #{Enum.join(where_clauses, " AND ")}
-        ORDER BY b.ts_min #{order_dir}
-        """
-      end
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-
-    if params != [] do
-      Exqlite.Sqlite3.bind(stmt, params)
-    end
-
-    rows = collect_rows_3(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    rows
-  end
-
-  defp build_query_terms(term_filters) do
-    Enum.flat_map(term_filters, fn
-      {:level, level} -> ["level:#{level}"]
-      {:metadata, map} -> Enum.map(map, fn {k, v} -> "#{k}:#{v}" end)
-      _ -> []
-    end)
-  end
-
-  defp build_where(terms, time_filters) do
-    {term_clauses, term_params} =
-      case terms do
-        [] ->
-          {[], []}
-
-        terms ->
-          placeholders = Enum.map_join(1..length(terms), ", ", &"?#{&1}")
-          {["bt.term IN (#{placeholders})"], terms}
-      end
-
-    {time_clauses, time_params} =
-      time_filters
-      |> Enum.reduce({[], []}, fn
-        {:since, ts}, {clauses, params} ->
-          idx = length(term_params) + length(params) + 1
-          {["b.ts_max >= ?#{idx}" | clauses], params ++ [to_unix(ts)]}
-
-        {:until, ts}, {clauses, params} ->
-          idx = length(term_params) + length(params) + 1
-          {["b.ts_min <= ?#{idx}" | clauses], params ++ [to_unix(ts)]}
-      end)
-
-    {term_clauses ++ time_clauses, term_params ++ time_params}
-  end
-
-  defp to_unix(%DateTime{} = dt), do: DateTime.to_unix(dt)
-  defp to_unix(ts) when is_integer(ts), do: ts
-
-  defp to_format_atom("raw"), do: :raw
-  defp to_format_atom("zstd"), do: :zstd
-  defp to_format_atom(:raw), do: :raw
-  defp to_format_atom(:zstd), do: :zstd
-  defp to_format_atom(_), do: :zstd
-
-  # 2-element tuple rows (used by raw_block_ids, delete helpers)
-  defp collect_rows_2(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [block_id, file_path]} -> [{block_id, file_path} | collect_rows_2(db, stmt)]
-      :done -> []
-    end
-  end
-
-  # 3-element tuple rows (used by find_matching_blocks)
-  defp collect_rows_3(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [block_id, file_path, format]} ->
-        [{block_id, file_path, format} | collect_rows_3(db, stmt)]
-
-      :done ->
-        []
-    end
-  end
+  # --- Deletion ---
 
   defp do_delete_before(db, cutoff_timestamp, storage) do
     {:ok, stmt} =
@@ -772,7 +972,13 @@ defmodule TimelessLogs.Index do
     blocks = collect_rows_2(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
 
-    delete_blocks(db, blocks, storage)
+    block_ids = Enum.map(blocks, fn {id, _fp} -> id end)
+
+    # Collect terms BEFORE deleting from SQLite
+    old_terms = collect_terms_for_blocks(db, block_ids)
+
+    count = delete_blocks(db, blocks, storage)
+    {count, block_ids, old_terms}
   end
 
   defp do_delete_over_size(db, max_bytes, storage) do
@@ -781,7 +987,7 @@ defmodule TimelessLogs.Index do
     Exqlite.Sqlite3.release(db, stmt)
 
     if total <= max_bytes do
-      0
+      {0, [], []}
     else
       {:ok, stmt} =
         Exqlite.Sqlite3.prepare(
@@ -801,7 +1007,13 @@ defmodule TimelessLogs.Index do
           end
         end)
 
-      delete_blocks(db, to_delete, storage)
+      block_ids = Enum.map(to_delete, fn {id, _fp} -> id end)
+
+      # Collect terms BEFORE deleting from SQLite
+      old_terms = collect_terms_for_blocks(db, block_ids)
+
+      count = delete_blocks(db, to_delete, storage)
+      {count, block_ids, old_terms}
     end
   end
 
@@ -828,6 +1040,58 @@ defmodule TimelessLogs.Index do
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
     length(blocks)
+  end
+
+  # --- Query building ---
+
+  defp split_pagination(filters) do
+    {pagination, search} =
+      Enum.split_with(filters, fn {k, _v} -> k in [:limit, :offset, :order] end)
+
+    {search, pagination}
+  end
+
+  defp split_filters(filters) do
+    term_filters =
+      Enum.filter(filters, fn {k, _v} -> k in [:level, :metadata] end)
+
+    time_filters =
+      Enum.filter(filters, fn {k, _v} -> k in [:since, :until] end)
+
+    {term_filters, time_filters}
+  end
+
+  defp build_query_terms(term_filters) do
+    Enum.flat_map(term_filters, fn
+      {:level, level} -> ["level:#{level}"]
+      {:metadata, map} -> Enum.map(map, fn {k, v} -> "#{k}:#{v}" end)
+      _ -> []
+    end)
+  end
+
+  defp to_unix(%DateTime{} = dt), do: DateTime.to_unix(dt)
+  defp to_unix(ts) when is_integer(ts), do: ts
+
+  defp to_format_atom("raw"), do: :raw
+  defp to_format_atom("zstd"), do: :zstd
+  defp to_format_atom(:raw), do: :raw
+  defp to_format_atom(:zstd), do: :zstd
+  defp to_format_atom(_), do: :zstd
+
+  # --- Row collectors ---
+
+  defp collect_single_column(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [value]} -> [value | collect_single_column(db, stmt)]
+      :done -> []
+    end
+  end
+
+  defp collect_rows_2(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [block_id, file_path]} -> [{block_id, file_path} | collect_rows_2(db, stmt)]
+      :done -> []
+    end
   end
 
   defp collect_rows_with_size(db, stmt) do

@@ -66,4 +66,9 @@ defmodule TimelessLogs.Config do
   def compression_level do
     Application.get_env(:timeless_logs, :compression_level, 5)
   end
+
+  @spec index_publish_interval() :: pos_integer()
+  def index_publish_interval do
+    Application.get_env(:timeless_logs, :index_publish_interval, 2_000)
+  end
 end
