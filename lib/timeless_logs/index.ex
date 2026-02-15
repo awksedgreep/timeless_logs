@@ -74,9 +74,9 @@ defmodule TimelessLogs.Index do
     GenServer.call(__MODULE__, :raw_block_ids, TimelessLogs.Config.query_timeout())
   end
 
-  @spec compact_blocks([integer()], TimelessLogs.Writer.block_meta(), [map()]) :: :ok
-  def compact_blocks(old_block_ids, new_meta, new_entries) do
-    GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
+  @spec compact_blocks([integer()], [{TimelessLogs.Writer.block_meta(), [map()]}]) :: :ok
+  def compact_blocks(old_block_ids, meta_chunk_pairs) do
+    GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, meta_chunk_pairs}, 60_000)
   end
 
   @spec backup(String.t()) :: :ok | {:error, term()}
@@ -184,9 +184,9 @@ defmodule TimelessLogs.Index do
     {:reply, result, state}
   end
 
-  def handle_call({:compact_blocks, old_ids, new_meta, new_entries}, _from, state) do
+  def handle_call({:compact_blocks, old_ids, meta_chunk_pairs}, _from, state) do
     state = flush_pending(state)
-    result = do_compact_blocks(state.db, old_ids, new_meta, new_entries, state.storage)
+    result = do_compact_blocks(state.db, old_ids, meta_chunk_pairs, state.storage)
     {:reply, result, state}
   end
 
@@ -579,7 +579,7 @@ defmodule TimelessLogs.Index do
     rows
   end
 
-  defp do_compact_blocks(db, old_ids, new_meta, new_entries, storage) do
+  defp do_compact_blocks(db, old_ids, meta_chunk_pairs, storage) do
     # Collect file paths of old blocks before deleting (for disk cleanup)
     old_file_paths =
       if storage == :disk do
@@ -602,9 +602,6 @@ defmodule TimelessLogs.Index do
         []
       end
 
-    # Atomic swap: delete old blocks, insert new compressed block
-    format_str = Atom.to_string(Map.get(new_meta, :format, :zstd))
-
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
     # Delete old block terms and blocks
@@ -620,30 +617,33 @@ defmodule TimelessLogs.Index do
       Exqlite.Sqlite3.release(db, stmt)
     end
 
-    # Insert new compressed block
-    {:ok, block_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      """)
+    # Insert new compressed blocks
+    for {meta, entries} <- meta_chunk_pairs do
+      format_str = Atom.to_string(Map.get(meta, :format, :zstd))
 
-    Exqlite.Sqlite3.bind(block_stmt, [
-      new_meta.block_id,
-      new_meta[:file_path],
-      new_meta.byte_size,
-      new_meta.entry_count,
-      new_meta.ts_min,
-      new_meta.ts_max,
-      new_meta[:data],
-      format_str
-    ])
+      {:ok, block_stmt} =
+        Exqlite.Sqlite3.prepare(db, """
+        INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        """)
 
-    Exqlite.Sqlite3.step(db, block_stmt)
-    Exqlite.Sqlite3.release(db, block_stmt)
+      Exqlite.Sqlite3.bind(block_stmt, [
+        meta.block_id,
+        meta[:file_path],
+        meta.byte_size,
+        meta.entry_count,
+        meta.ts_min,
+        meta.ts_max,
+        meta[:data],
+        format_str
+      ])
 
-    # Insert terms for new block
-    terms = extract_terms(new_entries)
-    insert_terms_batch(db, terms, new_meta.block_id)
+      Exqlite.Sqlite3.step(db, block_stmt)
+      Exqlite.Sqlite3.release(db, block_stmt)
+
+      terms = extract_terms(entries)
+      insert_terms_batch(db, terms, meta.block_id)
+    end
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
 

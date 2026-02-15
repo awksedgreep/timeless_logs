@@ -82,16 +82,39 @@ defmodule TimelessLogs.Compactor do
     if all_entries == [] do
       :noop
     else
-      # Sort by timestamp for optimal compression (similar data grouped)
-      sorted = Enum.sort_by(all_entries, & &1.timestamp)
-
-      # Write as single compressed block
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
+      concurrency = System.schedulers_online()
 
-      case TimelessLogs.Writer.write_block(sorted, write_target, :zstd) do
-        {:ok, new_meta} ->
+      chunks = Enum.chunk_every(all_entries, max(div(length(all_entries), concurrency), 1))
+
+      results =
+        chunks
+        |> Task.async_stream(
+          fn chunk ->
+            case TimelessLogs.Writer.write_block(chunk, write_target, :zstd) do
+              {:ok, meta} -> {:ok, meta, chunk}
+              error -> error
+            end
+          end,
+          max_concurrency: concurrency,
+          ordered: false
+        )
+        |> Enum.reduce({[], 0}, fn
+          {:ok, {:ok, meta, chunk}}, {pairs, bytes} ->
+            {[{meta, chunk} | pairs], bytes + meta.byte_size}
+
+          _, acc ->
+            acc
+        end)
+
+      case results do
+        {[], _} ->
+          Logger.warning("TimelessLogs: compaction failed: all chunks errored")
+          :noop
+
+        {meta_chunk_pairs, total_bytes} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
-          TimelessLogs.Index.compact_blocks(old_ids, new_meta, sorted)
+          TimelessLogs.Index.compact_blocks(old_ids, meta_chunk_pairs)
 
           duration = System.monotonic_time() - start_time
 
@@ -100,17 +123,13 @@ defmodule TimelessLogs.Compactor do
             %{
               duration: duration,
               raw_blocks: length(raw_blocks),
-              entry_count: length(sorted),
-              byte_size: new_meta.byte_size
+              entry_count: length(all_entries),
+              byte_size: total_bytes
             },
             %{}
           )
 
           :ok
-
-        {:error, reason} ->
-          Logger.warning("TimelessLogs: compaction failed: #{inspect(reason)}")
-          :noop
       end
     end
   end

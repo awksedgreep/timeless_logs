@@ -50,11 +50,11 @@ defmodule TimelessLogs.CompactorTest do
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
       assert :ok = TimelessLogs.Compactor.compact_now()
 
-      # Raw blocks should be gone, replaced by one zstd block
+      # Raw blocks should be gone, replaced by zstd block(s)
       raw_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       zstd_after = Path.wildcard(Path.join(blocks_dir, "*.zst"))
       assert length(raw_after) == 0
-      assert length(zstd_after) == 1
+      assert length(zstd_after) >= 1
 
       # All entries should still be queryable
       {:ok, %TimelessLogs.Result{total: 3}} = TimelessLogs.query([])
@@ -120,11 +120,11 @@ defmodule TimelessLogs.CompactorTest do
         TimelessLogs.flush()
       end
 
-      # Now we have mixed: 1 zstd + 3 raw
+      # Now we have mixed: zstd + 3 raw
       blocks_dir = Path.join(@data_dir, "blocks")
       zstd_files = Path.wildcard(Path.join(blocks_dir, "*.zst"))
       raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
-      assert length(zstd_files) == 1
+      assert length(zstd_files) >= 1
       assert length(raw_files) == 3
 
       # All 6 entries should be queryable
