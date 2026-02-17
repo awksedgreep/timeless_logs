@@ -46,11 +46,11 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
     IO.puts("")
 
     # Compare compression levels using 1000-entry blocks
-    IO.puts("=== Compression level comparison (1000-entry blocks) ===")
-    IO.puts("")
-
     chunks = Enum.chunk_every(entries, 1000)
     binaries = Enum.map(chunks, &:erlang.term_to_binary/1)
+
+    IO.puts("=== zstd: Compression level comparison (1000-entry blocks) ===")
+    IO.puts("")
 
     for level <- [1, 3, 5, 9, 12, 15, 19] do
       {elapsed_us, compressed_sizes} =
@@ -72,6 +72,172 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
       )
     end
 
+    IO.puts("")
+    IO.puts("=== OpenZL: Compression level comparison (1000-entry blocks) ===")
+    IO.puts("")
+
+    for level <- [1, 3, 5, 9, 12, 15, 19] do
+      cctx = ExOpenzl.create_compression_context()
+      :ok = ExOpenzl.set_compression_level(cctx, level)
+
+      {elapsed_us, compressed_sizes} =
+        :timer.tc(fn ->
+          Enum.map(binaries, fn bin ->
+            {:ok, compressed} = ExOpenzl.compress(cctx, bin)
+            byte_size(compressed)
+          end)
+        end)
+
+      total_compressed = Enum.sum(compressed_sizes)
+      ratio = raw_size / max(total_compressed, 1)
+      elapsed_ms = elapsed_us / 1_000
+      entries_per_sec = entry_count / (elapsed_us / 1_000_000)
+
+      IO.puts(
+        "  Level #{String.pad_leading("#{level}", 2)}: " <>
+          "#{String.pad_leading(fmt_bytes(total_compressed), 10)} " <>
+          "(#{String.pad_leading(:erlang.float_to_binary(ratio, decimals: 1), 5)}x)  " <>
+          "#{String.pad_leading(:erlang.float_to_binary(elapsed_ms, decimals: 0), 6)} ms  " <>
+          "#{fmt_number(round(entries_per_sec))} entries/sec"
+      )
+    end
+
+    IO.puts("")
+    IO.puts("=== Columnar+OpenZL: Compression level comparison (1000-entry blocks) ===")
+    IO.puts("")
+
+    for level <- [1, 3, 5, 9, 12, 15, 19] do
+      {elapsed_us, compressed_sizes} =
+        :timer.tc(fn ->
+          Enum.map(chunks, fn chunk ->
+            {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: level)
+            byte_size(compressed)
+          end)
+        end)
+
+      total_compressed = Enum.sum(compressed_sizes)
+      ratio = raw_size / max(total_compressed, 1)
+      elapsed_ms = elapsed_us / 1_000
+      entries_per_sec = entry_count / (elapsed_us / 1_000_000)
+
+      IO.puts(
+        "  Level #{String.pad_leading("#{level}", 2)}: " <>
+          "#{String.pad_leading(fmt_bytes(total_compressed), 10)} " <>
+          "(#{String.pad_leading(:erlang.float_to_binary(ratio, decimals: 1), 5)}x)  " <>
+          "#{String.pad_leading(:erlang.float_to_binary(elapsed_ms, decimals: 0), 6)} ms  " <>
+          "#{fmt_number(round(entries_per_sec))} entries/sec"
+      )
+    end
+
+    IO.puts("")
+
+    # Head-to-head at default level
+    default_level = TimelessLogs.Config.compression_level()
+    IO.puts("=== Head-to-head at level #{default_level} ===")
+    IO.puts("")
+
+    # zstd
+    {zstd_us, zstd_sizes} =
+      :timer.tc(fn ->
+        Enum.map(binaries, fn bin -> byte_size(:ezstd.compress(bin, default_level)) end)
+      end)
+
+    zstd_total = Enum.sum(zstd_sizes)
+
+    # OpenZL
+    ozl_cctx = ExOpenzl.create_compression_context()
+    :ok = ExOpenzl.set_compression_level(ozl_cctx, default_level)
+
+    {ozl_us, ozl_sizes} =
+      :timer.tc(fn ->
+        Enum.map(binaries, fn bin ->
+          {:ok, compressed} = ExOpenzl.compress(ozl_cctx, bin)
+          byte_size(compressed)
+        end)
+      end)
+
+    ozl_total = Enum.sum(ozl_sizes)
+
+    # Columnar
+    {col_us, col_sizes} =
+      :timer.tc(fn ->
+        Enum.map(chunks, fn chunk ->
+          {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: default_level)
+          byte_size(compressed)
+        end)
+      end)
+
+    col_total = Enum.sum(col_sizes)
+
+    # Verify roundtrips
+    ozl_dctx = ExOpenzl.create_decompression_context()
+
+    ozl_roundtrip_ok =
+      Enum.all?(Enum.zip(binaries, ozl_sizes), fn {bin, _} ->
+        {:ok, compressed} = ExOpenzl.compress(ozl_cctx, bin)
+        {:ok, ^bin} = ExOpenzl.decompress(ozl_dctx, compressed)
+        true
+      end)
+
+    col_roundtrip_ok =
+      Enum.all?(chunks, fn chunk ->
+        {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: default_level)
+        {:ok, decoded} = TimelessLogs.Writer.decode_columnar(compressed)
+        decoded == chunk
+      end)
+
+    IO.puts(
+      "  zstd:     #{String.pad_leading(fmt_bytes(zstd_total), 10)} " <>
+        "(#{:erlang.float_to_binary(raw_size / max(zstd_total, 1), decimals: 1)}x)  " <>
+        "#{:erlang.float_to_binary(zstd_us / 1_000, decimals: 0)} ms"
+    )
+
+    IO.puts(
+      "  OpenZL:   #{String.pad_leading(fmt_bytes(ozl_total), 10)} " <>
+        "(#{:erlang.float_to_binary(raw_size / max(ozl_total, 1), decimals: 1)}x)  " <>
+        "#{:erlang.float_to_binary(ozl_us / 1_000, decimals: 0)} ms"
+    )
+
+    IO.puts(
+      "  Columnar: #{String.pad_leading(fmt_bytes(col_total), 10)} " <>
+        "(#{:erlang.float_to_binary(raw_size / max(col_total, 1), decimals: 1)}x)  " <>
+        "#{:erlang.float_to_binary(col_us / 1_000, decimals: 0)} ms"
+    )
+
+    IO.puts("")
+
+    size_diff = (ozl_total - zstd_total) / max(zstd_total, 1) * 100
+    speed_diff = (ozl_us - zstd_us) / max(zstd_us, 1) * 100
+    col_size_diff = (col_total - zstd_total) / max(zstd_total, 1) * 100
+    col_speed_diff = (col_us - zstd_us) / max(zstd_us, 1) * 100
+
+    IO.puts("  OpenZL vs zstd:")
+
+    IO.puts(
+      "    Size:  #{:erlang.float_to_binary(abs(size_diff), decimals: 1)}% " <>
+        "#{if size_diff < 0, do: "smaller", else: "larger"}"
+    )
+
+    IO.puts(
+      "    Speed: #{:erlang.float_to_binary(abs(speed_diff), decimals: 1)}% " <>
+        "#{if speed_diff < 0, do: "faster", else: "slower"}"
+    )
+
+    IO.puts("    Roundtrip: #{if ozl_roundtrip_ok, do: "PASS", else: "FAIL"}")
+
+    IO.puts("  Columnar vs zstd:")
+
+    IO.puts(
+      "    Size:  #{:erlang.float_to_binary(abs(col_size_diff), decimals: 1)}% " <>
+        "#{if col_size_diff < 0, do: "smaller", else: "larger"}"
+    )
+
+    IO.puts(
+      "    Speed: #{:erlang.float_to_binary(abs(col_speed_diff), decimals: 1)}% " <>
+        "#{if col_speed_diff < 0, do: "faster", else: "slower"}"
+    )
+
+    IO.puts("    Roundtrip: #{if col_roundtrip_ok, do: "PASS", else: "FAIL"}")
     IO.puts("")
 
     File.rm_rf!(data_dir)
