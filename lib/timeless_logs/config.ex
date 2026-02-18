@@ -62,9 +62,19 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :compaction_max_raw_age, 60)
   end
 
-  @spec compression_level() :: 1..22
-  def compression_level do
-    Application.get_env(:timeless_logs, :compression_level, 5)
+  @spec zstd_compression_level() :: 1..22
+  def zstd_compression_level do
+    Application.get_env(:timeless_logs, :zstd_compression_level, 3)
+  end
+
+  @spec openzl_compression_level() :: 1..22
+  def openzl_compression_level do
+    Application.get_env(:timeless_logs, :openzl_compression_level, 9)
+  end
+
+  @spec compaction_format() :: :zstd | :openzl
+  def compaction_format do
+    Application.get_env(:timeless_logs, :compaction_format, :openzl)
   end
 
   @spec index_publish_interval() :: pos_integer()

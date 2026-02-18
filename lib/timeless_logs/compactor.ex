@@ -91,7 +91,11 @@ defmodule TimelessLogs.Compactor do
         chunks
         |> Task.async_stream(
           fn chunk ->
-            case TimelessLogs.Writer.write_block(chunk, write_target, :zstd) do
+            case TimelessLogs.Writer.write_block(
+                   chunk,
+                   write_target,
+                   TimelessLogs.Config.compaction_format()
+                 ) do
               {:ok, meta} -> {:ok, meta, chunk}
               error -> error
             end

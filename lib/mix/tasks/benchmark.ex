@@ -73,44 +73,14 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
     end
 
     IO.puts("")
-    IO.puts("=== OpenZL: Compression level comparison (1000-entry blocks) ===")
-    IO.puts("")
-
-    for level <- [1, 3, 5, 9, 12, 15, 19] do
-      cctx = ExOpenzl.create_compression_context()
-      :ok = ExOpenzl.set_compression_level(cctx, level)
-
-      {elapsed_us, compressed_sizes} =
-        :timer.tc(fn ->
-          Enum.map(binaries, fn bin ->
-            {:ok, compressed} = ExOpenzl.compress(cctx, bin)
-            byte_size(compressed)
-          end)
-        end)
-
-      total_compressed = Enum.sum(compressed_sizes)
-      ratio = raw_size / max(total_compressed, 1)
-      elapsed_ms = elapsed_us / 1_000
-      entries_per_sec = entry_count / (elapsed_us / 1_000_000)
-
-      IO.puts(
-        "  Level #{String.pad_leading("#{level}", 2)}: " <>
-          "#{String.pad_leading(fmt_bytes(total_compressed), 10)} " <>
-          "(#{String.pad_leading(:erlang.float_to_binary(ratio, decimals: 1), 5)}x)  " <>
-          "#{String.pad_leading(:erlang.float_to_binary(elapsed_ms, decimals: 0), 6)} ms  " <>
-          "#{fmt_number(round(entries_per_sec))} entries/sec"
-      )
-    end
-
-    IO.puts("")
-    IO.puts("=== Columnar+OpenZL: Compression level comparison (1000-entry blocks) ===")
+    IO.puts("=== OpenZL (columnar): Compression level comparison (1000-entry blocks) ===")
     IO.puts("")
 
     for level <- [1, 3, 5, 9, 12, 15, 19] do
       {elapsed_us, compressed_sizes} =
         :timer.tc(fn ->
           Enum.map(chunks, fn chunk ->
-            {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: level)
+            {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(chunk, level: level)
             byte_size(compressed)
           end)
         end)
@@ -131,85 +101,55 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
 
     IO.puts("")
 
-    # Head-to-head at default level
-    default_level = TimelessLogs.Config.compression_level()
-    IO.puts("=== Head-to-head at level #{default_level} ===")
+    # Head-to-head at default levels
+    zstd_level = TimelessLogs.Config.zstd_compression_level()
+    ozl_level = TimelessLogs.Config.openzl_compression_level()
+    IO.puts("=== Head-to-head at default levels (zstd=#{zstd_level}, openzl=#{ozl_level}) ===")
     IO.puts("")
 
     # zstd
     {zstd_us, zstd_sizes} =
       :timer.tc(fn ->
-        Enum.map(binaries, fn bin -> byte_size(:ezstd.compress(bin, default_level)) end)
+        Enum.map(binaries, fn bin -> byte_size(:ezstd.compress(bin, zstd_level)) end)
       end)
 
     zstd_total = Enum.sum(zstd_sizes)
 
-    # OpenZL
-    ozl_cctx = ExOpenzl.create_compression_context()
-    :ok = ExOpenzl.set_compression_level(ozl_cctx, default_level)
-
+    # OpenZL (columnar)
     {ozl_us, ozl_sizes} =
       :timer.tc(fn ->
-        Enum.map(binaries, fn bin ->
-          {:ok, compressed} = ExOpenzl.compress(ozl_cctx, bin)
+        Enum.map(chunks, fn chunk ->
+          {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(chunk, level: ozl_level)
           byte_size(compressed)
         end)
       end)
 
     ozl_total = Enum.sum(ozl_sizes)
 
-    # Columnar
-    {col_us, col_sizes} =
-      :timer.tc(fn ->
-        Enum.map(chunks, fn chunk ->
-          {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: default_level)
-          byte_size(compressed)
-        end)
-      end)
-
-    col_total = Enum.sum(col_sizes)
-
-    # Verify roundtrips
-    ozl_dctx = ExOpenzl.create_decompression_context()
-
+    # Verify roundtrip
     ozl_roundtrip_ok =
-      Enum.all?(Enum.zip(binaries, ozl_sizes), fn {bin, _} ->
-        {:ok, compressed} = ExOpenzl.compress(ozl_cctx, bin)
-        {:ok, ^bin} = ExOpenzl.decompress(ozl_dctx, compressed)
-        true
-      end)
-
-    col_roundtrip_ok =
       Enum.all?(chunks, fn chunk ->
-        {:ok, compressed} = TimelessLogs.Writer.encode_columnar(chunk, level: default_level)
-        {:ok, decoded} = TimelessLogs.Writer.decode_columnar(compressed)
+        {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(chunk, level: ozl_level)
+        {:ok, decoded} = TimelessLogs.Writer.columnar_deserialize(compressed)
         decoded == chunk
       end)
 
     IO.puts(
-      "  zstd:     #{String.pad_leading(fmt_bytes(zstd_total), 10)} " <>
+      "  zstd:   #{String.pad_leading(fmt_bytes(zstd_total), 10)} " <>
         "(#{:erlang.float_to_binary(raw_size / max(zstd_total, 1), decimals: 1)}x)  " <>
         "#{:erlang.float_to_binary(zstd_us / 1_000, decimals: 0)} ms"
     )
 
     IO.puts(
-      "  OpenZL:   #{String.pad_leading(fmt_bytes(ozl_total), 10)} " <>
+      "  OpenZL: #{String.pad_leading(fmt_bytes(ozl_total), 10)} " <>
         "(#{:erlang.float_to_binary(raw_size / max(ozl_total, 1), decimals: 1)}x)  " <>
         "#{:erlang.float_to_binary(ozl_us / 1_000, decimals: 0)} ms"
-    )
-
-    IO.puts(
-      "  Columnar: #{String.pad_leading(fmt_bytes(col_total), 10)} " <>
-        "(#{:erlang.float_to_binary(raw_size / max(col_total, 1), decimals: 1)}x)  " <>
-        "#{:erlang.float_to_binary(col_us / 1_000, decimals: 0)} ms"
     )
 
     IO.puts("")
 
     size_diff = (ozl_total - zstd_total) / max(zstd_total, 1) * 100
     speed_diff = (ozl_us - zstd_us) / max(zstd_us, 1) * 100
-    col_size_diff = (col_total - zstd_total) / max(zstd_total, 1) * 100
-    col_speed_diff = (col_us - zstd_us) / max(zstd_us, 1) * 100
 
     IO.puts("  OpenZL vs zstd:")
 
@@ -224,20 +164,214 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
     )
 
     IO.puts("    Roundtrip: #{if ozl_roundtrip_ok, do: "PASS", else: "FAIL"}")
+    IO.puts("")
 
-    IO.puts("  Columnar vs zstd:")
+    # --- Decompression benchmark ---
+    # Pre-compress all blocks in both formats
+    zstd_blobs =
+      Enum.map(binaries, fn bin -> :ezstd.compress(bin, zstd_level) end)
+
+    ozl_blobs =
+      Enum.map(chunks, fn chunk ->
+        {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(chunk, level: ozl_level)
+        compressed
+      end)
 
     IO.puts(
-      "    Size:  #{:erlang.float_to_binary(abs(col_size_diff), decimals: 1)}% " <>
-        "#{if col_size_diff < 0, do: "smaller", else: "larger"}"
+      "=== Decompression speed (#{length(zstd_blobs)} blocks, #{fmt_number(entry_count)} entries) ==="
+    )
+
+    IO.puts("")
+
+    # zstd decompress
+    {zstd_dec_us, _} =
+      :timer.tc(fn ->
+        Enum.each(zstd_blobs, fn blob ->
+          {:ok, _entries} = TimelessLogs.Writer.decompress_block(blob, :zstd)
+        end)
+      end)
+
+    # openzl decompress
+    {ozl_dec_us, _} =
+      :timer.tc(fn ->
+        Enum.each(ozl_blobs, fn blob ->
+          {:ok, _entries} = TimelessLogs.Writer.decompress_block(blob, :openzl)
+        end)
+      end)
+
+    zstd_dec_eps = entry_count / (zstd_dec_us / 1_000_000)
+    ozl_dec_eps = entry_count / (ozl_dec_us / 1_000_000)
+    dec_speed_diff = (ozl_dec_us - zstd_dec_us) / max(zstd_dec_us, 1) * 100
+
+    IO.puts(
+      "  zstd:   #{String.pad_leading(:erlang.float_to_binary(zstd_dec_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(zstd_dec_eps))} entries/sec"
     )
 
     IO.puts(
-      "    Speed: #{:erlang.float_to_binary(abs(col_speed_diff), decimals: 1)}% " <>
-        "#{if col_speed_diff < 0, do: "faster", else: "slower"}"
+      "  OpenZL: #{String.pad_leading(:erlang.float_to_binary(ozl_dec_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(ozl_dec_eps))} entries/sec"
     )
 
-    IO.puts("    Roundtrip: #{if col_roundtrip_ok, do: "PASS", else: "FAIL"}")
+    IO.puts(
+      "  OpenZL vs zstd: #{:erlang.float_to_binary(abs(dec_speed_diff), decimals: 1)}% " <>
+        "#{if dec_speed_diff < 0, do: "faster", else: "slower"}"
+    )
+
+    IO.puts("")
+
+    # --- Simulated query: decompress + filter + sort (what Index.query does) ---
+    IO.puts("=== Simulated query: decompress → filter → sort ===")
+    IO.puts("    (filter: level == :info, scan all #{length(zstd_blobs)} blocks)")
+    IO.puts("")
+
+    # zstd query
+    {zstd_q_us, zstd_q_count} =
+      :timer.tc(fn ->
+        zstd_blobs
+        |> Task.async_stream(
+          fn blob ->
+            {:ok, entries} = TimelessLogs.Writer.decompress_block(blob, :zstd)
+            Enum.filter(entries, &(&1.level == :info))
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false
+        )
+        |> Enum.flat_map(fn {:ok, entries} -> entries end)
+        |> Enum.sort_by(& &1.timestamp, :desc)
+        |> length()
+      end)
+
+    # openzl query
+    {ozl_q_us, ozl_q_count} =
+      :timer.tc(fn ->
+        ozl_blobs
+        |> Task.async_stream(
+          fn blob ->
+            {:ok, entries} = TimelessLogs.Writer.decompress_block(blob, :openzl)
+            Enum.filter(entries, &(&1.level == :info))
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false
+        )
+        |> Enum.flat_map(fn {:ok, entries} -> entries end)
+        |> Enum.sort_by(& &1.timestamp, :desc)
+        |> length()
+      end)
+
+    q_speed_diff = (ozl_q_us - zstd_q_us) / max(zstd_q_us, 1) * 100
+
+    IO.puts(
+      "  zstd:   #{String.pad_leading(:erlang.float_to_binary(zstd_q_us / 1_000, decimals: 0), 6)} ms  " <>
+        "(#{fmt_number(zstd_q_count)} matching entries)"
+    )
+
+    IO.puts(
+      "  OpenZL: #{String.pad_leading(:erlang.float_to_binary(ozl_q_us / 1_000, decimals: 0), 6)} ms  " <>
+        "(#{fmt_number(ozl_q_count)} matching entries)"
+    )
+
+    IO.puts(
+      "  OpenZL vs zstd: #{:erlang.float_to_binary(abs(q_speed_diff), decimals: 1)}% " <>
+        "#{if q_speed_diff < 0, do: "faster", else: "slower"}"
+    )
+
+    IO.puts("")
+
+    # --- Ingestion benchmark: raw write + index (what happens on every flush) ---
+    IO.puts("=== Ingestion: raw write + index (simulates Buffer flush path) ===")
+    IO.puts("")
+
+    # Disk ingestion
+    ingest_dir = "benchmark_ingest_#{System.unique_integer([:positive])}"
+    ingest_blocks_dir = Path.join(ingest_dir, "blocks")
+    File.mkdir_p!(ingest_blocks_dir)
+
+    {disk_ingest_us, _} =
+      :timer.tc(fn ->
+        Enum.each(chunks, fn chunk ->
+          {:ok, _meta} = TimelessLogs.Writer.write_block(chunk, ingest_dir, :raw)
+        end)
+      end)
+
+    disk_ingest_eps = entry_count / (disk_ingest_us / 1_000_000)
+
+    IO.puts(
+      "  Raw to disk:   #{String.pad_leading(:erlang.float_to_binary(disk_ingest_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(disk_ingest_eps))} entries/sec"
+    )
+
+    File.rm_rf!(ingest_dir)
+
+    # Memory ingestion
+    {mem_ingest_us, _} =
+      :timer.tc(fn ->
+        Enum.each(chunks, fn chunk ->
+          {:ok, _meta} = TimelessLogs.Writer.write_block(chunk, :memory, :raw)
+        end)
+      end)
+
+    mem_ingest_eps = entry_count / (mem_ingest_us / 1_000_000)
+
+    IO.puts(
+      "  Raw to memory: #{String.pad_leading(:erlang.float_to_binary(mem_ingest_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(mem_ingest_eps))} entries/sec"
+    )
+
+    IO.puts("")
+
+    # --- Compaction throughput: raw → zstd vs raw → openzl (parallel, like real compactor) ---
+    IO.puts("=== Compaction throughput (parallel, #{System.schedulers_online()} cores) ===")
+    IO.puts("")
+
+    concurrency = System.schedulers_online()
+
+    {zstd_compact_us, _} =
+      :timer.tc(fn ->
+        chunks
+        |> Task.async_stream(
+          fn chunk ->
+            {:ok, _meta} = TimelessLogs.Writer.write_block(chunk, :memory, :zstd)
+          end,
+          max_concurrency: concurrency,
+          ordered: false
+        )
+        |> Stream.run()
+      end)
+
+    zstd_compact_eps = entry_count / (zstd_compact_us / 1_000_000)
+
+    {ozl_compact_us, _} =
+      :timer.tc(fn ->
+        chunks
+        |> Task.async_stream(
+          fn chunk ->
+            {:ok, _meta} = TimelessLogs.Writer.write_block(chunk, :memory, :openzl)
+          end,
+          max_concurrency: concurrency,
+          ordered: false
+        )
+        |> Stream.run()
+      end)
+
+    ozl_compact_eps = entry_count / (ozl_compact_us / 1_000_000)
+    compact_diff = (ozl_compact_us - zstd_compact_us) / max(zstd_compact_us, 1) * 100
+
+    IO.puts(
+      "  zstd:   #{String.pad_leading(:erlang.float_to_binary(zstd_compact_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(zstd_compact_eps))} entries/sec"
+    )
+
+    IO.puts(
+      "  OpenZL: #{String.pad_leading(:erlang.float_to_binary(ozl_compact_us / 1_000, decimals: 0), 6)} ms  " <>
+        "#{fmt_number(round(ozl_compact_eps))} entries/sec"
+    )
+
+    IO.puts(
+      "  OpenZL vs zstd: #{:erlang.float_to_binary(abs(compact_diff), decimals: 1)}% " <>
+        "#{if compact_diff < 0, do: "faster", else: "slower"}"
+    )
+
     IO.puts("")
 
     File.rm_rf!(data_dir)

@@ -15,7 +15,10 @@ defmodule TimelessLogs.Stats do
             raw_entries: 0,
             zstd_blocks: 0,
             zstd_bytes: 0,
-            zstd_entries: 0
+            zstd_entries: 0,
+            openzl_blocks: 0,
+            openzl_bytes: 0,
+            openzl_entries: 0
 
   @type t :: %__MODULE__{
           total_blocks: non_neg_integer(),
@@ -30,6 +33,9 @@ defmodule TimelessLogs.Stats do
           raw_entries: non_neg_integer(),
           zstd_blocks: non_neg_integer(),
           zstd_bytes: non_neg_integer(),
-          zstd_entries: non_neg_integer()
+          zstd_entries: non_neg_integer(),
+          openzl_blocks: non_neg_integer(),
+          openzl_bytes: non_neg_integer(),
+          openzl_entries: non_neg_integer()
         }
 end

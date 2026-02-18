@@ -200,7 +200,9 @@ defmodule TimelessLogs.HTTP do
         raw_blocks: stats.raw_blocks,
         raw_bytes: stats.raw_bytes,
         zstd_blocks: stats.zstd_blocks,
-        zstd_bytes: stats.zstd_bytes
+        zstd_bytes: stats.zstd_bytes,
+        openzl_blocks: stats.openzl_blocks,
+        openzl_bytes: stats.openzl_bytes
       })
     )
   end

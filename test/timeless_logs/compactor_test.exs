@@ -17,6 +17,7 @@ defmodule TimelessLogs.CompactorTest do
     Application.put_env(:timeless_logs, :compaction_interval, 600_000)
     Application.put_env(:timeless_logs, :compaction_threshold, 500)
     Application.put_env(:timeless_logs, :compaction_max_raw_age, 3600)
+    Application.delete_env(:timeless_logs, :compaction_format)
     Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
@@ -24,6 +25,7 @@ defmodule TimelessLogs.CompactorTest do
       Application.delete_env(:timeless_logs, :compaction_interval)
       Application.delete_env(:timeless_logs, :compaction_threshold)
       Application.delete_env(:timeless_logs, :compaction_max_raw_age)
+      Application.delete_env(:timeless_logs, :compaction_format)
       File.rm_rf!(@data_dir)
     end)
 
@@ -31,7 +33,7 @@ defmodule TimelessLogs.CompactorTest do
   end
 
   describe "compact_now/0" do
-    test "compacts multiple raw blocks into a single zstd block" do
+    test "compacts multiple raw blocks into openzl blocks (default format)" do
       # Create 3 separate raw blocks
       Logger.info("block one entry")
       TimelessLogs.flush()
@@ -50,11 +52,11 @@ defmodule TimelessLogs.CompactorTest do
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
       assert :ok = TimelessLogs.Compactor.compact_now()
 
-      # Raw blocks should be gone, replaced by zstd block(s)
+      # Raw blocks should be gone, replaced by openzl block(s)
       raw_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
-      zstd_after = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      ozl_after = Path.wildcard(Path.join(blocks_dir, "*.ozl"))
       assert length(raw_after) == 0
-      assert length(zstd_after) >= 1
+      assert length(ozl_after) >= 1
 
       # All entries should still be queryable
       {:ok, %TimelessLogs.Result{total: 3}} = TimelessLogs.query([])
@@ -79,9 +81,9 @@ defmodule TimelessLogs.CompactorTest do
 
       blocks_dir = Path.join(@data_dir, "blocks")
       raw_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
-      zstd_after = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      ozl_after = Path.wildcard(Path.join(blocks_dir, "*.ozl"))
       assert length(raw_after) == 0
-      assert length(zstd_after) == 1
+      assert length(ozl_after) == 1
     end
 
     test "preserves entry order after compaction" do
@@ -101,14 +103,14 @@ defmodule TimelessLogs.CompactorTest do
       end
     end
 
-    test "queries work across mixed raw and zstd blocks" do
+    test "queries work across mixed raw and openzl blocks" do
       # Create raw blocks
       for i <- 1..3 do
         Logger.info("raw #{i}")
         TimelessLogs.flush()
       end
 
-      # Compact them to zstd
+      # Compact them to openzl
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
       TimelessLogs.Compactor.compact_now()
 
@@ -120,18 +122,18 @@ defmodule TimelessLogs.CompactorTest do
         TimelessLogs.flush()
       end
 
-      # Now we have mixed: zstd + 3 raw
+      # Now we have mixed: openzl + 3 raw
       blocks_dir = Path.join(@data_dir, "blocks")
-      zstd_files = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      ozl_files = Path.wildcard(Path.join(blocks_dir, "*.ozl"))
       raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
-      assert length(zstd_files) >= 1
+      assert length(ozl_files) >= 1
       assert length(raw_files) == 3
 
       # All 6 entries should be queryable
       {:ok, %TimelessLogs.Result{total: 6}} = TimelessLogs.query([])
     end
 
-    test "stream works across mixed raw and zstd blocks" do
+    test "stream works across mixed raw and openzl blocks" do
       # Create and compact some blocks
       for i <- 1..3 do
         Logger.info("stream #{i}")
@@ -152,6 +154,28 @@ defmodule TimelessLogs.CompactorTest do
       # Stream should return all entries
       entries = TimelessLogs.stream() |> Enum.to_list()
       assert length(entries) == 5
+    end
+
+    test "compacts to zstd when compaction_format is overridden" do
+      Logger.info("zstd override entry")
+      TimelessLogs.flush()
+
+      Application.put_env(:timeless_logs, :compaction_format, :zstd)
+      Application.put_env(:timeless_logs, :compaction_max_raw_age, 0)
+      Process.sleep(1100)
+
+      assert :ok = TimelessLogs.Compactor.compact_now()
+
+      blocks_dir = Path.join(@data_dir, "blocks")
+      raw_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
+      zstd_after = Path.wildcard(Path.join(blocks_dir, "*.zst"))
+      ozl_after = Path.wildcard(Path.join(blocks_dir, "*.ozl"))
+      assert length(raw_after) == 0
+      assert length(zstd_after) == 1
+      assert length(ozl_after) == 0
+
+      # Entry should still be queryable
+      {:ok, %TimelessLogs.Result{total: 1}} = TimelessLogs.query([])
     end
   end
 end

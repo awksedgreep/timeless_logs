@@ -13,10 +13,10 @@ defmodule TimelessLogs.Writer do
           entry_count: non_neg_integer(),
           ts_min: integer(),
           ts_max: integer(),
-          format: :raw | :zstd | :openzl | :columnar
+          format: :raw | :zstd | :openzl
         }
 
-  @spec write_block([map()], String.t() | :memory, :raw | :zstd | :openzl | :columnar, keyword()) ::
+  @spec write_block([map()], String.t() | :memory, :raw | :zstd | :openzl, keyword()) ::
           {:ok, block_meta()} | {:error, term()}
   def write_block(entries, target, format \\ :raw, opts \\ [])
 
@@ -31,15 +31,11 @@ defmodule TimelessLogs.Writer do
         :zstd ->
           :ezstd.compress(
             binary,
-            Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
+            Keyword.get(opts, :level, TimelessLogs.Config.zstd_compression_level())
           )
 
         :openzl ->
-          {:ok, compressed} = compress_openzl(binary, opts)
-          compressed
-
-        :columnar ->
-          {:ok, compressed} = encode_columnar(entries, opts)
+          {:ok, compressed} = columnar_serialize(entries, opts)
           compressed
       end
 
@@ -71,16 +67,12 @@ defmodule TimelessLogs.Writer do
         :zstd ->
           {:ezstd.compress(
              binary,
-             Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
+             Keyword.get(opts, :level, TimelessLogs.Config.zstd_compression_level())
            ), "zst"}
 
         :openzl ->
-          {:ok, compressed} = compress_openzl(binary, opts)
+          {:ok, compressed} = columnar_serialize(entries, opts)
           {compressed, "ozl"}
-
-        :columnar ->
-          {:ok, compressed} = encode_columnar(entries, opts)
-          {compressed, "col"}
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
@@ -118,7 +110,7 @@ defmodule TimelessLogs.Writer do
     end)
   end
 
-  @spec decompress_block(binary(), :raw | :zstd | :openzl | :columnar) ::
+  @spec decompress_block(binary(), :raw | :zstd | :openzl) ::
           {:ok, [map()]} | {:error, :corrupt_block}
   def decompress_block(data, format \\ :zstd)
 
@@ -144,9 +136,9 @@ defmodule TimelessLogs.Writer do
   end
 
   def decompress_block(compressed, :openzl) do
-    case ExOpenzl.decompress(compressed) do
-      {:ok, binary} ->
-        {:ok, :erlang.binary_to_term(binary)}
+    case columnar_deserialize(compressed) do
+      {:ok, entries} ->
+        {:ok, entries}
 
       {:error, reason} ->
         Logger.warning("TimelessLogs: corrupt openzl block data: #{inspect(reason)}")
@@ -154,18 +146,7 @@ defmodule TimelessLogs.Writer do
     end
   end
 
-  def decompress_block(compressed, :columnar) do
-    case decode_columnar(compressed) do
-      {:ok, entries} ->
-        {:ok, entries}
-
-      {:error, reason} ->
-        Logger.warning("TimelessLogs: corrupt columnar block data: #{inspect(reason)}")
-        {:error, :corrupt_block}
-    end
-  end
-
-  @spec read_block(String.t(), :raw | :zstd | :openzl | :columnar) ::
+  @spec read_block(String.t(), :raw | :zstd | :openzl) ::
           {:ok, [map()]} | {:error, term()}
   def read_block(file_path, format \\ :zstd) do
     case File.read(file_path) do
@@ -178,15 +159,8 @@ defmodule TimelessLogs.Writer do
     end
   end
 
-  defp compress_openzl(binary, opts) do
-    cctx = ExOpenzl.create_compression_context()
-    level = Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
-    :ok = ExOpenzl.set_compression_level(cctx, level)
-    ExOpenzl.compress(cctx, binary)
-  end
-
   @doc false
-  def encode_columnar(entries, opts \\ []) do
+  def columnar_serialize(entries, opts \\ []) do
     {ts_bin, levels_bin, msg_concat, msg_lengths_bin, meta_concat, meta_lengths_bin} =
       Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>, <<>>, <<>>}, fn entry,
                                                                     {ts_acc, lv_acc, msg_acc,
@@ -208,7 +182,7 @@ defmodule TimelessLogs.Writer do
       end)
 
     cctx = ExOpenzl.create_compression_context()
-    level = Keyword.get(opts, :level, TimelessLogs.Config.compression_level())
+    level = Keyword.get(opts, :level, TimelessLogs.Config.openzl_compression_level())
     :ok = ExOpenzl.set_compression_level(cctx, level)
 
     inputs = [
@@ -222,15 +196,15 @@ defmodule TimelessLogs.Writer do
   end
 
   @doc false
-  def decode_columnar(compressed) do
+  def columnar_deserialize(compressed) do
     dctx = ExOpenzl.create_decompression_context()
 
     case ExOpenzl.decompress_multi_typed(dctx, compressed) do
       {:ok, [ts_info, levels_info, msgs_info, meta_info]} ->
         timestamps = unpack_u64_le(ts_info.data)
         levels = unpack_u8(levels_info.data)
-        msg_lengths = unpack_u32_le(msgs_info.string_lengths)
-        meta_lengths = unpack_u32_le(meta_info.string_lengths)
+        msg_lengths = unpack_native_u32(msgs_info.string_lengths)
+        meta_lengths = unpack_native_u32(meta_info.string_lengths)
         messages = split_by_lengths(msgs_info.data, msg_lengths)
         metadatas = split_by_lengths(meta_info.data, meta_lengths)
 
@@ -262,10 +236,10 @@ defmodule TimelessLogs.Writer do
   defp unpack_u8(<<>>), do: []
   defp unpack_u8(<<val::unsigned-8, rest::binary>>), do: [val | unpack_u8(rest)]
 
-  defp unpack_u32_le(<<>>), do: []
+  defp unpack_native_u32(<<>>), do: []
 
-  defp unpack_u32_le(<<val::little-unsigned-32, rest::binary>>),
-    do: [val | unpack_u32_le(rest)]
+  defp unpack_native_u32(<<val::native-unsigned-32, rest::binary>>),
+    do: [val | unpack_native_u32(rest)]
 
   defp split_by_lengths(_bin, []), do: []
 
