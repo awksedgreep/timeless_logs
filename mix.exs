@@ -27,7 +27,7 @@ defmodule TimelessLogs.MixProject do
     [
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
-      {:ex_openzl, path: "../ex_openzl"},
+      {:ex_openzl, github: "awksedgreep/ex_openzl", ref: "25bcbf9", submodules: true},
       {:bandit, "~> 1.6"},
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
