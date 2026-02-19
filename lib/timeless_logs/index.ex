@@ -28,8 +28,7 @@ defmodule TimelessLogs.Index do
 
   @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
-    terms = extract_terms(entries)
-    GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms})
+    GenServer.cast(__MODULE__, {:index_block_raw, block_meta, entries})
   end
 
   # --- Lock-free read functions (run in caller's process) ---
@@ -250,6 +249,7 @@ defmodule TimelessLogs.Index do
        flush_timer: nil,
        block_insert_stmt: block_insert_stmt,
        terms_insert_stmt: terms_insert_stmt,
+       terms_stmt_cache: %{@terms_batch_size => terms_insert_stmt},
        publish_timer: publish_ref,
        publish_interval: publish_interval,
        dirty: false
@@ -258,10 +258,14 @@ defmodule TimelessLogs.Index do
 
   @impl true
   def terminate(_reason, state) do
-    flush_pending(state)
+    state = flush_pending(state)
 
     Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
-    Exqlite.Sqlite3.release(state.db, state.terms_insert_stmt)
+
+    for {_n, stmt} <- state.terms_stmt_cache do
+      Exqlite.Sqlite3.release(state.db, stmt)
+    end
+
     Exqlite.Sqlite3.close(state.db)
 
     # Clean up persistent_term keys
@@ -280,6 +284,7 @@ defmodule TimelessLogs.Index do
   def handle_call({:index_block, meta, entries, terms}, _from, state) do
     state = flush_pending(state)
     result = do_index_block(state, meta, entries, terms)
+    state = collect_stmt_cache(state)
     # Update cache after SQLite commit
     insert_block_ets(meta)
     insert_overflow(terms, meta.block_id)
@@ -319,6 +324,7 @@ defmodule TimelessLogs.Index do
     old_terms = collect_terms_for_blocks(state.db, old_ids)
 
     result = do_compact_blocks(state, old_ids, new_terms_list)
+    state = collect_stmt_cache(state)
 
     # Update cache: remove old, add new
     for id <- old_ids, do: :ets.delete(@blocks_table, id)
@@ -360,6 +366,12 @@ defmodule TimelessLogs.Index do
   @impl true
   def handle_cast({:index_block, meta, entries, terms}, state) do
     pending = [{meta, entries, terms} | state.pending]
+    state = schedule_index_flush(%{state | pending: pending})
+    {:noreply, state}
+  end
+
+  def handle_cast({:index_block_raw, meta, entries}, state) do
+    pending = [{:raw, meta, entries} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -488,8 +500,9 @@ defmodule TimelessLogs.Index do
   end
 
   defp insert_overflow(terms, block_id) do
-    for term <- terms do
-      :ets.insert(@overflow_table, {:term, term, block_id})
+    if terms != [] do
+      term_objects = Enum.map(terms, fn term -> {:term, term, block_id} end)
+      :ets.insert(@overflow_table, term_objects)
     end
   end
 
@@ -633,16 +646,29 @@ defmodule TimelessLogs.Index do
   defp flush_pending(%{pending: []} = state), do: state
 
   defp flush_pending(%{pending: pending} = state) do
+    # Precompute any raw entries
+    resolved =
+      pending
+      |> Enum.reverse()
+      |> Enum.map(fn
+        {:raw, meta, entries} ->
+          terms = extract_terms(entries)
+          {meta, entries, terms}
+
+        {meta, entries, terms} ->
+          {meta, entries, terms}
+      end)
+
     Exqlite.Sqlite3.execute(state.db, "BEGIN")
 
-    for {meta, entries, terms} <- Enum.reverse(pending) do
+    for {meta, entries, terms} <- resolved do
       insert_block_data(state, meta, entries, terms)
     end
 
     Exqlite.Sqlite3.execute(state.db, "COMMIT")
 
     # Update ETS + overflow for all flushed entries
-    for {meta, _entries, terms} <- Enum.reverse(pending) do
+    for {meta, _entries, terms} <- resolved do
       insert_block_ets(meta)
       insert_overflow(terms, meta.block_id)
     end
@@ -651,7 +677,23 @@ defmodule TimelessLogs.Index do
       Process.cancel_timer(state.flush_timer)
     end
 
+    state = collect_stmt_cache(state)
     %{state | pending: [], flush_timer: nil, dirty: true}
+  end
+
+  defp collect_stmt_cache(state) do
+    {new_terms} =
+      Process.get_keys()
+      |> Enum.reduce({state.terms_stmt_cache}, fn
+        {:terms_stmt_cache, n}, {tc} ->
+          stmt = Process.delete({:terms_stmt_cache, n})
+          {Map.put_new(tc, n, stmt)}
+
+        _, acc ->
+          acc
+      end)
+
+    %{state | terms_stmt_cache: new_terms}
   end
 
   defp schedule_index_flush(%{flush_timer: nil} = state) do
@@ -762,32 +804,35 @@ defmodule TimelessLogs.Index do
     |> Enum.each(fn batch ->
       n = length(batch)
       params = Enum.flat_map(batch, fn term -> [term, block_id] end)
-
-      if n == @terms_batch_size do
-        Exqlite.Sqlite3.bind(state.terms_insert_stmt, params)
-        Exqlite.Sqlite3.step(db, state.terms_insert_stmt)
-        Exqlite.Sqlite3.reset(state.terms_insert_stmt)
-      else
-        sql = build_terms_sql(n)
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-        Exqlite.Sqlite3.bind(stmt, params)
-        Exqlite.Sqlite3.step(db, stmt)
-        Exqlite.Sqlite3.release(db, stmt)
-      end
+      stmt = get_or_cache_terms_stmt(state, n)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.reset(stmt)
     end)
+  end
+
+  defp get_or_cache_terms_stmt(state, n) do
+    case Map.get(state.terms_stmt_cache, n) do
+      nil ->
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, build_terms_sql(n))
+        Process.put({:terms_stmt_cache, n}, stmt)
+        stmt
+
+      stmt ->
+        stmt
+    end
   end
 
   defp extract_terms(entries) do
     entries
-    |> Enum.flat_map(fn entry ->
-      level_term = "level:#{entry.level}"
+    |> Enum.reduce(MapSet.new(), fn entry, acc ->
+      acc = MapSet.put(acc, "level:#{entry.level}")
 
-      metadata_terms =
-        Enum.map(entry.metadata, fn {k, v} -> "#{k}:#{v}" end)
-
-      [level_term | metadata_terms]
+      Enum.reduce(entry.metadata, acc, fn {k, v}, inner_acc ->
+        MapSet.put(inner_acc, "#{k}:#{v}")
+      end)
     end)
-    |> Enum.uniq()
+    |> MapSet.to_list()
   end
 
   defp build_terms_sql(n) do
@@ -921,38 +966,46 @@ defmodule TimelessLogs.Index do
 
     old_file_paths =
       if storage == :disk do
-        Enum.flat_map(old_ids, fn id ->
-          {:ok, stmt} =
-            Exqlite.Sqlite3.prepare(db, "SELECT file_path FROM blocks WHERE block_id = ?1")
+        {:ok, fp_stmt} =
+          Exqlite.Sqlite3.prepare(db, "SELECT file_path FROM blocks WHERE block_id = ?1")
 
-          Exqlite.Sqlite3.bind(stmt, [id])
+        paths =
+          Enum.flat_map(old_ids, fn id ->
+            Exqlite.Sqlite3.bind(fp_stmt, [id])
 
-          result =
-            case Exqlite.Sqlite3.step(db, stmt) do
-              {:row, [path]} when is_binary(path) -> [path]
-              _ -> []
-            end
+            result =
+              case Exqlite.Sqlite3.step(db, fp_stmt) do
+                {:row, [path]} when is_binary(path) -> [path]
+                _ -> []
+              end
 
-          Exqlite.Sqlite3.release(db, stmt)
-          result
-        end)
+            Exqlite.Sqlite3.reset(fp_stmt)
+            result
+          end)
+
+        Exqlite.Sqlite3.release(db, fp_stmt)
+        paths
       else
         []
       end
 
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
-    for id <- old_ids do
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+    {:ok, del_terms} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
+    {:ok, del_blocks} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+    for id <- old_ids do
+      Exqlite.Sqlite3.bind(del_terms, [id])
+      Exqlite.Sqlite3.step(db, del_terms)
+      Exqlite.Sqlite3.reset(del_terms)
+
+      Exqlite.Sqlite3.bind(del_blocks, [id])
+      Exqlite.Sqlite3.step(db, del_blocks)
+      Exqlite.Sqlite3.reset(del_blocks)
     end
+
+    Exqlite.Sqlite3.release(db, del_terms)
+    Exqlite.Sqlite3.release(db, del_blocks)
 
     for {meta, entries, terms} <- new_terms_list do
       insert_block_data(state, meta, entries, terms)
@@ -1025,21 +1078,25 @@ defmodule TimelessLogs.Index do
   defp delete_blocks(db, blocks, storage) do
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
-    for {block_id, file_path} <- blocks do
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [block_id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+    {:ok, del_terms} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
+    {:ok, del_blocks} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [block_id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+    for {block_id, file_path} <- blocks do
+      Exqlite.Sqlite3.bind(del_terms, [block_id])
+      Exqlite.Sqlite3.step(db, del_terms)
+      Exqlite.Sqlite3.reset(del_terms)
+
+      Exqlite.Sqlite3.bind(del_blocks, [block_id])
+      Exqlite.Sqlite3.step(db, del_blocks)
+      Exqlite.Sqlite3.reset(del_blocks)
 
       if storage == :disk do
         File.rm(file_path)
       end
     end
+
+    Exqlite.Sqlite3.release(db, del_terms)
+    Exqlite.Sqlite3.release(db, del_blocks)
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
     length(blocks)

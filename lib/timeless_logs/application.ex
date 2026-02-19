@@ -17,6 +17,7 @@ defmodule TimelessLogs.Application do
       [
         {Registry, keys: :duplicate, name: TimelessLogs.Registry},
         {TimelessLogs.Index, data_dir: data_dir, storage: storage},
+        {Task.Supervisor, name: TimelessLogs.FlushSupervisor},
         {TimelessLogs.Buffer, data_dir: data_dir},
         {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
         {TimelessLogs.Retention, []}
