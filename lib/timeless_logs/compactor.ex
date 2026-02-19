@@ -66,7 +66,7 @@ defmodule TimelessLogs.Compactor do
 
     # Read all entries from raw blocks
     all_entries =
-      Enum.flat_map(raw_blocks, fn {block_id, file_path} ->
+      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs} ->
         read_result =
           case state.storage do
             :disk -> TimelessLogs.Writer.read_block(file_path, :raw)
@@ -82,6 +82,9 @@ defmodule TimelessLogs.Compactor do
     if all_entries == [] do
       :noop
     else
+      # Sum actual raw block file sizes (true "before compression" size)
+      raw_bytes = Enum.reduce(raw_blocks, 0, fn {_bid, _fp, bs}, acc -> acc + bs end)
+
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
       concurrency = System.schedulers_online()
 
@@ -124,7 +127,7 @@ defmodule TimelessLogs.Compactor do
               {meta, entries, TimelessLogs.Index.extract_terms(entries)}
             end)
 
-          TimelessLogs.Index.compact_blocks(old_ids, new_terms_list)
+          TimelessLogs.Index.compact_blocks(old_ids, new_terms_list, {raw_bytes, total_bytes})
 
           duration = System.monotonic_time() - start_time
 

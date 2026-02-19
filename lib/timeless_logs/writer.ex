@@ -161,25 +161,24 @@ defmodule TimelessLogs.Writer do
 
   @doc false
   def columnar_serialize(entries, opts \\ []) do
-    {ts_bin, levels_bin, msg_concat, msg_lengths_bin, meta_concat, meta_lengths_bin} =
-      Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>, <<>>, <<>>}, fn entry,
-                                                                    {ts_acc, lv_acc, msg_acc,
-                                                                     msg_len_acc, meta_acc,
-                                                                     meta_len_acc} ->
+    {ts_bin, levels_bin, msg_concat, msg_lengths_bin} =
+      Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>}, fn entry,
+                                                        {ts_acc, lv_acc, msg_acc, msg_len_acc} ->
         ts = entry.timestamp
         level_int = Map.fetch!(@level_to_int, entry.level)
         msg = entry.message
-        meta_bin = :erlang.term_to_binary(entry.metadata)
 
         {
           <<ts_acc::binary, ts::little-unsigned-64>>,
           <<lv_acc::binary, level_int::unsigned-8>>,
           <<msg_acc::binary, msg::binary>>,
-          <<msg_len_acc::binary, byte_size(msg)::little-unsigned-32>>,
-          <<meta_acc::binary, meta_bin::binary>>,
-          <<meta_len_acc::binary, byte_size(meta_bin)::little-unsigned-32>>
+          <<msg_len_acc::binary, byte_size(msg)::little-unsigned-32>>
         }
       end)
+
+    # Batch all metadata into a single term_to_binary call for atom sharing
+    meta_bin = :erlang.term_to_binary(Enum.map(entries, & &1.metadata))
+    meta_lengths_bin = <<byte_size(meta_bin)::little-unsigned-32>>
 
     {:ok, cctx} = ExOpenzl.create_compression_context()
     level = Keyword.get(opts, :level, TimelessLogs.Config.openzl_compression_level())
@@ -189,7 +188,7 @@ defmodule TimelessLogs.Writer do
       {:numeric, ts_bin, 8},
       {:numeric, levels_bin, 1},
       {:string, msg_concat, msg_lengths_bin},
-      {:string, meta_concat, meta_lengths_bin}
+      {:string, meta_bin, meta_lengths_bin}
     ]
 
     ExOpenzl.compress_multi_typed(cctx, inputs)
@@ -206,17 +205,19 @@ defmodule TimelessLogs.Writer do
         msg_lengths = unpack_native_u32(msgs_info.string_lengths)
         meta_lengths = unpack_native_u32(meta_info.string_lengths)
         messages = split_by_lengths(msgs_info.data, msg_lengths)
-        metadatas = split_by_lengths(meta_info.data, meta_lengths)
+
+        # Detect batched vs legacy per-entry metadata format
+        metadatas = deserialize_metadata(meta_info.data, meta_lengths, length(timestamps))
 
         entries =
           Enum.zip_with(
             [timestamps, levels, messages, metadatas],
-            fn [ts, level_int, msg, meta_bin] ->
+            fn [ts, level_int, msg, metadata] ->
               %{
                 timestamp: ts,
                 level: Map.fetch!(@int_to_level, level_int),
                 message: msg,
-                metadata: :erlang.binary_to_term(meta_bin)
+                metadata: metadata
               }
             end
           )
@@ -226,6 +227,22 @@ defmodule TimelessLogs.Writer do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Batched format: single term_to_binary blob containing list of all metadata maps
+  defp deserialize_metadata(data, [_single_len], entry_count) when entry_count > 1 do
+    :erlang.binary_to_term(data)
+  end
+
+  # Single entry: could be either format
+  defp deserialize_metadata(data, [_single_len], 1) do
+    result = :erlang.binary_to_term(data)
+    if is_list(result), do: result, else: [result]
+  end
+
+  # Legacy per-entry format: N separate term_to_binary blobs
+  defp deserialize_metadata(data, lengths, _entry_count) do
+    split_by_lengths(data, lengths) |> Enum.map(&:erlang.binary_to_term/1)
   end
 
   defp unpack_u64_le(<<>>), do: []
