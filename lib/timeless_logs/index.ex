@@ -16,22 +16,21 @@ defmodule TimelessLogs.Index do
   @terms_batch_size 400
 
   @blocks_table :timeless_logs_blocks
-  @overflow_table :timeless_logs_index_overflow
+  @term_index_table :timeless_logs_term_index
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec index_block(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
-  def index_block(block_meta, entries) do
-    terms = extract_terms(entries)
+  @spec index_block(TimelessLogs.Writer.block_meta(), [map()], [String.t()]) :: :ok
+  def index_block(block_meta, entries, terms) do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries, terms})
   end
 
-  @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()]) :: :ok
-  def index_block_async(block_meta, entries) do
-    GenServer.cast(__MODULE__, {:index_block_raw, block_meta, entries})
+  @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()], [String.t()]) :: :ok
+  def index_block_async(block_meta, entries, terms) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms})
   end
 
   # --- Lock-free read functions (run in caller's process) ---
@@ -176,13 +175,9 @@ defmodule TimelessLogs.Index do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
   end
 
-  @spec compact_blocks([integer()], [{TimelessLogs.Writer.block_meta(), [map()]}]) :: :ok
-  def compact_blocks(old_block_ids, meta_chunk_pairs) do
-    new_terms_list =
-      Enum.map(meta_chunk_pairs, fn {meta, entries} ->
-        {meta, entries, extract_terms(entries)}
-      end)
-
+  @spec compact_blocks([integer()], [{TimelessLogs.Writer.block_meta(), [map()], [String.t()]}]) ::
+          :ok
+  def compact_blocks(old_block_ids, new_terms_list) do
     GenServer.call(
       __MODULE__,
       {:compact_blocks, old_block_ids, new_terms_list},
@@ -235,13 +230,9 @@ defmodule TimelessLogs.Index do
     :persistent_term.put({__MODULE__, :storage}, storage)
     :persistent_term.put({__MODULE__, :db_path}, db_path)
 
-    # Bulk-load from SQLite into ETS/persistent_term
+    # Bulk-load from SQLite into ETS
     bulk_load_blocks(db)
     bulk_load_term_index(db)
-
-    # Schedule publish timer
-    publish_interval = TimelessLogs.Config.index_publish_interval()
-    publish_ref = Process.send_after(self(), :publish, publish_interval)
 
     {:ok,
      %{
@@ -254,10 +245,7 @@ defmodule TimelessLogs.Index do
        sqlite_flush_timer: nil,
        block_insert_stmt: block_insert_stmt,
        terms_insert_stmt: terms_insert_stmt,
-       terms_stmt_cache: %{@terms_batch_size => terms_insert_stmt},
-       publish_timer: publish_ref,
-       publish_interval: publish_interval,
-       dirty: false
+       terms_stmt_cache: %{@terms_batch_size => terms_insert_stmt}
      }}
   end
 
@@ -274,14 +262,13 @@ defmodule TimelessLogs.Index do
 
     Exqlite.Sqlite3.close(state.db)
 
-    # Clean up persistent_term keys
+    # Clean up persistent_term keys (write-once config only)
     :persistent_term.erase({__MODULE__, :storage})
     :persistent_term.erase({__MODULE__, :db_path})
-    :persistent_term.erase({__MODULE__, :term_index})
 
     # Clean up ETS tables
     safe_delete_ets(@blocks_table)
-    safe_delete_ets(@overflow_table)
+    safe_delete_ets(@term_index_table)
   end
 
   # --- handle_call (grouped) ---
@@ -292,10 +279,10 @@ defmodule TimelessLogs.Index do
     state = flush_sqlite(state)
     result = do_index_block(state, meta, entries, terms)
     state = collect_stmt_cache(state)
-    # Update cache after SQLite commit
+    # Update ETS cache after SQLite commit
     insert_block_ets(meta)
-    insert_overflow(terms, meta.block_id)
-    {:reply, result, %{state | dirty: true}}
+    insert_index_entries(terms, meta.block_id)
+    {:reply, result, state}
   end
 
   def handle_call({:delete_before, cutoff}, _from, state) do
@@ -306,7 +293,7 @@ defmodule TimelessLogs.Index do
       do_delete_before(state.db, cutoff, state.storage)
 
     remove_blocks_from_cache(deleted_ids, old_terms)
-    {:reply, count, %{state | dirty: false}}
+    {:reply, count, state}
   end
 
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
@@ -317,7 +304,7 @@ defmodule TimelessLogs.Index do
       do_delete_over_size(state.db, max_bytes, state.storage)
 
     remove_blocks_from_cache(deleted_ids, old_terms)
-    {:reply, count, %{state | dirty: false}}
+    {:reply, count, state}
   end
 
   def handle_call({:read_block_data, block_id}, _from, state) do
@@ -339,18 +326,14 @@ defmodule TimelessLogs.Index do
 
     # Update cache: remove old, add new
     for id <- old_ids, do: :ets.delete(@blocks_table, id)
-    remove_block_ids_from_persistent_term(old_ids, old_terms)
-    clear_overflow_for_blocks(old_ids)
+    remove_block_ids_from_index(old_ids, old_terms)
 
     for {meta, _entries, terms} <- new_terms_list do
       insert_block_ets(meta)
-      insert_overflow(terms, meta.block_id)
+      insert_index_entries(terms, meta.block_id)
     end
 
-    # Force immediate publish since compaction changes are significant
-    publish_overflow()
-
-    {:reply, result, %{state | dirty: false}}
+    {:reply, result, state}
   end
 
   def handle_call({:backup, target_path}, _from, state) do
@@ -370,8 +353,7 @@ defmodule TimelessLogs.Index do
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
     state = flush_sqlite(state)
-    publish_overflow()
-    {:reply, :ok, %{state | dirty: false}}
+    {:reply, :ok, state}
   end
 
   # --- handle_cast ---
@@ -379,12 +361,6 @@ defmodule TimelessLogs.Index do
   @impl true
   def handle_cast({:index_block, meta, entries, terms}, state) do
     pending = [{meta, entries, terms} | state.pending]
-    state = schedule_index_flush(%{state | pending: pending})
-    {:noreply, state}
-  end
-
-  def handle_cast({:index_block_raw, meta, entries}, state) do
-    pending = [{:raw, meta, entries} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -404,36 +380,27 @@ defmodule TimelessLogs.Index do
     {:noreply, state}
   end
 
-  def handle_info(:publish, state) do
-    if state.dirty do
-      publish_overflow()
-    end
-
-    ref = Process.send_after(self(), :publish, state.publish_interval)
-    {:noreply, %{state | publish_timer: ref, dirty: false}}
-  end
-
-  # --- ETS/persistent_term initialization ---
+  # --- ETS initialization ---
 
   defp init_ets_tables do
     safe_delete_ets(@blocks_table)
-    safe_delete_ets(@overflow_table)
+    safe_delete_ets(@term_index_table)
 
     :ets.new(@blocks_table, [
       :named_table,
       :ordered_set,
       :public,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: true
     ])
 
-    :ets.new(@overflow_table, [
+    :ets.new(@term_index_table, [
       :named_table,
-      :duplicate_bag,
+      :bag,
       :public,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: true
     ])
-
-    :persistent_term.put({__MODULE__, :term_index}, %{})
   end
 
   defp safe_delete_ets(table) do
@@ -482,21 +449,18 @@ defmodule TimelessLogs.Index do
     {:ok, stmt} =
       Exqlite.Sqlite3.prepare(db, "SELECT term, block_id FROM block_terms")
 
-    term_map = bulk_load_term_rows(db, stmt, %{})
+    bulk_load_term_rows(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
-    :persistent_term.put({__MODULE__, :term_index}, term_map)
   end
 
-  defp bulk_load_term_rows(db, stmt, acc) do
+  defp bulk_load_term_rows(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [term, block_id]} ->
-        updated =
-          Map.update(acc, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
-
-        bulk_load_term_rows(db, stmt, updated)
+        :ets.insert(@term_index_table, {term, block_id})
+        bulk_load_term_rows(db, stmt)
 
       :done ->
-        acc
+        :ok
     end
   end
 
@@ -518,25 +482,20 @@ defmodule TimelessLogs.Index do
     })
   end
 
-  defp insert_overflow(terms, block_id) do
+  defp insert_index_entries(terms, block_id) do
     if terms != [] do
-      term_objects = Enum.map(terms, fn term -> {:term, term, block_id} end)
-      :ets.insert(@overflow_table, term_objects)
+      term_objects = Enum.map(terms, fn term -> {term, block_id} end)
+      :ets.insert(@term_index_table, term_objects)
     end
   end
 
   # --- Lock-free read helpers ---
 
   defp term_block_ids(term) do
-    pt_set = Map.get(:persistent_term.get({__MODULE__, :term_index}), term, MapSet.new())
-
-    overflow_ids =
-      @overflow_table
-      |> :ets.match({:term, term, :"$1"})
-      |> List.flatten()
-      |> MapSet.new()
-
-    MapSet.union(pt_set, overflow_ids)
+    @term_index_table
+    |> :ets.lookup(term)
+    |> Enum.map(fn {_term, bid} -> bid end)
+    |> MapSet.new()
   end
 
   defp find_matching_blocks_ets(term_filters, time_filters, order) do
@@ -579,25 +538,6 @@ defmodule TimelessLogs.Index do
     |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, fmt, _ca} -> {bid, fp, fmt} end)
   end
 
-  # --- Publish: merge overflow into persistent_term ---
-
-  defp publish_overflow do
-    overflow_entries = :ets.tab2list(@overflow_table)
-
-    if overflow_entries != [] do
-      term_index = :persistent_term.get({__MODULE__, :term_index})
-
-      new_term_index =
-        Enum.reduce(overflow_entries, term_index, fn
-          {:term, term, block_id}, ti ->
-            Map.update(ti, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
-        end)
-
-      :persistent_term.put({__MODULE__, :term_index}, new_term_index)
-      :ets.delete_all_objects(@overflow_table)
-    end
-  end
-
   # --- Cache cleanup helpers ---
 
   defp collect_terms_for_blocks(db, block_ids) do
@@ -612,51 +552,16 @@ defmodule TimelessLogs.Index do
     end)
   end
 
-  defp remove_block_ids_from_persistent_term(old_ids, old_terms) do
-    old_id_set = MapSet.new(old_ids)
-
-    term_index = :persistent_term.get({__MODULE__, :term_index})
-
-    new_term_index =
-      old_terms
-      |> Enum.map(fn {term, _id} -> term end)
-      |> Enum.uniq()
-      |> Enum.reduce(term_index, fn term, acc ->
-        case Map.get(acc, term) do
-          nil ->
-            acc
-
-          bids ->
-            cleaned = MapSet.difference(bids, old_id_set)
-
-            if MapSet.size(cleaned) == 0 do
-              Map.delete(acc, term)
-            else
-              Map.put(acc, term, cleaned)
-            end
-        end
-      end)
-
-    :persistent_term.put({__MODULE__, :term_index}, new_term_index)
-  end
-
-  defp clear_overflow_for_blocks(old_ids) do
-    old_id_set = MapSet.new(old_ids)
-
-    @overflow_table
-    |> :ets.tab2list()
-    |> Enum.each(fn {_type, _key, bid} = entry ->
-      if MapSet.member?(old_id_set, bid) do
-        :ets.delete_object(@overflow_table, entry)
-      end
-    end)
+  defp remove_block_ids_from_index(_old_ids, old_terms) do
+    for {term, block_id} <- old_terms do
+      :ets.delete_object(@term_index_table, {term, block_id})
+    end
   end
 
   defp remove_blocks_from_cache(deleted_ids, old_terms) do
     if deleted_ids != [] do
       for id <- deleted_ids, do: :ets.delete(@blocks_table, id)
-      remove_block_ids_from_persistent_term(deleted_ids, old_terms)
-      clear_overflow_for_blocks(deleted_ids)
+      remove_block_ids_from_index(deleted_ids, old_terms)
     end
   end
 
@@ -665,23 +570,12 @@ defmodule TimelessLogs.Index do
   defp flush_pending(%{pending: []} = state), do: state
 
   defp flush_pending(%{pending: pending} = state) do
-    # Precompute any raw entries
-    resolved =
-      pending
-      |> Enum.reverse()
-      |> Enum.map(fn
-        {:raw, meta, entries} ->
-          terms = extract_terms(entries)
-          {meta, entries, terms}
+    resolved = Enum.reverse(pending)
 
-        {meta, entries, terms} ->
-          {meta, entries, terms}
-      end)
-
-    # Update ETS + overflow immediately (data becomes queryable now)
+    # Update ETS immediately (data becomes queryable now)
     for {meta, _entries, terms} <- resolved do
       insert_block_ets(meta)
-      insert_overflow(terms, meta.block_id)
+      insert_index_entries(terms, meta.block_id)
     end
 
     if state.flush_timer do
@@ -690,7 +584,7 @@ defmodule TimelessLogs.Index do
 
     # Queue SQLite persistence for background flush
     state = schedule_sqlite_flush(%{state | sqlite_pending: resolved ++ state.sqlite_pending})
-    %{state | pending: [], flush_timer: nil, dirty: true}
+    %{state | pending: [], flush_timer: nil}
   end
 
   defp flush_sqlite(%{sqlite_pending: []} = state), do: state
@@ -863,7 +757,8 @@ defmodule TimelessLogs.Index do
     end
   end
 
-  defp extract_terms(entries) do
+  @spec extract_terms([map()]) :: [String.t()]
+  def extract_terms(entries) do
     entries
     |> Enum.reduce(MapSet.new(), fn entry, acc ->
       acc = MapSet.put(acc, "level:#{entry.level}")

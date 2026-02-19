@@ -118,7 +118,13 @@ defmodule TimelessLogs.Compactor do
 
         {meta_chunk_pairs, total_bytes} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
-          TimelessLogs.Index.compact_blocks(old_ids, meta_chunk_pairs)
+
+          new_terms_list =
+            Enum.map(meta_chunk_pairs, fn {meta, entries} ->
+              {meta, entries, TimelessLogs.Index.extract_terms(entries)}
+            end)
+
+          TimelessLogs.Index.compact_blocks(old_ids, new_terms_list)
 
           duration = System.monotonic_time() - start_time
 

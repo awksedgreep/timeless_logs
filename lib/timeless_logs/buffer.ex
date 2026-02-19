@@ -120,10 +120,12 @@ defmodule TimelessLogs.Buffer do
 
     case TimelessLogs.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
+        terms = TimelessLogs.Index.extract_terms(entries)
+
         if Keyword.get(opts, :sync, false) do
-          TimelessLogs.Index.index_block(block_meta, entries)
+          TimelessLogs.Index.index_block(block_meta, entries, terms)
         else
-          TimelessLogs.Index.index_block_async(block_meta, entries)
+          TimelessLogs.Index.index_block_async(block_meta, entries, terms)
         end
 
         duration = System.monotonic_time() - start_time

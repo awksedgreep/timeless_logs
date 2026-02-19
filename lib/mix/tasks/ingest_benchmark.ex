@@ -60,7 +60,8 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
         |> Enum.reduce(0, fn chunk, count ->
           case TimelessLogs.Writer.write_block(chunk, idx_dir, :raw) do
             {:ok, meta} ->
-              TimelessLogs.Index.index_block(meta, chunk)
+              terms = TimelessLogs.Index.extract_terms(chunk)
+              TimelessLogs.Index.index_block(meta, chunk, terms)
               count + 1
 
             _ ->
