@@ -284,23 +284,23 @@ TimelessLogs emits telemetry events for monitoring:
 
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
-**Compression** (zstd level 5):
+**Compression** (zstd level 5, 1.1M simulated Phoenix log entries):
 
 | Metric | Value |
 |--------|-------|
-| Compression ratio | 11.1x |
-| Raw size | 247 MB |
+| Compression ratio | 11.2x |
+| Raw size | 246 MB |
 | Compressed size | 22 MB |
-| Index size | 31 MB |
-| Total disk | 53 MB |
-| Compression throughput | 295K entries/sec |
+| Compression throughput | 500K entries/sec |
 
-**Ingestion throughput** (500K entries):
+**Columnar+OpenZL** (per-column compression with reusable contexts):
 
-| Pipeline stage | Throughput |
-|----------------|-----------|
-| Writer only (no indexing) | 100K entries/sec |
-| Full pipeline (buffer + writer + index) | 64K entries/sec |
+| Level | Ratio | Throughput |
+|-------|-------|-----------|
+| 1 | 10.9x | 1.7M entries/sec |
+| 5 | 11.4x | 1.2M entries/sec |
+| 9 | 12.5x | 763K entries/sec |
+| 19 | 14.0x | 22.6K entries/sec |
 
 **Query latency** (1.1M entries indexed, 5 iterations, median):
 
