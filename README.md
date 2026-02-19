@@ -286,9 +286,9 @@ TimelessLogs emits telemetry events for monitoring:
 
 | Phase | Throughput |
 |---|---|
-| Writer only (serialization + disk I/O) | ~146K entries/sec |
-| Writer + Index (sync SQLite indexing) | ~38K entries/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~90K entries/sec |
+| Writer only (serialization + disk I/O) | ~159K entries/sec |
+| Writer + Index (sync SQLite indexing) | ~45K entries/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~88K entries/sec |
 
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
