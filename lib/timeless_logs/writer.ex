@@ -181,7 +181,7 @@ defmodule TimelessLogs.Writer do
         }
       end)
 
-    cctx = ExOpenzl.create_compression_context()
+    {:ok, cctx} = ExOpenzl.create_compression_context()
     level = Keyword.get(opts, :level, TimelessLogs.Config.openzl_compression_level())
     :ok = ExOpenzl.set_compression_level(cctx, level)
 
@@ -197,7 +197,7 @@ defmodule TimelessLogs.Writer do
 
   @doc false
   def columnar_deserialize(compressed) do
-    dctx = ExOpenzl.create_decompression_context()
+    {:ok, dctx} = ExOpenzl.create_decompression_context()
 
     case ExOpenzl.decompress_multi_typed(dctx, compressed) do
       {:ok, [ts_info, levels_info, msgs_info, meta_info]} ->
