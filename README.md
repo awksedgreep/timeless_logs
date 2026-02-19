@@ -282,6 +282,14 @@ TimelessLogs emits telemetry events for monitoring:
 
 ## Benchmarks
 
+**Ingestion throughput** (500K entries, 1000 entries/block):
+
+| Phase | Throughput |
+|---|---|
+| Writer only (serialization + disk I/O) | ~146K entries/sec |
+| Writer + Index (sync SQLite indexing) | ~38K entries/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~90K entries/sec |
+
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
 **Compression** (zstd level 5, 1.1M simulated Phoenix log entries):
