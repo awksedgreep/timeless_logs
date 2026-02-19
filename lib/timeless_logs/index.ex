@@ -541,7 +541,7 @@ defmodule TimelessLogs.Index do
     else
       {total_raw, total_compressed, block_count} =
         Enum.reduce(compressed_blocks, {0, 0, 0}, fn {block_id, file_path, byte_size, format},
-                                                      {raw_acc, comp_acc, count_acc} ->
+                                                     {raw_acc, comp_acc, count_acc} ->
           format_atom = to_format_atom(format)
 
           entries =
