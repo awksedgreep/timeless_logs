@@ -136,12 +136,13 @@ defmodule TimelessLogs.Writer do
   end
 
   def decompress_block(compressed, :openzl) do
-    case columnar_deserialize(compressed) do
-      {:ok, entries} ->
-        {:ok, entries}
-
-      {:error, reason} ->
-        Logger.warning("TimelessLogs: corrupt openzl block data: #{inspect(reason)}")
+    try do
+      {:ok, dctx} = ExOpenzl.create_decompression_context()
+      {:ok, outputs} = ExOpenzl.decompress_multi_typed(dctx, compressed)
+      {:ok, columnar_deserialize(outputs)}
+    rescue
+      e ->
+        Logger.warning("TimelessLogs: corrupt openzl block data: #{inspect(e)}")
         {:error, :corrupt_block}
     end
   end
@@ -195,38 +196,27 @@ defmodule TimelessLogs.Writer do
   end
 
   @doc false
-  def columnar_deserialize(compressed) do
-    {:ok, dctx} = ExOpenzl.create_decompression_context()
+  def columnar_deserialize([ts_info, levels_info, msgs_info, meta_info]) do
+    timestamps = unpack_u64_le(ts_info.data)
+    levels = unpack_u8(levels_info.data)
+    msg_lengths = unpack_native_u32(msgs_info.string_lengths)
+    meta_lengths = unpack_native_u32(meta_info.string_lengths)
+    messages = split_by_lengths(msgs_info.data, msg_lengths)
 
-    case ExOpenzl.decompress_multi_typed(dctx, compressed) do
-      {:ok, [ts_info, levels_info, msgs_info, meta_info]} ->
-        timestamps = unpack_u64_le(ts_info.data)
-        levels = unpack_u8(levels_info.data)
-        msg_lengths = unpack_native_u32(msgs_info.string_lengths)
-        meta_lengths = unpack_native_u32(meta_info.string_lengths)
-        messages = split_by_lengths(msgs_info.data, msg_lengths)
+    # Detect batched vs legacy per-entry metadata format
+    metadatas = deserialize_metadata(meta_info.data, meta_lengths, length(timestamps))
 
-        # Detect batched vs legacy per-entry metadata format
-        metadatas = deserialize_metadata(meta_info.data, meta_lengths, length(timestamps))
-
-        entries =
-          Enum.zip_with(
-            [timestamps, levels, messages, metadatas],
-            fn [ts, level_int, msg, metadata] ->
-              %{
-                timestamp: ts,
-                level: Map.fetch!(@int_to_level, level_int),
-                message: msg,
-                metadata: metadata
-              }
-            end
-          )
-
-        {:ok, entries}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    Enum.zip_with(
+      [timestamps, levels, messages, metadatas],
+      fn [ts, level_int, msg, metadata] ->
+        %{
+          timestamp: ts,
+          level: Map.fetch!(@int_to_level, level_int),
+          message: msg,
+          metadata: metadata
+        }
+      end
+    )
   end
 
   # Batched format: single term_to_binary blob containing list of all metadata maps

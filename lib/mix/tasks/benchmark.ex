@@ -130,7 +130,7 @@ defmodule Mix.Tasks.TimelessLogs.Benchmark do
     ozl_roundtrip_ok =
       Enum.all?(chunks, fn chunk ->
         {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(chunk, level: ozl_level)
-        {:ok, decoded} = TimelessLogs.Writer.columnar_deserialize(compressed)
+        {:ok, decoded} = TimelessLogs.Writer.decompress_block(compressed, :openzl)
         decoded == chunk
       end)
 
