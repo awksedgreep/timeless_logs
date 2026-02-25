@@ -156,6 +156,18 @@ defmodule TimelessLogs.Index do
     )
   end
 
+  @spec small_compressed_block_ids(pos_integer()) ::
+          [{integer(), String.t() | nil, non_neg_integer(), non_neg_integer()}]
+  def small_compressed_block_ids(max_entry_count) do
+    @blocks_table
+    |> :ets.tab2list()
+    |> Enum.filter(fn {_bid, _fp, _bs, ec, _tsmin, _tsmax, format, _ca} ->
+      format != :raw and ec < max_entry_count
+    end)
+    |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
+    |> Enum.map(fn {bid, fp, bs, ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp, bs, ec} end)
+  end
+
   @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
   def raw_block_ids do
     @blocks_table

@@ -15,6 +15,11 @@ defmodule TimelessLogs.Compactor do
     GenServer.call(__MODULE__, :compact_now, 60_000)
   end
 
+  @spec merge_now() :: :ok | :noop
+  def merge_now do
+    GenServer.call(__MODULE__, :merge_now, 60_000)
+  end
+
   @impl true
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
@@ -31,9 +36,15 @@ defmodule TimelessLogs.Compactor do
     {:reply, result, state}
   end
 
+  def handle_call(:merge_now, _from, state) do
+    result = maybe_merge_compact(state)
+    {:reply, result, state}
+  end
+
   @impl true
   def handle_info(:compaction_check, state) do
     maybe_compact(state)
+    maybe_merge_compact(state)
     schedule(state.interval)
     {:noreply, state}
   end
@@ -144,6 +155,123 @@ defmodule TimelessLogs.Compactor do
 
           :ok
       end
+    end
+  end
+
+  # --- Merge compaction ---
+
+  defp maybe_merge_compact(state) do
+    target = TimelessLogs.Config.merge_compaction_target_size()
+    min_blocks = TimelessLogs.Config.merge_compaction_min_blocks()
+    small_blocks = TimelessLogs.Index.small_compressed_block_ids(target)
+
+    if length(small_blocks) >= min_blocks do
+      do_merge_compact(state, small_blocks, target)
+    else
+      :noop
+    end
+  end
+
+  defp do_merge_compact(state, small_blocks, target_size) do
+    start_time = System.monotonic_time()
+    batches = group_into_batches(small_blocks, target_size)
+
+    merged_count =
+      Enum.reduce(batches, 0, fn batch, acc ->
+        case merge_batch(state, batch) do
+          :ok -> acc + 1
+          :noop -> acc
+        end
+      end)
+
+    if merged_count > 0 do
+      duration = System.monotonic_time() - start_time
+
+      TimelessLogs.Telemetry.event(
+        [:timeless_logs, :merge_compaction, :stop],
+        %{
+          duration: duration,
+          batches_merged: merged_count,
+          blocks_consumed: length(small_blocks)
+        },
+        %{}
+      )
+
+      :ok
+    else
+      :noop
+    end
+  end
+
+  defp group_into_batches(blocks, target_size) do
+    {batches, current} =
+      Enum.reduce(blocks, {[], []}, fn {_bid, _fp, _bs, ec} = block, {batches, current} ->
+        current_count = Enum.reduce(current, 0, fn {_, _, _, e}, a -> a + e end)
+
+        if current_count + ec > target_size and current != [] do
+          {[current | batches], [block]}
+        else
+          {batches, current ++ [block]}
+        end
+      end)
+
+    # Only include the last batch if it has >= 2 blocks
+    all = if length(current) >= 2, do: [current | batches], else: batches
+    Enum.reverse(all)
+  end
+
+  defp merge_batch(state, batch) do
+    all_entries =
+      Enum.flat_map(batch, fn {block_id, file_path, _bs, _ec} ->
+        read_result =
+          case state.storage do
+            :disk -> TimelessLogs.Writer.read_block(file_path, format_from_path(file_path))
+            :memory -> TimelessLogs.Index.read_block_data(block_id)
+          end
+
+        case read_result do
+          {:ok, entries} -> entries
+          {:error, _} -> []
+        end
+      end)
+
+    if all_entries == [] do
+      :noop
+    else
+      old_bytes = Enum.reduce(batch, 0, fn {_, _, bs, _}, a -> a + bs end)
+      write_target = if state.storage == :memory, do: :memory, else: state.data_dir
+
+      case TimelessLogs.Writer.write_block(
+             all_entries,
+             write_target,
+             TimelessLogs.Config.compaction_format()
+           ) do
+        {:ok, new_meta} ->
+          old_ids = Enum.map(batch, &elem(&1, 0))
+          terms = TimelessLogs.Index.extract_terms(all_entries)
+
+          TimelessLogs.Index.compact_blocks(
+            old_ids,
+            [{new_meta, all_entries, terms}],
+            {old_bytes, new_meta.byte_size}
+          )
+
+          :ok
+
+        {:error, _} ->
+          :noop
+      end
+    end
+  end
+
+  defp format_from_path(nil), do: :raw
+
+  defp format_from_path(path) do
+    case Path.extname(path) do
+      ".ozl" -> :openzl
+      ".zst" -> :zstd
+      ".raw" -> :raw
+      _ -> :raw
     end
   end
 end

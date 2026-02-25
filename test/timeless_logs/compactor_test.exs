@@ -178,4 +178,116 @@ defmodule TimelessLogs.CompactorTest do
       {:ok, %TimelessLogs.Result{total: 1}} = TimelessLogs.query([])
     end
   end
+
+  describe "merge compaction" do
+    test "merges multiple small compressed blocks into fewer larger ones" do
+      # Create 10 separate raw blocks with 3 entries each
+      for i <- 1..10 do
+        Logger.info("merge test entry #{i}")
+        TimelessLogs.flush()
+      end
+
+      # Compact them into 10 small compressed blocks
+      Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      assert :ok = TimelessLogs.Compactor.compact_now()
+
+      {:ok, stats_before} = TimelessLogs.stats()
+      assert stats_before.raw_blocks == 0
+      assert stats_before.openzl_blocks >= 1
+
+      blocks_before = stats_before.openzl_blocks
+
+      # Set merge config: target 50 entries, min 2 blocks
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 50)
+      Application.put_env(:timeless_logs, :merge_compaction_min_blocks, 2)
+
+      assert :ok = TimelessLogs.Compactor.merge_now()
+
+      {:ok, stats_after} = TimelessLogs.stats()
+      # Should have fewer blocks after merge
+      assert stats_after.total_blocks < blocks_before
+      # All entries still present
+      assert stats_after.total_entries == 10
+
+      # All entries still queryable
+      {:ok, %TimelessLogs.Result{total: 10}} = TimelessLogs.query([])
+    end
+
+    test "returns :noop when not enough small blocks" do
+      Logger.info("single entry")
+      TimelessLogs.flush()
+
+      Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      TimelessLogs.Compactor.compact_now()
+
+      # Only 1 compressed block, min_blocks is 4
+      Application.put_env(:timeless_logs, :merge_compaction_min_blocks, 4)
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 50)
+
+      assert :noop = TimelessLogs.Compactor.merge_now()
+    end
+
+    test "preserves query/search after merge" do
+      # Create entries with distinct metadata
+      Logger.info("alpha", domain: [:app])
+      TimelessLogs.flush()
+      Logger.warning("beta", domain: [:web])
+      TimelessLogs.flush()
+      Logger.error("gamma", domain: [:db])
+      TimelessLogs.flush()
+      Logger.info("delta", domain: [:app])
+      TimelessLogs.flush()
+
+      # Compact raw → compressed
+      Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      assert :ok = TimelessLogs.Compactor.compact_now()
+
+      # Merge compressed blocks
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 50)
+      Application.put_env(:timeless_logs, :merge_compaction_min_blocks, 2)
+      assert :ok = TimelessLogs.Compactor.merge_now()
+
+      # Query by level should still work
+      {:ok, %TimelessLogs.Result{total: total_errors}} = TimelessLogs.query(level: :error)
+      assert total_errors >= 1
+
+      # All entries queryable
+      {:ok, %TimelessLogs.Result{total: total}} = TimelessLogs.query([])
+      assert total == 4
+    end
+
+    test "works in memory mode" do
+      Application.stop(:timeless_logs)
+      Application.put_env(:timeless_logs, :storage, :memory)
+      Application.ensure_all_started(:timeless_logs)
+
+      for i <- 1..8 do
+        Logger.info("memory merge #{i}")
+        TimelessLogs.flush()
+      end
+
+      # Compact raw → compressed
+      Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      assert :ok = TimelessLogs.Compactor.compact_now()
+
+      {:ok, stats_before} = TimelessLogs.stats()
+      assert stats_before.raw_blocks == 0
+      blocks_before = stats_before.total_blocks
+
+      # Merge compressed blocks
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 50)
+      Application.put_env(:timeless_logs, :merge_compaction_min_blocks, 2)
+      assert :ok = TimelessLogs.Compactor.merge_now()
+
+      {:ok, stats_after} = TimelessLogs.stats()
+      assert stats_after.total_blocks < blocks_before
+      assert stats_after.total_entries == 8
+
+      {:ok, %TimelessLogs.Result{total: 8}} = TimelessLogs.query([])
+    after
+      Application.stop(:timeless_logs)
+      Application.put_env(:timeless_logs, :storage, :disk)
+      Application.ensure_all_started(:timeless_logs)
+    end
+  end
 end

@@ -81,4 +81,14 @@ defmodule TimelessLogs.Config do
   def index_publish_interval do
     Application.get_env(:timeless_logs, :index_publish_interval, 2_000)
   end
+
+  @spec merge_compaction_target_size() :: pos_integer()
+  def merge_compaction_target_size do
+    Application.get_env(:timeless_logs, :merge_compaction_target_size, 2_000)
+  end
+
+  @spec merge_compaction_min_blocks() :: pos_integer()
+  def merge_compaction_min_blocks do
+    Application.get_env(:timeless_logs, :merge_compaction_min_blocks, 4)
+  end
 end

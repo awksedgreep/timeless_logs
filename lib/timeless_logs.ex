@@ -160,6 +160,14 @@ defmodule TimelessLogs do
   end
 
   @doc """
+  Merge multiple small compressed blocks into fewer, larger blocks.
+
+  Returns `:ok` if blocks were merged, `:noop` if no merge was needed.
+  """
+  @spec merge_now() :: :ok | :noop
+  defdelegate merge_now(), to: TimelessLogs.Compactor
+
+  @doc """
   Create a consistent online backup of the log store.
 
   Flushes all in-flight data, then uses SQLite's `VACUUM INTO` to snapshot

@@ -146,6 +146,7 @@ TimelessLogs emits telemetry events for monitoring and observability:
 | `[:timeless_logs, :query, :stop]` | `duration`, `total`, `blocks_read` | `filters` |
 | `[:timeless_logs, :retention, :stop]` | `duration`, `blocks_deleted` | |
 | `[:timeless_logs, :compaction, :stop]` | `duration`, `raw_blocks`, `entry_count`, `byte_size` | |
+| `[:timeless_logs, :merge_compaction, :stop]` | `duration`, `batches_merged`, `blocks_consumed` | |
 | `[:timeless_logs, :block, :error]` | | `file_path`, `reason` |
 
 ### Attaching handlers
@@ -199,6 +200,7 @@ TimelessLogs emits telemetry events for monitoring and observability:
 - Avoid full scans (no filters) on large datasets
 - Reduce the time range with `:since` and `:until`
 - Check `raw_blocks` count -- many small raw blocks are slower to query than fewer compressed blocks
+- Trigger merge compaction to consolidate small compressed blocks: `TimelessLogs.merge_now()`
 
 ### Logs not appearing in queries
 

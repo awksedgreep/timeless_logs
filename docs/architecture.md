@@ -166,6 +166,36 @@ Update index (SQLite + ETS): remove old blocks, add new
 Delete old raw block files
 ```
 
+## Merge compaction
+
+After initial compaction produces many small compressed blocks (e.g. one per flush cycle), the Compactor runs a second pass that merges them into fewer, larger blocks. Larger blocks compress better (bigger dictionary window) and reduce per-block I/O overhead during reads.
+
+```
+Small compressed blocks (one per flush cycle)
+  │
+  ▼
+Trigger: compressed blocks with entry_count < target_size >= min_blocks
+  │
+  ▼
+Group into batches where sum(entry_count) ≈ merge_compaction_target_size
+  │  (sorted by ts_min for time locality)
+  ▼
+For each batch: decompress → merge → recompress
+  │
+  ▼
+Update index (SQLite + ETS): remove old blocks, add new
+  │
+  ▼
+Delete old compressed block files
+```
+
+The merge pass runs automatically after every compaction timer tick and can also be triggered manually via `TimelessLogs.merge_now()`.
+
+| Configuration | Default | Description |
+|---------------|---------|-------------|
+| `merge_compaction_target_size` | 2000 | Target entries per merged block |
+| `merge_compaction_min_blocks` | 4 | Minimum small blocks before merge triggers |
+
 ## Retention
 
 The Retention process runs periodically and enforces two independent policies:

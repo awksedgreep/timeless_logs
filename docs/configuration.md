@@ -17,6 +17,8 @@ All configuration is set via `config :timeless_logs` in your `config/config.exs`
 | `compaction_threshold` | integer | `500` | Min raw entries to trigger compaction |
 | `compaction_interval` | integer (ms) | `30_000` | Compaction check interval |
 | `compaction_max_raw_age` | integer (sec) | `60` | Force compact raw blocks older than this |
+| `merge_compaction_target_size` | integer | `2_000` | Target entries per merged compressed block |
+| `merge_compaction_min_blocks` | integer | `4` | Min small compressed blocks before merge triggers |
 | `retention_max_age` | integer (sec) or nil | `604_800` (7 days) | Delete logs older than this (`nil` = keep forever) |
 | `retention_max_size` | integer (bytes) or nil | `536_870_912` (512 MB) | Max total block storage (`nil` = unlimited) |
 | `retention_check_interval` | integer (ms) | `300_000` (5 min) | Retention check interval |
@@ -142,3 +144,13 @@ Compaction merges raw (uncompressed) blocks into compressed blocks. Tune these b
 - **High volume** (>1000 entries/sec): increase `compaction_threshold` to 2000+ and `compaction_interval` to 60_000 for larger, more efficient batches
 - **Low volume** (<10 entries/sec): decrease `compaction_max_raw_age` to 30 for faster compaction
 - **Testing**: set `compaction_threshold` to 10 and `compaction_max_raw_age` to 5 for immediate compaction
+
+### Merge compaction settings
+
+After initial compaction, many small compressed blocks accumulate (one per flush cycle). Merge compaction consolidates them into larger blocks for better compression and fewer blocks to scan during queries.
+
+- **High volume**: the defaults (target 2000 entries, min 4 blocks) work well
+- **Low volume** (<10 entries/sec): lower `merge_compaction_min_blocks` to 2 so merges happen with fewer blocks
+- **Large queries**: increase `merge_compaction_target_size` to 5000+ to produce fewer, larger blocks
+
+Merge compaction can also be triggered manually via `TimelessLogs.merge_now()`.
