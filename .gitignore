@@ -27,3 +27,7 @@ log_stream-*.tar
 
 # Test temp directories
 /test/tmp/
+
+# Environment files
+.env
+.env.*

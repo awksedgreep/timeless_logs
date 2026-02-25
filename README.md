@@ -21,7 +21,7 @@ Logs are written to raw blocks, automatically compacted with OpenZL (~12.5x comp
 ```elixir
 def deps do
   [
-    {:timeless_logs, "~> 0.6"}
+    {:timeless_logs, "~> 1.0"}
   ]
 end
 ```
