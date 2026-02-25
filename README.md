@@ -1,5 +1,7 @@
 # TimelessLogs
 
+> "I always found it odd that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
+
 Embedded log compression and indexing for Elixir applications. Add one dependency, configure a data directory, and your app gets compressed, searchable logs with zero external infrastructure.
 
 Logs are written to raw blocks, automatically compacted with OpenZL (~12.5x compression ratio), and indexed in SQLite for fast querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
