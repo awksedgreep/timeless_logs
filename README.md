@@ -2,7 +2,19 @@
 
 Embedded log compression and indexing for Elixir applications. Add one dependency, configure a data directory, and your app gets compressed, searchable logs with zero external infrastructure.
 
-Logs are written to raw blocks, automatically compacted with zstd (~11x compression ratio), and indexed in SQLite for fast querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
+Logs are written to raw blocks, automatically compacted with OpenZL (~12.5x compression ratio), and indexed in SQLite for fast querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
+
+## Documentation
+
+- [Getting Started](docs/getting_started.md)
+- [Configuration Reference](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [Querying](docs/querying.md)
+- [HTTP API](docs/http_api.md)
+- [Real-Time Subscriptions](docs/subscriptions.md)
+- [Storage & Compression](docs/storage.md)
+- [Operations](docs/operations.md)
+- [Telemetry](docs/telemetry.md)
 
 ## Installation
 
@@ -118,9 +130,9 @@ Get aggregate storage statistics without reading blocks:
 #   raw_blocks: 2,
 #   raw_bytes: 50_000,
 #   raw_entries: 500,
-#   zstd_blocks: 46,
-#   zstd_bytes: 23_950_000,
-#   zstd_entries: 124_500
+#   openzl_blocks: 46,
+#   openzl_bytes: 23_950_000,
+#   openzl_entries: 124_500
 # }
 ```
 
@@ -156,14 +168,15 @@ TimelessLogs.Retention.run_now()
 
 ## Compaction
 
-New log entries are first written as uncompressed raw blocks for low-latency ingestion. A background compactor periodically merges raw blocks into zstd-compressed blocks:
+New log entries are first written as uncompressed raw blocks for low-latency ingestion. A background compactor periodically merges raw blocks into compressed blocks:
 
 ```elixir
 config :timeless_logs,
   compaction_threshold: 500,       # Min raw entries to trigger compaction
   compaction_interval: 30_000,     # Check every 30 seconds
   compaction_max_raw_age: 60,      # Force compact raw blocks older than 60s
-  compression_level: 5             # zstd level 1-22 (default 5)
+  compaction_format: :openzl,      # :openzl (default) or :zstd
+  openzl_compression_level: 9      # OpenZL level 1-22 (default 9)
 ```
 
 Trigger manually:
@@ -248,7 +261,9 @@ When `bearer_token` is configured, all endpoints except `/health` require either
 | `flush_interval` | `1_000` | Buffer flush interval in ms |
 | `max_buffer_size` | `1_000` | Max entries before auto-flush |
 | `query_timeout` | `30_000` | Query timeout in ms |
-| `compression_level` | `5` | zstd compression level (1-22) |
+| `compaction_format` | `:openzl` | Compression format (`:openzl` or `:zstd`) |
+| `openzl_compression_level` | `9` | OpenZL compression level (1-22) |
+| `zstd_compression_level` | `3` | Zstd compression level (1-22) |
 | `compaction_threshold` | `500` | Min raw entries to trigger compaction |
 | `compaction_interval` | `30_000` | Compaction check interval in ms |
 | `compaction_max_raw_age` | `60` | Force compact raw blocks older than this (seconds) |
@@ -275,7 +290,7 @@ TimelessLogs emits telemetry events for monitoring:
 2. TimelessLogs captures log events via an OTP `:logger` handler
 3. Events buffer in a GenServer, flushing every 1s or 1000 entries
 4. Each flush writes a raw (uncompressed) block file
-5. A background compactor merges raw blocks into zstd-compressed blocks (~11x ratio)
+5. A background compactor merges raw blocks into OpenZL-compressed blocks (~12.5x ratio)
 6. Block metadata and an inverted index of terms are stored in SQLite (WAL mode)
 7. Queries hit the SQLite index to find relevant blocks, decompress only those in parallel, and filter entries
 8. Real-time subscribers receive matching entries as they're buffered
@@ -292,7 +307,7 @@ TimelessLogs emits telemetry events for monitoring:
 
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
-**Compression** (zstd level 5, 1.1M simulated Phoenix log entries):
+**Compression — zstd** (level 5, 1.1M simulated Phoenix log entries):
 
 | Metric | Value |
 |--------|-------|
