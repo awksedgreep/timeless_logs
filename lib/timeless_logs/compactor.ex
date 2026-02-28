@@ -94,7 +94,10 @@ defmodule TimelessLogs.Compactor do
       :noop
     else
       # Sum per-entry ETF sizes (logical size before compression)
-      raw_bytes = Enum.reduce(all_entries, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
+      raw_bytes =
+        Enum.reduce(all_entries, 0, fn entry, acc ->
+          acc + byte_size(:erlang.term_to_binary(entry))
+        end)
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
       concurrency = System.schedulers_online()
@@ -238,7 +241,11 @@ defmodule TimelessLogs.Compactor do
     if all_entries == [] do
       :noop
     else
-      raw_bytes = Enum.reduce(all_entries, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
+      raw_bytes =
+        Enum.reduce(all_entries, 0, fn entry, acc ->
+          acc + byte_size(:erlang.term_to_binary(entry))
+        end)
+
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
       case TimelessLogs.Writer.write_block(
