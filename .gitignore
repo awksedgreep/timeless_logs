@@ -28,6 +28,9 @@ log_stream-*.tar
 # Test temp directories
 /test/tmp/
 
+# Benchmark data
+/benchmark_data*/
+
 # Environment files
 .env
 .env.*
