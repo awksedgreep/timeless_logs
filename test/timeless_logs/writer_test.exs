@@ -217,6 +217,43 @@ defmodule TimelessLogs.WriterTest do
              ]
     end
 
+    test "handles all OTP/syslog severity levels without crashing" do
+      for level <- [
+            :debug,
+            :info,
+            :notice,
+            :warning,
+            :warn,
+            :error,
+            :critical,
+            :alert,
+            :emergency
+          ] do
+        entries = [
+          %{timestamp: 1000, level: level, message: "#{level} msg", metadata: %{}}
+        ]
+
+        {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
+        {:ok, [read_entry]} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
+
+        assert read_entry.message == "#{level} msg",
+               "Failed to round-trip log with level #{level}"
+      end
+    end
+
+    test "handles unknown severity levels without crashing" do
+      entries = [
+        %{timestamp: 1000, level: :fatal, message: "unknown level", metadata: %{}},
+        %{timestamp: 1001, level: :trace, message: "another unknown", metadata: %{}}
+      ]
+
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
+      {:ok, read_entries} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
+
+      assert length(read_entries) == 2
+      assert Enum.map(read_entries, & &1.message) == ["unknown level", "another unknown"]
+    end
+
     test "preserves metadata maps" do
       entries = [
         %{

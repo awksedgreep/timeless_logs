@@ -3,7 +3,17 @@ defmodule TimelessLogs.Writer do
 
   require Logger
 
-  @level_to_int %{debug: 0, info: 1, warning: 2, error: 3}
+  @level_to_int %{
+    debug: 0,
+    info: 1,
+    notice: 1,
+    warning: 2,
+    warn: 2,
+    error: 3,
+    critical: 3,
+    alert: 3,
+    emergency: 3
+  }
   @int_to_level %{0 => :debug, 1 => :info, 2 => :warning, 3 => :error}
 
   @type block_meta :: %{
@@ -166,7 +176,7 @@ defmodule TimelessLogs.Writer do
       Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>}, fn entry,
                                                         {ts_acc, lv_acc, msg_acc, msg_len_acc} ->
         ts = entry.timestamp
-        level_int = Map.fetch!(@level_to_int, entry.level)
+        level_int = Map.get(@level_to_int, entry.level, 1)
         msg = entry.message
 
         {
