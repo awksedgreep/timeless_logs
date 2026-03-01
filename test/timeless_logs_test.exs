@@ -121,6 +121,30 @@ defmodule TimelessLogsTest do
       assert hd(page1).timestamp != hd(page2).timestamp || hd(page1).message != hd(page2).message
     end
 
+    test "nested map metadata does not crash extract_terms" do
+      # Simulate VictoriaLogs-style ingest with nested meta (e.g. syslog)
+      entry = %{
+        timestamp: System.os_time(:microsecond),
+        level: :info,
+        message: "syslog message",
+        metadata: %{
+          service: "syslog",
+          app: "syslog",
+          meta: %{"source_ip" => "10.0.0.1", "facility" => 16, "hostname" => "router1"}
+        }
+      }
+
+      TimelessLogs.Buffer.log(entry)
+      TimelessLogs.flush()
+
+      # Should be queryable by metadata (service filter)
+      {:ok, %TimelessLogs.Result{entries: results}} =
+        TimelessLogs.query(metadata: %{service: "syslog"})
+
+      assert length(results) >= 1
+      assert hd(results).message =~ "syslog"
+    end
+
     test "ordering asc and desc" do
       Logger.info("first")
       Process.sleep(1100)

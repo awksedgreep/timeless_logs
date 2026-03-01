@@ -945,7 +945,11 @@ defmodule TimelessLogs.Index do
       acc = MapSet.put(acc, "level:#{entry.level}")
 
       Enum.reduce(entry.metadata, acc, fn {k, v}, inner_acc ->
-        MapSet.put(inner_acc, "#{k}:#{v}")
+        if is_binary(v) or is_atom(v) or is_number(v) do
+          MapSet.put(inner_acc, "#{k}:#{v}")
+        else
+          inner_acc
+        end
       end)
     end)
     |> MapSet.to_list()
