@@ -159,6 +159,19 @@ defmodule TimelessLogs.Compactor do
           :ok
       end
     end
+  rescue
+    e ->
+      Logger.error(
+        "TimelessLogs: compaction crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      TimelessLogs.Telemetry.event(
+        [:timeless_logs, :compaction, :error],
+        %{},
+        %{reason: e}
+      )
+
+      :noop
   end
 
   # --- Merge compaction ---
@@ -265,10 +278,18 @@ defmodule TimelessLogs.Compactor do
 
           :ok
 
-        {:error, _} ->
+        {:error, reason} ->
+          Logger.error("TimelessLogs: merge batch write failed: #{inspect(reason)}")
           :noop
       end
     end
+  rescue
+    e ->
+      Logger.error(
+        "TimelessLogs: merge batch crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      :noop
   end
 
   defp format_from_path(nil), do: :raw

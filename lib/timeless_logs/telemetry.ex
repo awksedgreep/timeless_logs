@@ -16,6 +16,14 @@ defmodule TimelessLogs.Telemetry do
       * Measurements: `%{duration: native_time, blocks_deleted: integer}`
       * Metadata: `%{}`
 
+    * `[:timeless_logs, :flush, :error]` - A buffer flush failed (write or index error).
+      * Measurements: `%{entry_count: integer}`
+      * Metadata: `%{reason: term}`
+
+    * `[:timeless_logs, :compaction, :error]` - A compaction pass failed.
+      * Measurements: `%{}`
+      * Metadata: `%{reason: term}`
+
     * `[:timeless_logs, :block, :error]` - A block read failed (corrupt or missing).
       * Measurements: `%{}`
       * Metadata: `%{file_path: string, reason: atom}`
