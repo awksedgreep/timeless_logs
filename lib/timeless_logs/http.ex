@@ -23,8 +23,11 @@ defmodule TimelessLogs.HTTP do
     * `POST /insert/jsonline` - NDJSON log ingest (VictoriaLogs format)
 
   ### Query
-    * `GET /select/logsql/query` - Query logs with filters, returns NDJSON
-    * `GET /select/logsql/stats` - Storage statistics
+    * `GET  /select/logsql/query` - Query logs with filters, returns NDJSON
+    * `POST /select/logsql/query` - LogsQL query via form body, returns NDJSON
+    * `POST /select/logsql/field_values` - Distinct values for a field
+    * `POST /select/logsql/field_names` - All field names from matching entries
+    * `GET  /select/logsql/stats` - Storage statistics
 
   ### Operational
     * `GET /health` - Health check
@@ -110,7 +113,7 @@ defmodule TimelessLogs.HTTP do
     {:ok, stats} = TimelessLogs.stats()
 
     body =
-      Jason.encode!(%{
+      json_encode!(%{
         status: "ok",
         blocks: stats.total_blocks,
         entries: stats.total_entries,
@@ -135,7 +138,7 @@ defmodule TimelessLogs.HTTP do
         if errors > 0 do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{entries: count, errors: errors}))
+          |> send_resp(200, json_encode!(%{entries: count, errors: errors}))
         else
           send_resp(conn, 204, "")
         end
@@ -143,14 +146,14 @@ defmodule TimelessLogs.HTTP do
       {:more, _partial, conn} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(413, Jason.encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
+        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
 
       {:error, reason} ->
         json_error(conn, 400, to_string(reason))
     end
   end
 
-  # Query logs with filters, returns NDJSON
+  # Query logs with filters via GET params, returns NDJSON
   get "/select/logsql/query" do
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
@@ -159,25 +162,80 @@ defmodule TimelessLogs.HTTP do
 
     case TimelessLogs.query(filters) do
       {:ok, %{entries: entries}} ->
-        body =
-          entries
-          |> Enum.map_join("\n", fn entry ->
-            map = %{
-              "_time" => format_timestamp(entry.timestamp),
-              "_msg" => entry.message,
-              "level" => to_string(entry.level)
-            }
-
-            map = Map.merge(map, stringify_metadata(entry.metadata))
-            Jason.encode!(map)
-          end)
-
-        conn
-        |> put_resp_content_type("application/x-ndjson")
-        |> send_resp(200, body)
+        send_ndjson_response(conn, entries)
 
       {:error, reason} ->
         json_error(conn, 500, inspect(reason))
+    end
+  end
+
+  # Query logs with LogsQL via POST form body, returns NDJSON
+  post "/select/logsql/query" do
+    case read_form_body(conn) do
+      {:ok, form, conn} ->
+        query_str = Map.get(form, "query", "*")
+
+        case TimelessLogs.LogsQL.parse(query_str) do
+          {:stats_count, filters} ->
+            case TimelessLogs.query(filters) do
+              {:ok, %{total: total}} ->
+                conn
+                |> put_resp_content_type("application/x-ndjson")
+                |> send_resp(200, json_encode!(%{total: total}))
+
+              {:error, reason} ->
+                json_error(conn, 500, inspect(reason))
+            end
+
+          {:query, filters} ->
+            case TimelessLogs.query(filters) do
+              {:ok, %{entries: entries}} ->
+                send_ndjson_response(conn, entries)
+
+              {:error, reason} ->
+                json_error(conn, 500, inspect(reason))
+            end
+        end
+
+      {:error, conn} ->
+        json_error(conn, 400, "failed to read body")
+    end
+  end
+
+  # Distinct values for a field
+  post "/select/logsql/field_values" do
+    conn = Plug.Conn.fetch_query_params(conn)
+    field = conn.query_params["field"]
+
+    case read_form_body(conn) do
+      {:ok, form, _conn} ->
+        query_str = Map.get(form, "query", "*")
+        {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
+        {:ok, values} = TimelessLogs.field_values(field, filters)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, json_encode!(%{values: values}))
+
+      {:error, conn} ->
+        json_error(conn, 400, "failed to read body")
+    end
+  end
+
+  # All field names from matching entries
+  post "/select/logsql/field_names" do
+    case read_form_body(conn) do
+      {:ok, form, _conn} ->
+        query_str = Map.get(form, "query", "*")
+        {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
+        {:ok, values} = TimelessLogs.field_names(filters)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, json_encode!(%{values: values}))
+
+      {:error, conn} ->
+        json_error(conn, 400, "failed to read body")
     end
   end
 
@@ -189,7 +247,7 @@ defmodule TimelessLogs.HTTP do
     |> put_resp_content_type("application/json")
     |> send_resp(
       200,
-      Jason.encode!(%{
+      json_encode!(%{
         total_blocks: stats.total_blocks,
         total_entries: stats.total_entries,
         total_bytes: stats.total_bytes,
@@ -215,7 +273,7 @@ defmodule TimelessLogs.HTTP do
           nil
 
         {:ok, body, _} ->
-          case Jason.decode(body) do
+          case json_decode(body) do
             {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
             _ -> nil
           end
@@ -232,7 +290,7 @@ defmodule TimelessLogs.HTTP do
         |> put_resp_content_type("application/json")
         |> send_resp(
           200,
-          Jason.encode!(%{
+          json_encode!(%{
             status: "ok",
             path: result.path,
             files: result.files,
@@ -251,7 +309,7 @@ defmodule TimelessLogs.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{status: "ok"}))
+    |> send_resp(200, json_encode!(%{status: "ok"}))
   end
 
   match _ do
@@ -419,6 +477,38 @@ defmodule TimelessLogs.HTTP do
     Map.new(metadata, fn {k, v} -> {to_string(k), v} end)
   end
 
+  defp send_ndjson_response(conn, entries) do
+    body =
+      entries
+      |> Enum.map_join("\n", fn entry ->
+        map = %{
+          "_time" => format_timestamp(entry.timestamp),
+          "_msg" => entry.message,
+          "level" => to_string(entry.level)
+        }
+
+        map = Map.merge(map, stringify_metadata(entry.metadata))
+        json_encode!(map)
+      end)
+
+    conn
+    |> put_resp_content_type("application/x-ndjson")
+    |> send_resp(200, body)
+  end
+
+  defp read_form_body(conn) do
+    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
+      {:ok, body, conn} ->
+        {:ok, URI.decode_query(body), conn}
+
+      {:more, _partial, conn} ->
+        {:error, conn}
+
+      {:error, _reason} ->
+        {:error, conn}
+    end
+  end
+
   defp default_backup_dir do
     data_dir = TimelessLogs.Config.data_dir()
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
@@ -427,6 +517,40 @@ defmodule TimelessLogs.HTTP do
   defp json_error(conn, status, msg) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{error: msg}))
+    |> send_resp(status, json_encode!(%{error: msg}))
   end
+
+  # JSON encoding/decoding using :json NIF (OTP 27+)
+  # Handles nil → :null conversion for compatibility
+  defp json_encode!(data) do
+    data
+    |> normalize_for_json()
+    |> :json.encode()
+    |> IO.iodata_to_binary()
+  end
+
+  defp json_decode(data) do
+    try do
+      {:ok, :json.decode(data)}
+    rescue
+      _ -> :error
+    end
+  end
+
+  defp normalize_for_json(nil), do: :null
+  defp normalize_for_json(atom) when is_atom(atom), do: Atom.to_string(atom)
+  defp normalize_for_json(val) when is_binary(val) or is_number(val) or is_boolean(val), do: val
+
+  defp normalize_for_json(list) when is_list(list) do
+    Enum.map(list, &normalize_for_json/1)
+  end
+
+  defp normalize_for_json(map) when is_map(map) do
+    Map.new(map, fn {k, v} ->
+      key = if is_atom(k), do: Atom.to_string(k), else: k
+      {key, normalize_for_json(v)}
+    end)
+  end
+
+  defp normalize_for_json(val), do: val
 end

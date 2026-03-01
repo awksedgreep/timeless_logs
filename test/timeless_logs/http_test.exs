@@ -29,7 +29,7 @@ defmodule TimelessLogs.HTTPTest do
   end
 
   defp json_body(conn) do
-    Jason.decode!(conn.resp_body)
+    :json.decode(conn.resp_body)
   end
 
   # --- Health ---
@@ -152,27 +152,10 @@ defmodule TimelessLogs.HTTPTest do
     end
   end
 
-  # --- Query ---
+  # --- Query (GET) ---
 
   describe "GET /select/logsql/query" do
-    setup do
-      lines =
-        Enum.join(
-          [
-            ~s({"_msg":"info one","level":"info","service":"api"}),
-            ~s({"_msg":"error boom","level":"error","service":"api"}),
-            ~s({"_msg":"info two","level":"info","service":"web"})
-          ],
-          "\n"
-        )
-
-      conn(:post, "/insert/jsonline", lines)
-      |> put_req_header("content-type", "application/x-ndjson")
-      |> call()
-
-      TimelessLogs.flush()
-      :ok
-    end
+    setup :ingest_test_data
 
     test "returns all logs as NDJSON" do
       conn = conn(:get, "/select/logsql/query") |> call()
@@ -182,7 +165,7 @@ defmodule TimelessLogs.HTTPTest do
       lines = String.split(conn.resp_body, "\n", trim: true)
       assert length(lines) == 3
 
-      parsed = Enum.map(lines, &Jason.decode!/1)
+      parsed = Enum.map(lines, &:json.decode/1)
       assert Enum.all?(parsed, &Map.has_key?(&1, "_msg"))
       assert Enum.all?(parsed, &Map.has_key?(&1, "_time"))
       assert Enum.all?(parsed, &Map.has_key?(&1, "level"))
@@ -194,7 +177,7 @@ defmodule TimelessLogs.HTTPTest do
 
       lines = String.split(conn.resp_body, "\n", trim: true)
       assert length(lines) == 1
-      assert Jason.decode!(hd(lines))["_msg"] == "error boom"
+      assert :json.decode(hd(lines))["_msg"] == "error boom"
     end
 
     test "respects limit" do
@@ -210,9 +193,142 @@ defmodule TimelessLogs.HTTPTest do
       assert conn.status == 200
 
       lines = String.split(conn.resp_body, "\n", trim: true)
-      parsed = Enum.map(lines, &Jason.decode!/1)
+      parsed = Enum.map(lines, &:json.decode/1)
       times = Enum.map(parsed, & &1["_time"])
       assert times == Enum.sort(times)
+    end
+  end
+
+  # --- Query (POST with LogsQL) ---
+
+  describe "POST /select/logsql/query" do
+    setup :ingest_test_data
+
+    test "returns all logs with wildcard query" do
+      conn =
+        conn(:post, "/select/logsql/query", "query=*")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-type") |> hd() =~ "ndjson"
+
+      lines = String.split(conn.resp_body, "\n", trim: true)
+      assert length(lines) == 3
+    end
+
+    test "filters by level via LogsQL" do
+      conn =
+        conn(:post, "/select/logsql/query", "query=level%3Aerror")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+
+      lines = String.split(conn.resp_body, "\n", trim: true)
+      assert length(lines) == 1
+      assert :json.decode(hd(lines))["_msg"] == "error boom"
+    end
+
+    test "stats count query returns total" do
+      query = URI.encode_query(%{"query" => "* | stats count() as total"})
+
+      conn =
+        conn(:post, "/select/logsql/query", query)
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+      body = :json.decode(conn.resp_body)
+      assert body["total"] == 3
+    end
+
+    test "respects limit pipe" do
+      query = URI.encode_query(%{"query" => "* | limit 1"})
+
+      conn =
+        conn(:post, "/select/logsql/query", query)
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+
+      lines = String.split(conn.resp_body, "\n", trim: true)
+      assert length(lines) == 1
+    end
+
+    test "filters by metadata field" do
+      query = URI.encode_query(%{"query" => "service:web"})
+
+      conn =
+        conn(:post, "/select/logsql/query", query)
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+
+      lines = String.split(conn.resp_body, "\n", trim: true)
+      assert length(lines) == 1
+      assert :json.decode(hd(lines))["_msg"] == "info two"
+    end
+  end
+
+  # --- Field Values ---
+
+  describe "POST /select/logsql/field_values" do
+    setup :ingest_test_data
+
+    test "returns distinct values for level field" do
+      conn =
+        conn(:post, "/select/logsql/field_values?field=level", "query=*")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+      body = json_body(conn)
+      values = body["values"]
+
+      assert is_list(values)
+      value_names = Enum.map(values, & &1["value"])
+      assert "info" in value_names
+      assert "error" in value_names
+    end
+
+    test "returns distinct values for metadata field" do
+      conn =
+        conn(:post, "/select/logsql/field_values?field=service", "query=*")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+      body = json_body(conn)
+      values = body["values"]
+      value_names = Enum.map(values, & &1["value"])
+      assert "api" in value_names
+      assert "web" in value_names
+    end
+  end
+
+  # --- Field Names ---
+
+  describe "POST /select/logsql/field_names" do
+    setup :ingest_test_data
+
+    test "returns all field names" do
+      conn =
+        conn(:post, "/select/logsql/field_names", "query=*")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> call()
+
+      assert conn.status == 200
+      body = json_body(conn)
+      values = body["values"]
+
+      value_names = Enum.map(values, & &1["value"])
+      assert "_msg" in value_names
+      assert "_time" in value_names
+      assert "level" in value_names
+      assert "service" in value_names
     end
   end
 
@@ -261,7 +377,6 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "POST /api/v1/backup" do
     test "creates backup with default path" do
-      # Ingest some data first
       body = ~s({"_msg":"backup test","level":"info"})
 
       conn(:post, "/insert/jsonline", body)
@@ -296,8 +411,10 @@ defmodule TimelessLogs.HTTPTest do
 
       TimelessLogs.flush()
 
+      payload = IO.iodata_to_binary(:json.encode(%{"path" => backup_dir}))
+
       conn =
-        conn(:post, "/api/v1/backup", Jason.encode!(%{path: backup_dir}))
+        conn(:post, "/api/v1/backup", payload)
         |> put_req_header("content-type", "application/json")
         |> call()
 
@@ -359,5 +476,26 @@ defmodule TimelessLogs.HTTPTest do
       conn = conn(:get, "/nonexistent") |> call()
       assert conn.status == 404
     end
+  end
+
+  # --- Helpers ---
+
+  defp ingest_test_data(_context) do
+    lines =
+      Enum.join(
+        [
+          ~s({"_msg":"info one","level":"info","service":"api"}),
+          ~s({"_msg":"error boom","level":"error","service":"api"}),
+          ~s({"_msg":"info two","level":"info","service":"web"})
+        ],
+        "\n"
+      )
+
+    conn(:post, "/insert/jsonline", lines)
+    |> put_req_header("content-type", "application/x-ndjson")
+    |> call()
+
+    TimelessLogs.flush()
+    :ok
   end
 end

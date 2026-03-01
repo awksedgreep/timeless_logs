@@ -64,6 +64,93 @@ defmodule TimelessLogs do
   end
 
   @doc """
+  Collect distinct values and hit counts for a given field.
+
+  Handles built-in fields (`"_msg"`, `"_time"`, `"level"`) and metadata fields.
+
+  ## Examples
+
+      TimelessLogs.field_values("level", since: DateTime.add(DateTime.utc_now(), -3600))
+      #=> {:ok, [%{"value" => "info", "hits" => 706}, %{"value" => "error", "hits" => 42}]}
+  """
+  @spec field_values(String.t(), keyword()) :: {:ok, list(map())}
+  def field_values(field_name, filters \\ []) do
+    counts =
+      stream(filters)
+      |> Enum.reduce(%{}, fn entry, acc ->
+        value = extract_field(entry, field_name)
+
+        if value do
+          Map.update(acc, value, 1, &(&1 + 1))
+        else
+          acc
+        end
+      end)
+
+    values =
+      counts
+      |> Enum.map(fn {value, hits} -> %{"value" => to_string(value), "hits" => hits} end)
+      |> Enum.sort_by(& &1["hits"], :desc)
+
+    {:ok, values}
+  end
+
+  @doc """
+  Collect all field names and hit counts from matching entries.
+
+  Always includes `_msg`, `_time`, and `level`. Metadata keys are also included.
+
+  ## Examples
+
+      TimelessLogs.field_names(since: DateTime.add(DateTime.utc_now(), -3600))
+      #=> {:ok, [%{"value" => "_msg", "hits" => 1094}, ...]}
+  """
+  @spec field_names(keyword()) :: {:ok, list(map())}
+  def field_names(filters \\ []) do
+    counts =
+      stream(filters)
+      |> Enum.reduce(%{}, fn entry, acc ->
+        # Built-in fields always present
+        acc =
+          acc
+          |> Map.update("_msg", 1, &(&1 + 1))
+          |> Map.update("_time", 1, &(&1 + 1))
+          |> Map.update("level", 1, &(&1 + 1))
+
+        # Add metadata keys
+        case entry.metadata do
+          meta when is_map(meta) and map_size(meta) > 0 ->
+            Enum.reduce(meta, acc, fn {k, _v}, inner ->
+              Map.update(inner, to_string(k), 1, &(&1 + 1))
+            end)
+
+          _ ->
+            acc
+        end
+      end)
+
+    values =
+      counts
+      |> Enum.map(fn {name, hits} -> %{"value" => name, "hits" => hits} end)
+      |> Enum.sort_by(& &1["hits"], :desc)
+
+    {:ok, values}
+  end
+
+  defp extract_field(entry, "_msg"), do: entry.message
+  defp extract_field(entry, "_time"), do: entry.timestamp
+  defp extract_field(entry, "level"), do: entry.level
+
+  defp extract_field(entry, field) do
+    key = String.to_atom(field)
+
+    case entry.metadata do
+      meta when is_map(meta) -> Map.get(meta, key)
+      _ -> nil
+    end
+  end
+
+  @doc """
   Lazily stream matching log entries without loading all results into memory.
 
   Returns an Elixir `Stream` that yields `%TimelessLogs.Entry{}` structs.
