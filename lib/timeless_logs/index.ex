@@ -232,6 +232,7 @@ defmodule TimelessLogs.Index do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     storage = Keyword.get(opts, :storage, :disk)
 
     # Initialize ETS tables
@@ -544,28 +545,36 @@ defmodule TimelessLogs.Index do
   defp load_snapshot(path) do
     case File.read(path) do
       {:ok, binary} ->
-        snapshot = :erlang.binary_to_term(binary)
-        :ets.insert(@blocks_table, snapshot.blocks)
-        :ets.insert(@term_index_table, snapshot.term_index)
-        :ets.insert(@compression_stats_table, snapshot.compression_stats)
-        :ets.insert(@block_data_table, Map.get(snapshot, :block_data, []))
-        :persistent_term.put({__MODULE__, :snapshot_ts}, snapshot.timestamp)
-        :ok
+        try do
+          snapshot = :erlang.binary_to_term(binary)
+          :ets.insert(@blocks_table, snapshot.blocks)
+          :ets.insert(@term_index_table, snapshot.term_index)
+          :ets.insert(@compression_stats_table, snapshot.compression_stats)
+          :ets.insert(@block_data_table, Map.get(snapshot, :block_data, []))
+          :persistent_term.put({__MODULE__, :snapshot_ts}, snapshot.timestamp)
+          :ok
+        rescue
+          e ->
+            require Logger
+            Logger.warning("TimelessLogs: corrupt snapshot, starting fresh: #{inspect(e)}")
+            :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
+            :ok
+        end
 
       {:error, :enoent} ->
-        :persistent_term.put({__MODULE__, :snapshot_ts}, 0)
+        :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
         :ok
 
       {:error, reason} ->
         require Logger
         Logger.warning("TimelessLogs: failed to load snapshot: #{inspect(reason)}")
-        :persistent_term.put({__MODULE__, :snapshot_ts}, 0)
+        :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
         :ok
     end
   end
 
   defp snapshot_timestamp do
-    :persistent_term.get({__MODULE__, :snapshot_ts}, 0)
+    :persistent_term.get({__MODULE__, :snapshot_ts}, :none)
   end
 
   # --- Disk log ---
@@ -601,7 +610,7 @@ defmodule TimelessLogs.Index do
           Enum.reduce(terms, count, fn term, acc ->
             ts = elem(term, 1)
 
-            if ts > snapshot_ts do
+            if snapshot_ts == :none or ts > snapshot_ts do
               apply_log_entry(term)
               acc + 1
             else
@@ -617,7 +626,7 @@ defmodule TimelessLogs.Index do
           Enum.reduce(terms, count, fn term, acc ->
             ts = elem(term, 1)
 
-            if ts > snapshot_ts do
+            if snapshot_ts == :none or ts > snapshot_ts do
               apply_log_entry(term)
               acc + 1
             else
