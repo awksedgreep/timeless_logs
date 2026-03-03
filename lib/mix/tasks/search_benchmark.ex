@@ -6,11 +6,14 @@ defmodule Mix.Tasks.TimelessLogs.SearchBenchmark do
 
   @impl true
   def run(_args) do
-    Mix.Task.run("app.start")
-
     data_dir = "search_bench_#{System.unique_integer([:positive])}"
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
+
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
+    Application.put_env(:timeless_logs, :storage, :disk)
+    Application.put_env(:timeless_logs, :compaction_interval, 600_000)
+    Mix.Task.run("app.start")
 
     IO.puts("=== TimelessLogs Search Benchmark ===\n")
     IO.puts("Generating 1 week of Phoenix logs...")
@@ -20,9 +23,13 @@ defmodule Mix.Tasks.TimelessLogs.SearchBenchmark do
     IO.puts("Generated #{fmt_number(entry_count)} log entries\n")
 
     IO.puts("Ingesting and indexing...")
-    {ingest_us, {block_count, index_size}} = :timer.tc(fn -> ingest_all(entries, data_dir) end)
+    {ingest_us, block_count} = :timer.tc(fn -> ingest_all(entries, data_dir) end)
+
+    {:ok, stats} = TimelessLogs.Index.stats()
+    index_size = stats.index_size
+
     IO.puts("Ingested #{block_count} blocks in #{fmt_ms(ingest_us)}")
-    IO.puts("SQLite index size: #{fmt_bytes(index_size)}\n")
+    IO.puts("Index size: #{fmt_bytes(index_size)}\n")
 
     # Now benchmark various query patterns
     IO.puts("Running search benchmarks (5 iterations each)...\n")
@@ -86,138 +93,41 @@ defmodule Mix.Tasks.TimelessLogs.SearchBenchmark do
     IO.puts("")
 
     # Summary stats
-    total_blocks = block_count
     total_disk = dir_size(blocks_dir) + index_size
 
     IO.puts("=== Storage Summary ===")
     IO.puts("Blocks on disk:   #{fmt_bytes(dir_size(blocks_dir))}")
-    IO.puts("SQLite index:     #{fmt_bytes(index_size)}")
+    IO.puts("Index (log+snap): #{fmt_bytes(index_size)}")
     IO.puts("Total disk:       #{fmt_bytes(total_disk)}")
 
     IO.puts(
       "Index overhead:   #{:erlang.float_to_binary(index_size / max(total_disk, 1) * 100, decimals: 1)}%"
     )
 
-    IO.puts("Blocks:           #{total_blocks}")
+    IO.puts("Blocks:           #{block_count}")
     IO.puts("Entries:          #{fmt_number(entry_count)}")
 
+    Application.stop(:timeless_logs)
     File.rm_rf!(data_dir)
   end
 
   defp ingest_all(entries, data_dir) do
-    db_path = Path.join(data_dir, "index.db")
-    {:ok, db} = Exqlite.Sqlite3.open(db_path)
+    entries
+    |> Enum.chunk_every(1000)
+    |> Enum.reduce(0, fn chunk, count ->
+      case TimelessLogs.Writer.write_block(chunk, data_dir) do
+        {:ok, meta} ->
+          terms = TimelessLogs.Index.extract_terms(chunk)
+          TimelessLogs.Index.index_block(meta, chunk, terms)
+          count + 1
 
-    Exqlite.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
-    Exqlite.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
-
-    Exqlite.Sqlite3.execute(db, """
-    CREATE TABLE IF NOT EXISTS blocks (
-      block_id INTEGER PRIMARY KEY,
-      file_path TEXT,
-      byte_size INTEGER NOT NULL,
-      entry_count INTEGER NOT NULL,
-      ts_min INTEGER NOT NULL,
-      ts_max INTEGER NOT NULL,
-      data BLOB,
-      format TEXT NOT NULL DEFAULT 'zstd',
-      created_at INTEGER NOT NULL DEFAULT (unixepoch())
-    )
-    """)
-
-    Exqlite.Sqlite3.execute(db, """
-    CREATE TABLE IF NOT EXISTS block_terms (
-      term TEXT NOT NULL,
-      block_id INTEGER NOT NULL REFERENCES blocks(block_id),
-      PRIMARY KEY (term, block_id)
-    ) WITHOUT ROWID
-    """)
-
-    Exqlite.Sqlite3.execute(db, """
-    CREATE INDEX IF NOT EXISTS idx_blocks_ts ON blocks(ts_min, ts_max)
-    """)
-
-    block_count =
-      entries
-      |> Enum.chunk_every(1000)
-      |> Enum.reduce(0, fn chunk, count ->
-        case TimelessLogs.Writer.write_block(chunk, data_dir) do
-          {:ok, meta} ->
-            index_block_direct(db, meta, chunk)
-            count + 1
-
-          _ ->
-            count
-        end
-      end)
-
-    Exqlite.Sqlite3.close(db)
-
-    # Point the running Index GenServer at this data
-    # We need to restart the app with this data_dir
-    Application.stop(:timeless_logs)
-    Application.put_env(:timeless_logs, :data_dir, data_dir)
-    Application.ensure_all_started(:timeless_logs)
-
-    index_size = File.stat!(db_path).size
-    {block_count, index_size}
-  end
-
-  defp index_block_direct(db, meta, entries) do
-    Exqlite.Sqlite3.execute(db, "BEGIN")
-
-    {:ok, block_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-      """)
-
-    format_str = Atom.to_string(Map.get(meta, :format, :raw))
-
-    Exqlite.Sqlite3.bind(block_stmt, [
-      meta.block_id,
-      meta.file_path,
-      meta.byte_size,
-      meta.entry_count,
-      meta.ts_min,
-      meta.ts_max,
-      format_str
-    ])
-
-    Exqlite.Sqlite3.step(db, block_stmt)
-    Exqlite.Sqlite3.release(db, block_stmt)
-
-    terms =
-      entries
-      |> Enum.flat_map(fn entry ->
-        level_term = "level:#{entry.level}"
-        metadata_terms = Enum.map(entry.metadata, fn {k, v} -> "#{k}:#{v}" end)
-        [level_term | metadata_terms]
-      end)
-      |> Enum.uniq()
-
-    # Batch insert terms (400 per statement, 800 params)
-    terms
-    |> Enum.chunk_every(400)
-    |> Enum.each(fn batch ->
-      n = length(batch)
-
-      placeholders =
-        Enum.map_join(1..n, ", ", fn i -> "(?#{i * 2 - 1}, ?#{i * 2})" end)
-
-      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-      params = Enum.flat_map(batch, fn term -> [term, meta.block_id] end)
-      Exqlite.Sqlite3.bind(stmt, params)
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+        _ ->
+          count
+      end
     end)
-
-    Exqlite.Sqlite3.execute(db, "COMMIT")
   end
 
   defp pick_request_id(entries) do
-    # Find a request_id that exists in the data
     entries
     |> Enum.find_value(fn entry ->
       Map.get(entry.metadata, "request_id")

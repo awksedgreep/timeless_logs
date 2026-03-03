@@ -25,7 +25,6 @@ defmodule TimelessLogs.MixProject do
 
   defp deps do
     [
-      {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
       {:ex_openzl, "~> 0.4.0"},
       {:bandit, "~> 1.6"},
