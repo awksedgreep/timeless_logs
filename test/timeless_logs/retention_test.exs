@@ -13,6 +13,7 @@ defmodule TimelessLogs.RetentionTest do
     Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
     Application.put_env(:timeless_logs, :retention_max_age, nil)
     Application.put_env(:timeless_logs, :retention_max_size, nil)
+    Application.put_env(:timeless_logs, :max_term_index_entries, nil)
     Application.put_env(:timeless_logs, :retention_check_interval, 600_000)
     Application.ensure_all_started(:timeless_logs)
 
@@ -20,6 +21,7 @@ defmodule TimelessLogs.RetentionTest do
       Application.stop(:timeless_logs)
       Application.put_env(:timeless_logs, :retention_max_age, nil)
       Application.put_env(:timeless_logs, :retention_max_size, nil)
+      Application.put_env(:timeless_logs, :max_term_index_entries, nil)
       File.rm_rf!(@data_dir)
     end)
 

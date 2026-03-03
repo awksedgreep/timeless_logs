@@ -24,28 +24,44 @@ defmodule TimelessLogs.Compactor do
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
     data_dir = Keyword.get(opts, :data_dir, TimelessLogs.Config.data_dir())
-    interval = TimelessLogs.Config.compaction_interval()
-    schedule(interval)
+    base_interval = TimelessLogs.Config.compaction_interval()
+    schedule(base_interval)
 
-    {:ok, %{storage: storage, data_dir: data_dir, interval: interval}}
+    {:ok,
+     %{
+       storage: storage,
+       data_dir: data_dir,
+       base_interval: base_interval,
+       idle_cycles: 0
+     }}
   end
 
   @impl true
   def handle_call(:compact_now, _from, state) do
     result = maybe_compact(state)
-    {:reply, result, state}
+    {:reply, result, %{state | idle_cycles: 0}}
   end
 
   def handle_call(:merge_now, _from, state) do
     result = maybe_merge_compact(state)
-    {:reply, result, state}
+    {:reply, result, %{state | idle_cycles: 0}}
   end
 
   @impl true
   def handle_info(:compaction_check, state) do
-    maybe_compact(state)
-    maybe_merge_compact(state)
-    schedule(state.interval)
+    compact_result = maybe_compact(state)
+    merge_result = maybe_merge_compact(state)
+
+    state =
+      if compact_result == :noop and merge_result == :noop do
+        %{state | idle_cycles: state.idle_cycles + 1}
+      else
+        %{state | idle_cycles: 0}
+      end
+
+    max_backoff = TimelessLogs.Config.compaction_max_backoff()
+    next_interval = min(state.base_interval * Bitwise.bsl(1, state.idle_cycles), max_backoff)
+    schedule(next_interval)
     {:noreply, state}
   end
 

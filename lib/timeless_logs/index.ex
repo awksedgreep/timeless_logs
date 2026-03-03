@@ -132,11 +132,7 @@ defmodule TimelessLogs.Index do
           oldest_created_at: integer() | nil
         }
   def raw_block_stats do
-    rows = :ets.tab2list(@blocks_table)
-
-    Enum.reduce(
-      rows,
-      %{entry_count: 0, block_count: 0, oldest_created_at: nil},
+    :ets.foldl(
       fn {_bid, _fp, _bs, entry_count, _tsmin, _tsmax, format, created_at}, acc ->
         if format == :raw do
           oldest =
@@ -152,20 +148,28 @@ defmodule TimelessLogs.Index do
         else
           acc
         end
-      end
+      end,
+      %{entry_count: 0, block_count: 0, oldest_created_at: nil},
+      @blocks_table
     )
   end
 
   @spec small_compressed_block_ids(pos_integer()) ::
           [{integer(), String.t() | nil, non_neg_integer(), non_neg_integer()}]
   def small_compressed_block_ids(max_entry_count) do
-    @blocks_table
-    |> :ets.tab2list()
-    |> Enum.filter(fn {_bid, _fp, _bs, ec, _tsmin, _tsmax, format, _ca} ->
-      format != :raw and ec < max_entry_count
-    end)
-    |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
-    |> Enum.map(fn {bid, fp, bs, ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp, bs, ec} end)
+    :ets.foldl(
+      fn {bid, fp, bs, ec, ts_min, _tsmax, format, _ca}, acc ->
+        if format != :raw and ec < max_entry_count do
+          [{ts_min, bid, fp, bs, ec} | acc]
+        else
+          acc
+        end
+      end,
+      [],
+      @blocks_table
+    )
+    |> Enum.sort_by(fn {ts_min, _bid, _fp, _bs, _ec} -> ts_min end)
+    |> Enum.map(fn {_ts_min, bid, fp, bs, ec} -> {bid, fp, bs, ec} end)
   end
 
   @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
@@ -195,6 +199,11 @@ defmodule TimelessLogs.Index do
   @spec delete_blocks_over_size(non_neg_integer()) :: non_neg_integer()
   def delete_blocks_over_size(max_bytes) do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
+  end
+
+  @spec delete_oldest_blocks_until_term_limit(pos_integer()) :: non_neg_integer()
+  def delete_oldest_blocks_until_term_limit(max_entries) do
+    GenServer.call(__MODULE__, {:delete_by_term_limit, max_entries}, 60_000)
   end
 
   @spec compact_blocks(
@@ -332,6 +341,23 @@ defmodule TimelessLogs.Index do
 
     remove_blocks_from_cache(deleted_ids, old_terms)
     {:reply, count, state}
+  end
+
+  def handle_call({:delete_by_term_limit, max_entries}, _from, state) do
+    current_size = :ets.info(@term_index_table, :size)
+
+    if current_size <= max_entries do
+      {:reply, 0, state}
+    else
+      state = flush_pending(state)
+      state = flush_sqlite(state)
+
+      {count, deleted_ids, old_terms} =
+        do_delete_by_term_limit(state.db, max_entries, state.storage)
+
+      remove_blocks_from_cache(deleted_ids, old_terms)
+      {:reply, count, state}
+    end
   end
 
   def handle_call({:read_block_data, block_id}, _from, state) do
@@ -1193,6 +1219,44 @@ defmodule TimelessLogs.Index do
     end
   end
 
+  defp do_delete_by_term_limit(db, max_entries, storage) do
+    current_size = :ets.info(@term_index_table, :size)
+
+    if current_size <= max_entries do
+      {0, [], []}
+    else
+      {:ok, stmt} =
+        Exqlite.Sqlite3.prepare(
+          db,
+          """
+          SELECT b.block_id, b.file_path, COUNT(bt.term) as term_count
+          FROM blocks b
+          LEFT JOIN block_terms bt ON b.block_id = bt.block_id
+          GROUP BY b.block_id
+          ORDER BY b.ts_min ASC
+          """
+        )
+
+      rows = collect_rows_with_term_count(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+
+      {to_delete, _} =
+        Enum.reduce_while(rows, {[], current_size}, fn {block_id, file_path, term_count},
+                                                       {acc, remaining} ->
+          if remaining > max_entries do
+            {:cont, {[{block_id, file_path} | acc], remaining - term_count}}
+          else
+            {:halt, {acc, remaining}}
+          end
+        end)
+
+      block_ids = Enum.map(to_delete, fn {id, _fp} -> id end)
+      old_terms = collect_terms_for_blocks(db, block_ids)
+      count = delete_blocks(db, to_delete, storage)
+      {count, block_ids, old_terms}
+    end
+  end
+
   defp delete_blocks(_db, [], _storage), do: 0
 
   defp delete_blocks(db, blocks, storage) do
@@ -1280,6 +1344,16 @@ defmodule TimelessLogs.Index do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [block_id, file_path, size]} ->
         [{block_id, file_path, size} | collect_rows_with_size(db, stmt)]
+
+      :done ->
+        []
+    end
+  end
+
+  defp collect_rows_with_term_count(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [block_id, file_path, term_count]} ->
+        [{block_id, file_path, term_count} | collect_rows_with_term_count(db, stmt)]
 
       :done ->
         []
