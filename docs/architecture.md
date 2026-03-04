@@ -9,7 +9,7 @@ TimelessLogs.Supervisor (:one_for_one)
 ├── Registry (TimelessLogs.Registry, :duplicate)
 │     Real-time log subscription registry
 ├── TimelessLogs.Index (GenServer)
-│     SQLite persistence + ETS cache for block metadata and term index
+│     ETS tables for block metadata and term index, persisted via snapshots + disk log
 ├── Task.Supervisor (TimelessLogs.FlushSupervisor)
 │     Concurrent flush task execution
 ├── TimelessLogs.Buffer (GenServer)
@@ -50,7 +50,7 @@ TimelessLogs.Writer.write_block/4
   │  (serialize entries to raw block, write to disk or memory)
   ▼
 TimelessLogs.Index.index_block_async/3
-  │  (index block metadata + terms in ETS immediately, persist to SQLite async)
+  │  (index block metadata + terms in ETS immediately, journal to disk log)
   ▼
 Data is queryable
 ```
@@ -110,25 +110,27 @@ The OpenZL format splits entries into columns for better compression:
 
 Each column is independently compressed with OpenZL, allowing the compressor to exploit per-column redundancy.
 
-### SQLite index
+### ETS index
 
-SQLite (WAL mode, mmap enabled) stores:
-
-- **blocks table**: block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at
-- **block_terms table**: inverted index mapping `"key:value"` terms to block IDs
-- **compression_stats**: lifetime compression statistics
-
-On startup, all block metadata and term index entries are bulk-loaded into ETS tables for lock-free read access.
-
-### ETS tables
+All index state lives in ETS tables — the authoritative source of truth at runtime:
 
 | Table | Type | Purpose |
 |-------|------|---------|
-| `timeless_logs_blocks` | ordered_set | Block metadata cache (block_id → metadata) |
+| `timeless_logs_blocks` | ordered_set | Block metadata (block_id → file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) |
 | `timeless_logs_term_index` | bag | Inverted term index (term → block_id) |
 | `timeless_logs_compression_stats` | set | Lifetime compression statistics |
+| `timeless_logs_block_data` | set | In-memory block data (memory storage mode only) |
 
 All tables are public with `read_concurrency: true` for lock-free query access.
+
+### Persistence
+
+Index durability uses a snapshot + write-ahead log strategy:
+
+- **`index.snapshot`**: Periodic full dump of all ETS tables (Erlang `term_to_binary`, compressed). Written every 1000 index operations or on graceful shutdown.
+- **`index.log`**: Erlang `:disk_log` that journals every index mutation (block inserts, deletes, compactions). Replayed on startup after loading the snapshot.
+
+On startup: load snapshot → replay log entries newer than the snapshot → index is fully reconstructed in ETS. No external database required.
 
 ## Inverted index
 
@@ -160,7 +162,7 @@ Compress in parallel chunks (concurrency = schedulers_online)
 Write new compressed block files
   │
   ▼
-Update index (SQLite + ETS): remove old blocks, add new
+Update index (ETS + disk log): remove old blocks, add new
   │
   ▼
 Delete old raw block files
@@ -183,7 +185,7 @@ Group into batches where sum(entry_count) ≈ merge_compaction_target_size
 For each batch: decompress → merge → recompress
   │
   ▼
-Update index (SQLite + ETS): remove old blocks, add new
+Update index (ETS + disk log): remove old blocks, add new
   │
   ▼
 Delete old compressed block files

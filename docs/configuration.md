@@ -6,8 +6,8 @@ All configuration is set via `config :timeless_logs` in your `config/config.exs`
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `data_dir` | string | `"priv/log_stream"` | Root directory for block files and SQLite index |
-| `storage` | atom | `:disk` | Storage backend: `:disk` (block files) or `:memory` (SQLite BLOBs) |
+| `data_dir` | string | `"priv/log_stream"` | Root directory for block files and index snapshots |
+| `storage` | atom | `:disk` | Storage backend: `:disk` (block files + ETS snapshots) or `:memory` (ETS only) |
 | `flush_interval` | integer (ms) | `1_000` | Buffer flush interval |
 | `max_buffer_size` | integer | `1_000` | Max entries before auto-flush |
 | `query_timeout` | integer (ms) | `30_000` | Query operation timeout |
@@ -22,7 +22,7 @@ All configuration is set via `config :timeless_logs` in your `config/config.exs`
 | `retention_max_age` | integer (sec) or nil | `604_800` (7 days) | Delete logs older than this (`nil` = keep forever) |
 | `retention_max_size` | integer (bytes) or nil | `536_870_912` (512 MB) | Max total block storage (`nil` = unlimited) |
 | `retention_check_interval` | integer (ms) | `300_000` (5 min) | Retention check interval |
-| `index_publish_interval` | integer (ms) | `2_000` | ETS-to-SQLite batch flush interval |
+| `index_publish_interval` | integer (ms) | `2_000` | Index disk log flush interval |
 | `http` | boolean or keyword | `false` | Enable HTTP API (see below) |
 
 ## Full configuration example
@@ -83,7 +83,7 @@ config :timeless_logs,
   data_dir: "/var/lib/my_app/logs"
 ```
 
-Block files are stored in `data_dir/blocks/` as numbered files with format-specific extensions (`.raw`, `.zst`, `.ozl`). The SQLite index is stored at `data_dir/index.db`.
+Block files are stored in `data_dir/blocks/` as numbered files with format-specific extensions (`.raw`, `.zst`, `.ozl`). The index is persisted as `data_dir/index.snapshot` (periodic full dump) and `data_dir/index.log` (write-ahead log).
 
 ### Memory storage
 
@@ -92,7 +92,7 @@ config :timeless_logs,
   storage: :memory
 ```
 
-Block data is stored as BLOBs in an in-memory SQLite database. Useful for testing or ephemeral environments. Data does not survive restarts.
+Block data is stored in ETS tables only. Useful for testing or ephemeral environments. Data does not survive restarts.
 
 ## Tuning guidance
 
@@ -111,10 +111,11 @@ The compaction format determines how raw blocks are compressed:
 
 | Format | Ratio | Throughput | Best for |
 |--------|-------|-----------|----------|
-| `:zstd` | ~11x | ~500K entries/sec | General use |
-| `:openzl` (level 1) | ~11x | ~1.7M entries/sec | High throughput |
-| `:openzl` (level 9) | ~12.5x | ~763K entries/sec | Balance (default) |
-| `:openzl` (level 19) | ~14x | ~23K entries/sec | Maximum compression |
+| `:zstd` (level 5) | ~11.1x | ~1.2M entries/sec | General use |
+| `:openzl` (level 1) | ~11.2x | ~706K entries/sec | High throughput |
+| `:openzl` (level 3) | ~11.3x | ~2.1M entries/sec | Fast compression |
+| `:openzl` (level 9) | ~12.8x | ~702K entries/sec | Balance (default) |
+| `:openzl` (level 19) | ~14.4x | ~17.5K entries/sec | Maximum compression |
 
 ### Retention settings
 

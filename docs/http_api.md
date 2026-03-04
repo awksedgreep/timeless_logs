@@ -204,7 +204,7 @@ Response:
 {
   "status": "ok",
   "path": "/tmp/logs_backup",
-  "files": ["index.db", "blocks"],
+  "files": ["index.snapshot", "blocks"],
   "total_bytes": 24000000
 }
 ```

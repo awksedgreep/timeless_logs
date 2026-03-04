@@ -262,15 +262,9 @@ defmodule TimelessLogs.Index do
         data_dir = Keyword.fetch!(opts, :data_dir)
         log_path = Path.join(data_dir, "index.log")
         snapshot_path = Path.join(data_dir, "index.snapshot")
-        db_path = Path.join(data_dir, "index.db")
 
         :persistent_term.put({__MODULE__, :snapshot_path}, snapshot_path)
         :persistent_term.put({__MODULE__, :log_path}, log_path)
-
-        # SQLite migration: if index.db exists but no snapshot, migrate
-        if File.exists?(db_path) and not File.exists?(snapshot_path) do
-          migrate_from_sqlite(db_path, data_dir)
-        end
 
         # Load snapshot into ETS
         load_snapshot(snapshot_path)
@@ -1032,95 +1026,6 @@ defmodule TimelessLogs.Index do
   end
 
   defp schedule_index_flush(state), do: state
-
-  # --- SQLite migration ---
-
-  defp migrate_from_sqlite(db_path, _data_dir) do
-    if Code.ensure_loaded?(Exqlite.Sqlite3) do
-      require Logger
-      Logger.info("TimelessLogs: migrating from SQLite to ETS snapshots...")
-
-      {:ok, db} = Exqlite.Sqlite3.open(db_path)
-
-      # Bulk load blocks
-      {:ok, stmt} =
-        Exqlite.Sqlite3.prepare(db, """
-        SELECT block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at
-        FROM blocks
-        """)
-
-      migrate_load_blocks(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
-
-      # Bulk load term index
-      {:ok, stmt} =
-        Exqlite.Sqlite3.prepare(db, "SELECT term, block_id FROM block_terms")
-
-      migrate_load_terms(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
-
-      # Bulk load compression stats
-      {:ok, stmt} =
-        Exqlite.Sqlite3.prepare(
-          db,
-          "SELECT raw_bytes_in, compressed_bytes_out, compaction_count FROM compression_stats WHERE id = 1"
-        )
-
-      case Exqlite.Sqlite3.step(db, stmt) do
-        {:row, [r, c, n]} ->
-          :ets.insert(@compression_stats_table, {:lifetime, r, c, n})
-
-        :done ->
-          :ets.insert(@compression_stats_table, {:lifetime, 0, 0, 0})
-      end
-
-      Exqlite.Sqlite3.release(db, stmt)
-      Exqlite.Sqlite3.close(db)
-
-      # Write snapshot from migrated ETS state
-      snapshot_path = :persistent_term.get({__MODULE__, :snapshot_path})
-      write_snapshot(snapshot_path)
-
-      # Rename old db
-      File.rename!(db_path, db_path <> ".migrated")
-      Logger.info("TimelessLogs: migration complete, renamed index.db to index.db.migrated")
-    else
-      require Logger
-      Logger.warning("TimelessLogs: index.db found but Exqlite not available for migration")
-    end
-  end
-
-  defp migrate_load_blocks(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at]} ->
-        :ets.insert(@blocks_table, {
-          block_id,
-          file_path,
-          byte_size,
-          entry_count,
-          ts_min,
-          ts_max,
-          to_format_atom(format),
-          created_at
-        })
-
-        migrate_load_blocks(db, stmt)
-
-      :done ->
-        :ok
-    end
-  end
-
-  defp migrate_load_terms(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [term, block_id]} ->
-        :ets.insert(@term_index_table, {term, block_id})
-        migrate_load_terms(db, stmt)
-
-      :done ->
-        :ok
-    end
-  end
 
   # --- Indexing ---
 

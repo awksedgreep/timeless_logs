@@ -20,7 +20,7 @@ Returns a `%TimelessLogs.Stats{}` struct:
 | `total_entries` | Total log entries across all blocks |
 | `total_bytes` | Total block storage size |
 | `disk_size` | On-disk storage size |
-| `index_size` | SQLite index file size |
+| `index_size` | Index snapshot + log file size |
 | `oldest_timestamp` | Timestamp of oldest entry (microseconds) |
 | `newest_timestamp` | Timestamp of newest entry (microseconds) |
 | `raw_blocks` | Number of uncompressed raw blocks |
@@ -68,7 +68,7 @@ Create a consistent online backup without stopping the application.
 
 ```elixir
 {:ok, result} = TimelessLogs.backup("/tmp/logs_backup")
-# => {:ok, %{path: "/tmp/logs_backup", files: ["index.db", "blocks"], total_bytes: 24000000}}
+# => {:ok, %{path: "/tmp/logs_backup", files: ["index.snapshot", "blocks"], total_bytes: 24000000}}
 ```
 
 ### HTTP API
@@ -82,7 +82,7 @@ curl -X POST http://localhost:9428/api/v1/backup \
 ### Backup procedure
 
 1. The buffer is flushed (all pending entries written to disk)
-2. SQLite index is snapshot via `VACUUM INTO` (atomic, consistent)
+2. ETS index is written as a snapshot file (atomic rename)
 3. Block files are copied in parallel to the target directory
 4. Returns the backup path, file list, and total bytes
 

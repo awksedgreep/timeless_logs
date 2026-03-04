@@ -42,7 +42,7 @@ TimelessLogs.flush()
 
 TimelessLogs is an embedded log compression and indexing library for Elixir.
 It hooks into the standard `Logger`, compresses logs with zstd or OpenZL
-(~11-14x compression), indexes them in SQLite, and provides querying with
+(~11-14x compression), indexes them in ETS, and provides querying with
 sub-millisecond latency. Zero external infrastructure required.
 
 ### Add the Dependency
@@ -75,8 +75,8 @@ config :timeless_logs,
 
 | Option                      | Default             | Description                                                 |
 | --------------------------- | ------------------- | ----------------------------------------------------------- |
-| `:data_dir`                 | `"priv/log_stream"` | Directory for block files and SQLite index                  |
-| `:storage`                  | `:disk`             | `:disk` or `:memory` (memory stores blocks as SQLite BLOBs) |
+| `:data_dir`                 | `"priv/log_stream"` | Directory for block files and index snapshots               |
+| `:storage`                  | `:disk`             | `:disk` (block files + ETS snapshots) or `:memory` (ETS only) |
 | `:flush_interval`           | `1_000`             | Buffer flush interval (ms)                                  |
 | `:max_buffer_size`          | `1_000`             | Entries before auto-flush                                   |
 | `:query_timeout`            | `30_000`            | Query operation timeout (ms)                                |
@@ -89,7 +89,7 @@ config :timeless_logs,
 | `:compaction_format`        | `:openzl`           | Compression format: `:zstd` or `:openzl`                    |
 | `:zstd_compression_level`   | `5`                 | Zstd compression level (1-22)                               |
 | `:openzl_compression_level` | `9`                 | OpenZL compression level (1-22)                             |
-| `:index_publish_interval`   | `2_000`             | ETS → SQLite batch flush interval (ms)                    |
+| `:index_publish_interval`   | `2_000`             | Index disk log flush interval (ms)                          |
 | `:http`                     | `false`             | `true`, or `[port: 9428, bearer_token: "secret"]`           |
 
 ### Full Configuration Example
@@ -370,7 +370,7 @@ Returns a `%TimelessLogs.Stats{}` struct with fields:
 | `total_entries`                                     | Total log entries stored              |
 | `total_bytes`                                       | Total block data bytes                |
 | `disk_size`                                         | On-disk storage size                  |
-| `index_size`                                        | SQLite index size                     |
+| `index_size`                                        | Index snapshot + log size             |
 | `oldest_timestamp`                                  | Oldest entry timestamp (microseconds) |
 | `newest_timestamp`                                  | Newest entry timestamp (microseconds) |
 | `raw_blocks` / `raw_bytes` / `raw_entries`          | Uncompressed block stats              |
@@ -427,12 +427,11 @@ curl "http://localhost:9428/api/v1/flush"
 ### Backup
 
 Create a consistent online backup without stopping the application. Uses
-SQLite `VACUUM INTO` for an atomic index snapshot and copies block files in
-parallel:
+an atomic ETS snapshot and copies block files in parallel:
 
 ```elixir
 {:ok, result} = TimelessLogs.backup("/tmp/logs_backup")
-# result => %{path: "/tmp/logs_backup", files: ["index.db", ...], total_bytes: 24000000}
+# result => %{path: "/tmp/logs_backup", files: ["index.snapshot", ...], total_bytes: 24000000}
 ```
 
 Via HTTP:
@@ -444,7 +443,7 @@ curl -X POST http://localhost:9428/api/v1/backup \
 ```
 
 ```json
-{"status":"ok","path":"/tmp/logs_backup","files":["index.db","blocks"],"total_bytes":24000000}
+{"status":"ok","path":"/tmp/logs_backup","files":["index.snapshot","blocks"],"total_bytes":24000000}
 ```
 
 To download the backup, archive it from the server filesystem:

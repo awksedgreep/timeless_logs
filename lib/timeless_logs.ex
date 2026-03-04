@@ -3,7 +3,7 @@ defmodule TimelessLogs do
   Embedded log compression and indexing for Elixir applications.
 
   TimelessLogs plugs into Elixir's Logger as a handler, compresses log entries
-  into zstd blocks, and indexes them in SQLite for fast querying.
+  into compressed blocks, and indexes them in ETS for fast querying.
 
   ## Setup
 
@@ -257,8 +257,8 @@ defmodule TimelessLogs do
   @doc """
   Create a consistent online backup of the log store.
 
-  Flushes all in-flight data, then uses SQLite's `VACUUM INTO` to snapshot
-  the index database and copies block files to the target directory.
+  Flushes all in-flight data, writes an ETS index snapshot,
+  and copies block files to the target directory.
 
   ## Parameters
 
@@ -278,8 +278,8 @@ defmodule TimelessLogs do
 
     File.mkdir_p!(target_dir)
 
-    # Backup index DB via VACUUM INTO
-    index_target = Path.join(target_dir, "index.db")
+    # Backup index snapshot
+    index_target = Path.join(target_dir, "index.snapshot")
 
     case TimelessLogs.Index.backup(index_target) do
       :ok ->
@@ -294,7 +294,7 @@ defmodule TimelessLogs do
         {:ok,
          %{
            path: target_dir,
-           files: ["index.db", "blocks"],
+           files: ["index.snapshot", "blocks"],
            total_bytes: index_bytes + block_bytes
          }}
 

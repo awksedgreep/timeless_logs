@@ -21,7 +21,7 @@ graph TD
 ```
 
 * **Registry** — Duplicate-key registry for real-time log subscriptions
-* **Index** — SQLite persistence + ETS caching for block metadata and term index
+* **Index** — ETS tables for block metadata and term index, persisted via snapshots + disk log
 * **FlushSupervisor** — Task.Supervisor managing concurrent async flush tasks
 * **Buffer** — Accumulates log entries, auto-flushes on size or interval threshold
 * **Compactor** — Merges raw blocks into compressed blocks (zstd or OpenZL)
@@ -58,7 +58,7 @@ sequenceDiagram
     W->>I: GenServer.cast(:index, block_meta)
     I->>I: ETS insert (hot cache)
 
-    Note over I: Every 100-500ms:<br/>ETS → SQLite batch persist
+    Note over I: Every 100ms:<br/>flush pending to disk log
 ```
 
 ### Backpressure
@@ -97,20 +97,19 @@ flowchart TD
     subgraph "On-Disk Layout"
         DIR["data_dir/"]
         DIR --> BLK["blocks/<br/>000000000001.raw<br/>000000000002.zst<br/>000000000003.ozl"]
-        DIR --> IDX["index.db<br/><i>SQLite</i>"]
+        DIR --> IDX["index.snapshot + index.log<br/><i>ETS persistence</i>"]
     end
 ```
 
 ### Memory Mode
 
 When `storage: :memory` is configured, block data is stored as BLOBs inside
-SQLite instead of individual files. The index database and ETS caches still
-operate identically.
+ETS tables only. No files are written to disk. Data does not survive restarts.
 
 ## Indexing Strategy
 
-The index maintains two layers: a hot ETS cache for fast reads and a SQLite
-database for persistence across restarts.
+The index uses ETS tables as the authoritative runtime state, with a snapshot +
+write-ahead log for persistence across restarts.
 
 ```mermaid
 flowchart LR
@@ -119,16 +118,16 @@ flowchart LR
         TI["term_index<br/><i>bag</i><br/>term → block_id"]
     end
 
-    subgraph "SQLite (Persistent)"
-        BM["blocks table<br/>id, file_path, format,<br/>byte_size, entry_count,<br/>ts_min, ts_max"]
-        BTM["block_terms table<br/>block_id, term"]
+    subgraph "Persistence"
+        SNAP["index.snapshot<br/><i>periodic ETS dump</i>"]
+        LOG["index.log<br/><i>write-ahead log</i>"]
     end
 
     W["Writer"] -->|"cast :index"| I["Index GenServer"]
     I -->|"immediate"| BT
     I -->|"immediate"| TI
-    I -->|"batched 100-500ms"| BM
-    I -->|"batched 100-500ms"| BTM
+    I -->|"journal"| LOG
+    I -->|"every 1000 ops"| SNAP
 ```
 
 ### Term Format
@@ -169,13 +168,13 @@ sequenceDiagram
 
 | Query Pattern           | Latency (1.1M entries) |
 | ----------------------- | ---------------------- |
-| Specific metadata key   | 0.6ms                  |
-| Last 1h + level filter  | 2.4ms                  |
-| Last 1 hour, all levels | 4.4ms                  |
-| Level filter, all time  | 226ms                  |
-| Message substring       | 420ms                  |
-| Last 24 hours           | 244ms                  |
-| Full scan, no filters   | 1.4s                   |
+| Specific metadata key   | 845us                  |
+| Last 1h + level filter  | 3.4ms                  |
+| Last 1 hour, all levels | 3.9ms                  |
+| Level filter, all time  | 215ms                  |
+| Message substring       | 238ms                  |
+| Last 24 hours           | 157ms                  |
+| Full scan, no filters   | 2.6s                   |
 
 ## Compaction Lifecycle
 
@@ -196,7 +195,7 @@ flowchart TD
     READ --> MERGE["Merge entries"]
     MERGE --> COMPRESS["Compress to zstd or OpenZL"]
     COMPRESS --> WRITE["Write compressed block(s)<br/><i>parallel, chunked by schedulers</i>"]
-    WRITE --> REINDEX["Update Index<br/>(ETS + SQLite)"]
+    WRITE --> REINDEX["Update Index<br/>(ETS + disk log)"]
     REINDEX --> DELETE["Delete raw block files"]
     DELETE --> STATS["Update compression stats"]
 ```
@@ -205,10 +204,10 @@ flowchart TD
 
 | Format           | Ratio | Throughput       |
 | ---------------- | ----- | ---------------- |
-| Zstd (level 3)   | 11.2x | 500K entries/sec |
-| OpenZL (level 1) | 10.9x | 1.7M entries/sec |
-| OpenZL (level 5) | 11.4x | 1.2M entries/sec |
-| OpenZL (level 9) | 12.5x | 763K entries/sec |
+| Zstd (level 5)   | 11.1x | 1.2M entries/sec |
+| OpenZL (level 1) | 11.2x | 706K entries/sec |
+| OpenZL (level 5) | 11.6x | 1.2M entries/sec |
+| OpenZL (level 9) | 12.8x | 702K entries/sec |
 
 ## Merge Compaction
 
@@ -234,7 +233,7 @@ flowchart TD
     B1 & B2 & BN --> DECOMP["Decompress all blocks in batch"]
     DECOMP --> MERGE["Merge entries"]
     MERGE --> RECOMP["Recompress as single block<br/><i>zstd or OpenZL</i>"]
-    RECOMP --> REINDEX["Update Index<br/>(ETS + SQLite)"]
+    RECOMP --> REINDEX["Update Index<br/>(ETS + disk log)"]
     REINDEX --> DELETE["Delete old block files"]
     DELETE --> TEL["Emit telemetry:<br/>[:timeless_logs, :merge_compaction, :stop]"]
 ```
@@ -256,7 +255,7 @@ flowchart TD
 
     AGE --> DEL["Delete block files"]
     SIZE --> DEL
-    DEL --> IDX["Remove from Index<br/>(ETS + SQLite)"]
+    DEL --> IDX["Remove from Index<br/>(ETS + disk log)"]
     IDX --> TEL["Emit telemetry:<br/>[:timeless_logs, :retention, :stop]"]
 ```
 

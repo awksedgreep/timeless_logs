@@ -22,8 +22,9 @@ Erlang term_to_binary compressed with [Zstandard](https://facebook.github.io/zst
 
 | Metric | Value |
 |--------|-------|
-| Compression ratio | ~11.2x |
-| Compression throughput | ~500K entries/sec |
+| Compression ratio | ~11.1x (level 5) |
+| Compression throughput | ~1.2M entries/sec |
+| Decompression throughput | ~2.4M entries/sec |
 | Configurable level | 1-22 (default: 3) |
 
 ### OpenZL (`.ozl`)
@@ -32,10 +33,13 @@ Columnar format with [OpenZL](https://github.com/nicholasgasior/ex_openzl) compr
 
 | Level | Ratio | Throughput |
 |-------|-------|-----------|
-| 1 | 10.9x | 1.7M entries/sec |
-| 5 | 11.4x | 1.2M entries/sec |
-| 9 (default) | 12.5x | 763K entries/sec |
-| 19 | 14.0x | 22.6K entries/sec |
+| 1 | 11.2x | 706K entries/sec |
+| 3 | 11.3x | 2.1M entries/sec |
+| 5 | 11.6x | 1.2M entries/sec |
+| 9 (default) | 12.8x | 702K entries/sec |
+| 19 | 14.4x | 17.5K entries/sec |
+
+OpenZL decompresses at ~4.3M entries/sec — 44% faster than zstd — which directly benefits query performance.
 
 ### Choosing a format
 
@@ -100,9 +104,8 @@ TimelessLogs.Compactor.compact_now()
 
 ```
 data_dir/
-├── index.db          # SQLite index (WAL mode)
-├── index.db-wal      # SQLite WAL file
-├── index.db-shm      # SQLite shared memory
+├── index.snapshot    # Periodic ETS table dump (compressed ETF)
+├── index.log         # Write-ahead log (Erlang disk_log)
 └── blocks/
     ├── 000000000001.raw   # Raw block (temporary)
     ├── 000000000002.raw   # Raw block (temporary)
@@ -122,7 +125,7 @@ config :timeless_logs, storage: :memory
 ```
 
 In memory mode:
-- Block data is stored as BLOBs in an in-memory SQLite database
+- Block data is stored in ETS tables only
 - No block files are written to disk
 - The ETS index still provides lock-free read access
 - Data does not survive application restarts

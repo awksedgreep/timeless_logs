@@ -4,7 +4,7 @@
 
 Embedded log compression and indexing for Elixir applications. Add one dependency, configure a data directory, and your app gets compressed, searchable logs with zero external infrastructure.
 
-Logs are written to raw blocks, automatically compacted with OpenZL (~12.5x compression ratio), and indexed in SQLite for fast querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
+Logs are written to raw blocks, automatically compacted with OpenZL (~12.8x compression ratio), and indexed in ETS for lock-free querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
 
 ## Documentation
 
@@ -148,7 +148,7 @@ Create a consistent online backup without stopping the application:
 # %{path: "/tmp/logs_backup", files: [...], total_bytes: 24_000_000}
 ```
 
-Uses SQLite `VACUUM INTO` for an atomic index snapshot and copies block files in parallel.
+Writes an ETS index snapshot and copies block files in parallel.
 
 ## Retention
 
@@ -292,20 +292,24 @@ TimelessLogs emits telemetry events for monitoring:
 2. TimelessLogs captures log events via an OTP `:logger` handler
 3. Events buffer in a GenServer, flushing every 1s or 1000 entries
 4. Each flush writes a raw (uncompressed) block file
-5. A background compactor merges raw blocks into OpenZL-compressed blocks (~12.5x ratio)
-6. Block metadata and an inverted index of terms are stored in SQLite (WAL mode)
-7. Queries hit the SQLite index to find relevant blocks, decompress only those in parallel, and filter entries
+5. A background compactor merges raw blocks into OpenZL-compressed blocks (~12.8x ratio)
+6. Block metadata and an inverted index of terms are indexed into ETS immediately, with changes journaled to a disk log and periodically snapshotted
+7. Queries run directly against public ETS tables — no GenServer round-trip needed — to find relevant blocks, decompress only those in parallel, and filter entries
 8. Real-time subscribers receive matching entries as they're buffered
 
 ## Benchmarks
+
+Run on a 28-core laptop. Reproduce with `mix timeless_logs.ingest_benchmark`, `mix timeless_logs.benchmark`, and `mix timeless_logs.search_benchmark`.
 
 **Ingestion throughput** (500K entries, 1000 entries/block):
 
 | Phase | Throughput |
 |---|---|
-| Writer only (serialization + disk I/O) | ~151K entries/sec |
-| Writer + Index (sync SQLite indexing) | ~45K entries/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~119K entries/sec |
+| Writer only (serialization + disk I/O) | ~193K entries/sec |
+| Writer + Index (ETS immediate + disk log persist) | ~191K entries/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~129K entries/sec |
+
+The ETS-first indexing architecture makes index overhead negligible — less than 2% throughput reduction vs. writer-only.
 
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
@@ -313,31 +317,43 @@ On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
 | Metric | Value |
 |--------|-------|
-| Compression ratio | 11.2x |
+| Compression ratio | 11.1x |
 | Raw size | 246 MB |
 | Compressed size | 22 MB |
-| Compression throughput | 500K entries/sec |
+| Compression throughput | 1.2M entries/sec |
 
 **Columnar+OpenZL** (per-column compression with reusable contexts):
 
 | Level | Ratio | Throughput |
 |-------|-------|-----------|
-| 1 | 10.9x | 1.7M entries/sec |
-| 5 | 11.4x | 1.2M entries/sec |
-| 9 | 12.5x | 763K entries/sec |
-| 19 | 14.0x | 22.6K entries/sec |
+| 1 | 11.2x | 706K entries/sec |
+| 3 | 11.3x | 2.1M entries/sec |
+| 5 | 11.6x | 1.2M entries/sec |
+| 9 | 12.8x | 702K entries/sec |
+| 19 | 14.4x | 17.5K entries/sec |
+
+**Decompression speed** (1.1M entries, 1128 blocks):
+
+| Format | Throughput |
+|--------|-----------|
+| zstd | 2.4M entries/sec |
+| OpenZL | 4.3M entries/sec |
+
+OpenZL decompresses 44% faster than zstd, which directly benefits query performance.
 
 **Query latency** (1.1M entries indexed, 5 iterations, median):
 
 | Query | Median |
 |-------|--------|
-| Specific request_id | 0.6ms |
-| Last 1h + level=error | 2.4ms |
-| Last 1 hour (all levels) | 4.4ms |
-| level=error (all time) | 226ms |
-| Message substring search | 420ms |
-| Last 24 hours | 244ms |
-| All logs, no filters | 1.4s |
+| Specific request_id | 845us |
+| Last 1h + level=error | 3.4ms |
+| Last 1 hour (all levels) | 3.9ms |
+| level=error + metadata intersection | 162ms |
+| level=error (all time) | 215ms |
+| Message substring search | 238ms |
+| Last 24 hours | 157ms |
+| All logs, page 1 (no filters) | 2.6s |
+| All logs, page 50 (deep pagination) | 863ms |
 
 ## License
 
