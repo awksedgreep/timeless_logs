@@ -35,7 +35,7 @@ defmodule TimelessLogs.MixProject do
 
   defp package do
     [
-      maintainers: ["Matt Cotner"],
+      maintainers: ["Mark Cotner"],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_logs"},
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
