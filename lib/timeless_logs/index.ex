@@ -579,7 +579,7 @@ defmodule TimelessLogs.Index do
     # Close any existing log with this name (e.g. from previous run)
     :disk_log.close(log_name)
 
-    {:ok, ref} =
+    result =
       :disk_log.open(
         name: log_name,
         file: String.to_charlist(log_path),
@@ -587,7 +587,19 @@ defmodule TimelessLogs.Index do
         format: :internal
       )
 
-    ref
+    case result do
+      {:ok, ref} ->
+        ref
+
+      {:repaired, ref, {:recovered, recovered}, {:badbytes, bad}} ->
+        require Logger
+
+        Logger.warning(
+          "disk_log #{log_name} repaired: recovered=#{recovered} badbytes=#{bad}"
+        )
+
+        ref
+    end
   end
 
   defp replay_log(log_ref, snapshot_ts) do
