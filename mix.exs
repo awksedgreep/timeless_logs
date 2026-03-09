@@ -4,7 +4,7 @@ defmodule TimelessLogs.MixProject do
   def project do
     [
       app: :timeless_logs,
-      version: "1.1.1",
+      version: "1.2.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -18,7 +18,7 @@ defmodule TimelessLogs.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto],
       mod: {TimelessLogs.Application, []}
     ]
   end
@@ -27,8 +27,8 @@ defmodule TimelessLogs.MixProject do
     [
       {:ezstd, "~> 1.2"},
       {:ex_openzl, "~> 0.4.0"},
-      {:bandit, "~> 1.6"},
-      {:plug, "~> 1.16"},
+      {:rocket, github: "awksedgreep/rocket"},
+      {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

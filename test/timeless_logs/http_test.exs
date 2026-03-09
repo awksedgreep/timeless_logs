@@ -1,11 +1,10 @@
 defmodule TimelessLogs.HTTPTest do
   use ExUnit.Case, async: false
 
-  import Plug.Test
-  import Plug.Conn
   require Logger
 
   @data_dir "test/tmp/http_test"
+  @port 19_428
 
   setup do
     Application.stop(:timeless_logs)
@@ -16,6 +15,14 @@ defmodule TimelessLogs.HTTPTest do
     Application.put_env(:timeless_logs, :http, false)
     Application.ensure_all_started(:timeless_logs)
 
+    # Clear any auth token from previous tests
+    :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, nil)
+
+    # Remove logger handler so Rocket startup logs don't pollute the buffer
+    :logger.remove_handler(TimelessLogs.Handler.handler_id())
+
+    start_supervised!({TimelessLogs.HTTP, port: @port})
+
     on_exit(fn ->
       Application.stop(:timeless_logs)
       File.rm_rf!(@data_dir)
@@ -24,22 +31,26 @@ defmodule TimelessLogs.HTTPTest do
     :ok
   end
 
-  defp call(conn, opts \\ []) do
-    TimelessLogs.HTTP.call(conn, TimelessLogs.HTTP.init(opts))
+  defp get(path, opts \\ []) do
+    TimelessLogs.TestHTTP.get(@port, path, opts)
   end
 
-  defp json_body(conn) do
-    :json.decode(conn.resp_body)
+  defp post(path, body, opts) do
+    TimelessLogs.TestHTTP.post(@port, path, body, opts)
+  end
+
+  defp json_body(resp) do
+    :json.decode(resp.body)
   end
 
   # --- Health ---
 
   describe "GET /health" do
     test "returns ok with stats" do
-      conn = conn(:get, "/health") |> call()
+      resp = get("/health")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       assert body["status"] == "ok"
       assert is_integer(body["blocks"])
       assert is_integer(body["entries"])
@@ -54,12 +65,9 @@ defmodule TimelessLogs.HTTPTest do
       body =
         ~s({"_msg":"hello world","level":"info","app":"test"}\n{"_msg":"oh no","level":"error","app":"test"})
 
-      conn =
-        conn(:post, "/insert/jsonline", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessLogs.flush()
 
@@ -73,12 +81,10 @@ defmodule TimelessLogs.HTTPTest do
     test "uses custom _msg_field and _time_field" do
       body = ~s({"body":"custom msg","ts":"2024-06-15T12:00:00Z","level":"warning"})
 
-      conn =
-        conn(:post, "/insert/jsonline?_msg_field=body&_time_field=ts", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline?_msg_field=body&_time_field=ts", body,
+        content_type: "application/x-ndjson")
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessLogs.flush()
 
@@ -90,13 +96,10 @@ defmodule TimelessLogs.HTTPTest do
     test "reports errors for malformed lines" do
       body = "not json at all\n{\"_msg\":\"valid\",\"level\":\"info\"}\n{broken"
 
-      conn =
-        conn(:post, "/insert/jsonline", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       assert body["entries"] == 1
       assert body["errors"] == 2
     end
@@ -104,12 +107,9 @@ defmodule TimelessLogs.HTTPTest do
     test "extra fields become metadata" do
       body = ~s({"_msg":"tagged","level":"info","service":"api","region":"us-east"})
 
-      conn =
-        conn(:post, "/insert/jsonline", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessLogs.flush()
 
@@ -121,12 +121,9 @@ defmodule TimelessLogs.HTTPTest do
     test "parses ISO8601 timestamps" do
       body = ~s({"_msg":"timestamped","_time":"2024-01-15T10:30:00Z","level":"info"})
 
-      conn =
-        conn(:post, "/insert/jsonline", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessLogs.flush()
 
@@ -138,12 +135,9 @@ defmodule TimelessLogs.HTTPTest do
     test "parses unix second timestamps" do
       body = ~s({"_msg":"unix ts","_time":1700000000,"level":"info"})
 
-      conn =
-        conn(:post, "/insert/jsonline", body)
-        |> put_req_header("content-type", "application/x-ndjson")
-        |> call()
+      resp = post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessLogs.flush()
 
@@ -158,11 +152,13 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns all logs as NDJSON" do
-      conn = conn(:get, "/select/logsql/query") |> call()
-      assert conn.status == 200
-      assert get_resp_header(conn, "content-type") |> hd() =~ "ndjson"
+      resp = get("/select/logsql/query")
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      ct = List.keyfind(resp.headers, "content-type", 0)
+      assert ct && elem(ct, 1) =~ "ndjson"
+
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 3
 
       parsed = Enum.map(lines, &:json.decode/1)
@@ -172,27 +168,27 @@ defmodule TimelessLogs.HTTPTest do
     end
 
     test "filters by level" do
-      conn = conn(:get, "/select/logsql/query?level=error") |> call()
-      assert conn.status == 200
+      resp = get("/select/logsql/query?level=error")
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 1
       assert :json.decode(hd(lines))["_msg"] == "error boom"
     end
 
     test "respects limit" do
-      conn = conn(:get, "/select/logsql/query?limit=2") |> call()
-      assert conn.status == 200
+      resp = get("/select/logsql/query?limit=2")
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 2
     end
 
     test "respects order=asc" do
-      conn = conn(:get, "/select/logsql/query?order=asc") |> call()
-      assert conn.status == 200
+      resp = get("/select/logsql/query?order=asc")
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       parsed = Enum.map(lines, &:json.decode/1)
       times = Enum.map(parsed, & &1["_time"])
       assert times == Enum.sort(times)
@@ -205,27 +201,25 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns all logs with wildcard query" do
-      conn =
-        conn(:post, "/select/logsql/query", "query=*")
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/query", "query=*",
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
-      assert get_resp_header(conn, "content-type") |> hd() =~ "ndjson"
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      ct = List.keyfind(resp.headers, "content-type", 0)
+      assert ct && elem(ct, 1) =~ "ndjson"
+
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 3
     end
 
     test "filters by level via LogsQL" do
-      conn =
-        conn(:post, "/select/logsql/query", "query=level%3Aerror")
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/query", "query=level%3Aerror",
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 1
       assert :json.decode(hd(lines))["_msg"] == "error boom"
     end
@@ -233,41 +227,35 @@ defmodule TimelessLogs.HTTPTest do
     test "stats count query returns total" do
       query = URI.encode_query(%{"query" => "* | stats count() as total"})
 
-      conn =
-        conn(:post, "/select/logsql/query", query)
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/query", query,
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
-      body = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
       assert body["total"] == 3
     end
 
     test "respects limit pipe" do
       query = URI.encode_query(%{"query" => "* | limit 1"})
 
-      conn =
-        conn(:post, "/select/logsql/query", query)
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/query", query,
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 1
     end
 
     test "filters by metadata field" do
       query = URI.encode_query(%{"query" => "service:web"})
 
-      conn =
-        conn(:post, "/select/logsql/query", query)
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/query", query,
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
+      assert resp.status == 200
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 1
       assert :json.decode(hd(lines))["_msg"] == "info two"
     end
@@ -279,13 +267,11 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns distinct values for level field" do
-      conn =
-        conn(:post, "/select/logsql/field_values?field=level", "query=*")
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/field_values?field=level", "query=*",
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       values = body["values"]
 
       assert is_list(values)
@@ -295,13 +281,11 @@ defmodule TimelessLogs.HTTPTest do
     end
 
     test "returns distinct values for metadata field" do
-      conn =
-        conn(:post, "/select/logsql/field_values?field=service", "query=*")
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/field_values?field=service", "query=*",
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       values = body["values"]
       value_names = Enum.map(values, & &1["value"])
       assert "api" in value_names
@@ -315,13 +299,11 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns all field names" do
-      conn =
-        conn(:post, "/select/logsql/field_names", "query=*")
-        |> put_req_header("content-type", "application/x-www-form-urlencoded")
-        |> call()
+      resp = post("/select/logsql/field_names", "query=*",
+        content_type: "application/x-www-form-urlencoded")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       values = body["values"]
 
       value_names = Enum.map(values, & &1["value"])
@@ -336,10 +318,10 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "GET /select/logsql/stats" do
     test "returns storage statistics" do
-      conn = conn(:get, "/select/logsql/stats") |> call()
-      assert conn.status == 200
+      resp = get("/select/logsql/stats")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert is_integer(body["total_blocks"])
       assert is_integer(body["total_entries"])
       assert is_integer(body["total_bytes"])
@@ -349,15 +331,12 @@ defmodule TimelessLogs.HTTPTest do
 
     test "stats reflect ingested data" do
       body = ~s({"_msg":"stat test","level":"info"})
-
-      conn(:post, "/insert/jsonline", body)
-      |> put_req_header("content-type", "application/x-ndjson")
-      |> call()
+      post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
       TimelessLogs.flush()
 
-      conn = conn(:get, "/select/logsql/stats") |> call()
-      stats = json_body(conn)
+      resp = get("/select/logsql/stats")
+      stats = json_body(resp)
       assert stats["total_blocks"] >= 1
       assert stats["total_entries"] >= 1
     end
@@ -367,9 +346,9 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "GET /api/v1/flush" do
     test "returns ok" do
-      conn = conn(:get, "/api/v1/flush") |> call()
-      assert conn.status == 200
-      assert json_body(conn)["status"] == "ok"
+      resp = get("/api/v1/flush")
+      assert resp.status == 200
+      assert json_body(resp)["status"] == "ok"
     end
   end
 
@@ -378,20 +357,14 @@ defmodule TimelessLogs.HTTPTest do
   describe "POST /api/v1/backup" do
     test "creates backup with default path" do
       body = ~s({"_msg":"backup test","level":"info"})
-
-      conn(:post, "/insert/jsonline", body)
-      |> put_req_header("content-type", "application/x-ndjson")
-      |> call()
+      post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
       TimelessLogs.flush()
 
-      conn =
-        conn(:post, "/api/v1/backup", "")
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp = post("/api/v1/backup", "", content_type: "application/json")
 
-      assert conn.status == 200
-      result = json_body(conn)
+      assert resp.status == 200
+      result = json_body(resp)
       assert result["status"] == "ok"
       assert is_binary(result["path"])
       assert is_integer(result["total_bytes"])
@@ -404,22 +377,16 @@ defmodule TimelessLogs.HTTPTest do
       backup_dir = Path.join(@data_dir, "custom_backup")
 
       body = ~s({"_msg":"backup test","level":"info"})
-
-      conn(:post, "/insert/jsonline", body)
-      |> put_req_header("content-type", "application/x-ndjson")
-      |> call()
+      post("/insert/jsonline", body, content_type: "application/x-ndjson")
 
       TimelessLogs.flush()
 
       payload = IO.iodata_to_binary(:json.encode(%{"path" => backup_dir}))
 
-      conn =
-        conn(:post, "/api/v1/backup", payload)
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp = post("/api/v1/backup", payload, content_type: "application/json")
 
-      assert conn.status == 200
-      result = json_body(conn)
+      assert resp.status == 200
+      result = json_body(resp)
       assert result["path"] == backup_dir
       assert File.exists?(backup_dir)
 
@@ -431,41 +398,45 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "bearer token auth" do
     test "401 when token required but not provided" do
-      conn = conn(:get, "/select/logsql/stats") |> call(bearer_token: "secret")
-      assert conn.status == 401
-      assert json_body(conn)["error"] == "unauthorized"
+      :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
+
+      resp = get("/select/logsql/stats")
+      assert resp.status == 401
+      assert json_body(resp)["error"] == "unauthorized"
     end
 
     test "403 when token is wrong" do
-      conn =
-        conn(:get, "/select/logsql/stats")
-        |> put_req_header("authorization", "Bearer wrong")
-        |> call(bearer_token: "secret")
+      :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
 
-      assert conn.status == 403
-      assert json_body(conn)["error"] == "forbidden"
+      resp = get("/select/logsql/stats",
+        headers: [{"authorization", "Bearer wrong"}])
+
+      assert resp.status == 403
+      assert json_body(resp)["error"] == "forbidden"
     end
 
     test "passes with correct bearer token" do
-      conn =
-        conn(:get, "/select/logsql/stats")
-        |> put_req_header("authorization", "Bearer secret")
-        |> call(bearer_token: "secret")
+      :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
 
-      assert conn.status == 200
+      resp = get("/select/logsql/stats",
+        headers: [{"authorization", "Bearer secret"}])
+
+      assert resp.status == 200
     end
 
     test "passes with query param token" do
-      conn =
-        conn(:get, "/select/logsql/stats?token=secret")
-        |> call(bearer_token: "secret")
+      :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
 
-      assert conn.status == 200
+      resp = get("/select/logsql/stats?token=secret")
+
+      assert resp.status == 200
     end
 
     test "health endpoint skips auth" do
-      conn = conn(:get, "/health") |> call(bearer_token: "secret")
-      assert conn.status == 200
+      :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
+
+      resp = get("/health")
+      assert resp.status == 200
     end
   end
 
@@ -473,8 +444,8 @@ defmodule TimelessLogs.HTTPTest do
 
   describe "catch-all" do
     test "returns 404 for unknown routes" do
-      conn = conn(:get, "/nonexistent") |> call()
-      assert conn.status == 404
+      resp = get("/nonexistent")
+      assert resp.status == 404
     end
   end
 
@@ -491,9 +462,7 @@ defmodule TimelessLogs.HTTPTest do
         "\n"
       )
 
-    conn(:post, "/insert/jsonline", lines)
-    |> put_req_header("content-type", "application/x-ndjson")
-    |> call()
+    post("/insert/jsonline", lines, content_type: "application/x-ndjson")
 
     TimelessLogs.flush()
     :ok

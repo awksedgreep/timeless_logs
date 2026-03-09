@@ -35,285 +35,275 @@ defmodule TimelessLogs.HTTP do
     * `GET /api/v1/flush` - Force buffer flush
   """
 
-  use Plug.Router
+  use Rocket.Router
 
   @max_body_bytes 10 * 1024 * 1024
-
-  plug(:match)
-  plug(:authenticate)
-  plug(:dispatch)
 
   def child_spec(opts) do
     port = Keyword.get(opts, :port, 9428)
     bearer_token = Keyword.get(opts, :bearer_token)
-    plug_opts = [bearer_token: bearer_token]
+
+    :persistent_term.put({__MODULE__, :bearer_token}, bearer_token)
 
     %{
       id: __MODULE__,
-      start: {Bandit, :start_link, [[plug: {__MODULE__, plug_opts}, port: port]]},
+      start: {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
       type: :supervisor
     }
   end
 
-  @impl Plug
-  def init(opts), do: opts
+  # --- Config access ---
 
-  @impl Plug
-  def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:timeless_logs_token, Keyword.get(opts, :bearer_token))
-    |> super(opts)
-  end
+  defp bearer_token, do: :persistent_term.get({__MODULE__, :bearer_token})
 
-  # Bearer token authentication plug.
+  # --- Authentication ---
+  # Returns :ok or :halt (response already sent).
   # Skips auth when no token is configured.
-  # Exempts /health for load balancers and monitoring.
-  defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
 
-  defp authenticate(conn, _opts) do
-    case conn.private[:timeless_logs_token] do
-      nil -> conn
-      expected -> check_token(conn, expected)
+  defp check_auth(req) do
+    case bearer_token() do
+      nil -> :ok
+      expected -> verify_token(req, expected)
     end
   end
 
-  defp check_token(conn, expected) do
-    case extract_token(conn) do
+  defp verify_token(req, expected) do
+    case extract_token(req) do
       nil ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(401, ~s({"error":"unauthorized"}))
-        |> halt()
+        json_resp(req, 401, %{error: "unauthorized"})
+        :halt
 
       token ->
-        if Plug.Crypto.secure_compare(token, expected) do
-          conn
+        if constant_time_compare(token, expected) do
+          :ok
         else
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(403, ~s({"error":"forbidden"}))
-          |> halt()
+          json_resp(req, 403, %{error: "forbidden"})
+          :halt
         end
     end
   end
 
-  defp extract_token(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] ->
+  defp extract_token(req) do
+    auth =
+      Rocket.Request.get_header(req, "Authorization") ||
+        Rocket.Request.get_header(req, "authorization")
+
+    case auth do
+      "Bearer " <> token ->
         String.trim(token)
 
       _ ->
-        conn = Plug.Conn.fetch_query_params(conn)
-        conn.query_params["token"]
+        Rocket.Request.get_query_param(req, "token")
     end
   end
 
-  # Health check
+  defp constant_time_compare(a, b) when byte_size(a) == byte_size(b) do
+    :crypto.hash_equals(a, b)
+  end
+
+  defp constant_time_compare(_a, _b), do: false
+
+  # --- Response helpers ---
+
+  defp json_resp(req, status, term) do
+    body = json_encode!(term)
+
+    Rocket.Response.send_iodata(req, status,
+      [{"content-type", "application/json"}], body)
+  end
+
+  defp ndjson_resp(req, status, body) do
+    Rocket.Response.send_iodata(req, status,
+      [{"content-type", "application/x-ndjson"}], body)
+  end
+
+  defp json_error(req, status, msg) do
+    json_resp(req, status, %{error: msg})
+  end
+
+  # --- Route Handlers ---
+
+  # Health check (no auth required)
   get "/health" do
     {:ok, stats} = TimelessLogs.stats()
 
-    body =
-      json_encode!(%{
-        status: "ok",
-        blocks: stats.total_blocks,
-        entries: stats.total_entries,
-        disk_size: stats.disk_size
-      })
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, body)
+    json_resp(req, 200, %{
+      status: "ok",
+      blocks: stats.total_blocks,
+      entries: stats.total_entries,
+      disk_size: stats.disk_size
+    })
   end
 
   # NDJSON log ingest (VictoriaLogs format)
   post "/insert/jsonline" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    msg_field = conn.query_params["_msg_field"] || "_msg"
-    time_field = conn.query_params["_time_field"] || "_time"
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        {params, _} = Rocket.Request.query_params(req)
+        msg_field = params["_msg_field"] || "_msg"
+        time_field = params["_time_field"] || "_time"
 
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
-        {count, errors} = ingest_ndjson(body, msg_field, time_field)
+        {count, errors} = ingest_ndjson(req.body, msg_field, time_field)
 
         if errors > 0 do
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, json_encode!(%{entries: count, errors: errors}))
+          json_resp(req, 200, %{entries: count, errors: errors})
         else
-          send_resp(conn, 204, "")
+          send_resp(req, 204)
         end
-
-      {:more, _partial, conn} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # Query logs with filters via GET params, returns NDJSON
   get "/select/logsql/query" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        {params, _} = Rocket.Request.query_params(req)
+        filters = build_query_filters(params)
 
-    filters = build_query_filters(params)
+        case TimelessLogs.query(filters) do
+          {:ok, %{entries: entries}} ->
+            send_ndjson_response(req, entries)
 
-    case TimelessLogs.query(filters) do
-      {:ok, %{entries: entries}} ->
-        send_ndjson_response(conn, entries)
-
-      {:error, reason} ->
-        json_error(conn, 500, inspect(reason))
+          {:error, reason} ->
+            json_error(req, 500, inspect(reason))
+        end
     end
   end
 
   # Query logs with LogsQL via POST form body, returns NDJSON
   post "/select/logsql/query" do
-    case read_form_body(conn) do
-      {:ok, form, conn} ->
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
 
         case TimelessLogs.LogsQL.parse(query_str) do
           {:stats_count, filters} ->
             case TimelessLogs.query(filters) do
               {:ok, %{total: total}} ->
-                conn
-                |> put_resp_content_type("application/x-ndjson")
-                |> send_resp(200, json_encode!(%{total: total}))
+                ndjson_resp(req, 200, json_encode!(%{total: total}))
 
               {:error, reason} ->
-                json_error(conn, 500, inspect(reason))
+                json_error(req, 500, inspect(reason))
             end
 
           {:query, filters} ->
             case TimelessLogs.query(filters) do
               {:ok, %{entries: entries}} ->
-                send_ndjson_response(conn, entries)
+                send_ndjson_response(req, entries)
 
               {:error, reason} ->
-                json_error(conn, 500, inspect(reason))
+                json_error(req, 500, inspect(reason))
             end
         end
-
-      {:error, conn} ->
-        json_error(conn, 400, "failed to read body")
     end
   end
 
   # Distinct values for a field
   post "/select/logsql/field_values" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    field = conn.query_params["field"]
-
-    case read_form_body(conn) do
-      {:ok, form, _conn} ->
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        field = Rocket.Request.get_query_param(req, "field")
+        form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
         {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
         {:ok, values} = TimelessLogs.field_values(field, filters)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(%{values: values}))
-
-      {:error, conn} ->
-        json_error(conn, 400, "failed to read body")
+        json_resp(req, 200, %{values: values})
     end
   end
 
   # All field names from matching entries
   post "/select/logsql/field_names" do
-    case read_form_body(conn) do
-      {:ok, form, _conn} ->
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
         {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
         {:ok, values} = TimelessLogs.field_names(filters)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(%{values: values}))
-
-      {:error, conn} ->
-        json_error(conn, 400, "failed to read body")
+        json_resp(req, 200, %{values: values})
     end
   end
 
   # Storage statistics
   get "/select/logsql/stats" do
-    {:ok, stats} = TimelessLogs.stats()
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        {:ok, stats} = TimelessLogs.stats()
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(
-      200,
-      json_encode!(%{
-        total_blocks: stats.total_blocks,
-        total_entries: stats.total_entries,
-        total_bytes: stats.total_bytes,
-        disk_size: stats.disk_size,
-        index_size: stats.index_size,
-        oldest_timestamp: stats.oldest_timestamp,
-        newest_timestamp: stats.newest_timestamp,
-        raw_blocks: stats.raw_blocks,
-        raw_bytes: stats.raw_bytes,
-        zstd_blocks: stats.zstd_blocks,
-        zstd_bytes: stats.zstd_bytes,
-        openzl_blocks: stats.openzl_blocks,
-        openzl_bytes: stats.openzl_bytes
-      })
-    )
+        json_resp(req, 200, %{
+          total_blocks: stats.total_blocks,
+          total_entries: stats.total_entries,
+          total_bytes: stats.total_bytes,
+          disk_size: stats.disk_size,
+          index_size: stats.index_size,
+          oldest_timestamp: stats.oldest_timestamp,
+          newest_timestamp: stats.newest_timestamp,
+          raw_blocks: stats.raw_blocks,
+          raw_bytes: stats.raw_bytes,
+          zstd_blocks: stats.zstd_blocks,
+          zstd_bytes: stats.zstd_bytes,
+          openzl_blocks: stats.openzl_blocks,
+          openzl_bytes: stats.openzl_bytes
+        })
+    end
   end
 
   # Online backup
   post "/api/v1/backup" do
-    parsed_path =
-      case Plug.Conn.read_body(conn, length: 64_000) do
-        {:ok, "", _} ->
-          nil
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        body = req.body
 
-        {:ok, body, _} ->
-          case json_decode(body) do
-            {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
-            _ -> nil
+        parsed_path =
+          case body do
+            "" ->
+              nil
+
+            _ ->
+              case json_decode(body) do
+                {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
+                _ -> nil
+              end
           end
 
-        _ ->
-          nil
-      end
+        target_dir = parsed_path || default_backup_dir()
 
-    target_dir = parsed_path || default_backup_dir()
+        case TimelessLogs.backup(target_dir) do
+          {:ok, result} ->
+            json_resp(req, 200, %{
+              status: "ok",
+              path: result.path,
+              files: result.files,
+              total_bytes: result.total_bytes
+            })
 
-    case TimelessLogs.backup(target_dir) do
-      {:ok, result} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(
-          200,
-          json_encode!(%{
-            status: "ok",
-            path: result.path,
-            files: result.files,
-            total_bytes: result.total_bytes
-          })
-        )
-
-      {:error, reason} ->
-        json_error(conn, 500, inspect(reason))
+          {:error, reason} ->
+            json_error(req, 500, inspect(reason))
+        end
     end
   end
 
   # Force buffer flush
   get "/api/v1/flush" do
-    TimelessLogs.flush()
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "ok"}))
+    case check_auth(req) do
+      :halt -> :ok
+      :ok ->
+        TimelessLogs.flush()
+        json_resp(req, 200, %{status: "ok"})
+    end
   end
 
   match _ do
-    send_resp(conn, 404, "not found")
+    send_resp(req, 404, "not found")
   end
 
   # --- Internals ---
@@ -477,7 +467,7 @@ defmodule TimelessLogs.HTTP do
     Map.new(metadata, fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp send_ndjson_response(conn, entries) do
+  defp send_ndjson_response(req, entries) do
     body =
       entries
       |> Enum.map_join("\n", fn entry ->
@@ -491,22 +481,7 @@ defmodule TimelessLogs.HTTP do
         json_encode!(map)
       end)
 
-    conn
-    |> put_resp_content_type("application/x-ndjson")
-    |> send_resp(200, body)
-  end
-
-  defp read_form_body(conn) do
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
-        {:ok, URI.decode_query(body), conn}
-
-      {:more, _partial, conn} ->
-        {:error, conn}
-
-      {:error, _reason} ->
-        {:error, conn}
-    end
+    ndjson_resp(req, 200, body)
   end
 
   defp default_backup_dir do
@@ -514,20 +489,8 @@ defmodule TimelessLogs.HTTP do
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 
-  defp json_error(conn, status, msg) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, json_encode!(%{error: msg}))
-  end
-
   # JSON encoding/decoding using :json NIF (OTP 27+)
-  # Handles nil → :null conversion for compatibility
-  defp json_encode!(data) do
-    data
-    |> normalize_for_json()
-    |> :json.encode()
-    |> IO.iodata_to_binary()
-  end
+  defp json_encode!(term), do: term |> nullify() |> :json.encode() |> IO.iodata_to_binary()
 
   defp json_decode(data) do
     try do
@@ -537,20 +500,10 @@ defmodule TimelessLogs.HTTP do
     end
   end
 
-  defp normalize_for_json(nil), do: :null
-  defp normalize_for_json(atom) when is_atom(atom), do: Atom.to_string(atom)
-  defp normalize_for_json(val) when is_binary(val) or is_number(val) or is_boolean(val), do: val
-
-  defp normalize_for_json(list) when is_list(list) do
-    Enum.map(list, &normalize_for_json/1)
-  end
-
-  defp normalize_for_json(map) when is_map(map) do
-    Map.new(map, fn {k, v} ->
-      key = if is_atom(k), do: Atom.to_string(k), else: k
-      {key, normalize_for_json(v)}
-    end)
-  end
-
-  defp normalize_for_json(val), do: val
+  defp nullify(nil), do: :null
+  defp nullify(atom) when is_atom(atom), do: Atom.to_string(atom)
+  defp nullify(val) when is_binary(val) or is_number(val) or is_boolean(val), do: val
+  defp nullify(list) when is_list(list), do: Enum.map(list, &nullify/1)
+  defp nullify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {to_string(k), nullify(v)} end)
+  defp nullify(val), do: val
 end
