@@ -47,7 +47,8 @@ defmodule TimelessLogs.HTTP do
 
     %{
       id: __MODULE__,
-      start: {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
+      start:
+        {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
       type: :supervisor
     }
   end
@@ -108,13 +109,11 @@ defmodule TimelessLogs.HTTP do
   defp json_resp(req, status, term) do
     body = json_encode!(term)
 
-    Rocket.Response.send_iodata(req, status,
-      [{"content-type", "application/json"}], body)
+    Rocket.Response.send_iodata(req, status, [{"content-type", "application/json"}], body)
   end
 
   defp ndjson_resp(req, status, body) do
-    Rocket.Response.send_iodata(req, status,
-      [{"content-type", "application/x-ndjson"}], body)
+    Rocket.Response.send_iodata(req, status, [{"content-type", "application/x-ndjson"}], body)
   end
 
   defp json_error(req, status, msg) do
@@ -138,7 +137,9 @@ defmodule TimelessLogs.HTTP do
   # NDJSON log ingest (VictoriaLogs format)
   post "/insert/jsonline" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         {params, _} = Rocket.Request.query_params(req)
         msg_field = params["_msg_field"] || "_msg"
@@ -157,7 +158,9 @@ defmodule TimelessLogs.HTTP do
   # Query logs with filters via GET params, returns NDJSON
   get "/select/logsql/query" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         {params, _} = Rocket.Request.query_params(req)
         filters = build_query_filters(params)
@@ -175,7 +178,9 @@ defmodule TimelessLogs.HTTP do
   # Query logs with LogsQL via POST form body, returns NDJSON
   post "/select/logsql/query" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
@@ -205,7 +210,9 @@ defmodule TimelessLogs.HTTP do
   # Distinct values for a field
   post "/select/logsql/field_values" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         field = Rocket.Request.get_query_param(req, "field")
         form = URI.decode_query(req.body || "")
@@ -220,7 +227,9 @@ defmodule TimelessLogs.HTTP do
   # All field names from matching entries
   post "/select/logsql/field_names" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
@@ -234,7 +243,9 @@ defmodule TimelessLogs.HTTP do
   # Storage statistics
   get "/select/logsql/stats" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         {:ok, stats} = TimelessLogs.stats()
 
@@ -259,7 +270,9 @@ defmodule TimelessLogs.HTTP do
   # Online backup
   post "/api/v1/backup" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         body = req.body
 
@@ -295,7 +308,9 @@ defmodule TimelessLogs.HTTP do
   # Force buffer flush
   get "/api/v1/flush" do
     case check_auth(req) do
-      :halt -> :ok
+      :halt ->
+        :ok
+
       :ok ->
         TimelessLogs.flush()
         json_resp(req, 200, %{status: "ok"})
@@ -504,6 +519,9 @@ defmodule TimelessLogs.HTTP do
   defp nullify(atom) when is_atom(atom), do: Atom.to_string(atom)
   defp nullify(val) when is_binary(val) or is_number(val) or is_boolean(val), do: val
   defp nullify(list) when is_list(list), do: Enum.map(list, &nullify/1)
-  defp nullify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {to_string(k), nullify(v)} end)
+
+  defp nullify(map) when is_map(map),
+    do: Map.new(map, fn {k, v} -> {to_string(k), nullify(v)} end)
+
   defp nullify(val), do: val
 end

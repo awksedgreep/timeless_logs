@@ -170,8 +170,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "response is parseable by DDNet's NDJSON parser" do
-      resp = post("/select/logsql/query", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=*", content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
       logs = ddnet_parse_ndjson(resp.body)
@@ -179,8 +179,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "each log has required fields for DDNet" do
-      resp = post("/select/logsql/query", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=*", content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
 
@@ -193,8 +193,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "metadata fields propagate correctly through DDNet parser" do
-      resp = post("/select/logsql/query", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=*", content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
 
@@ -214,8 +214,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "custom metadata ends up in DDNet meta field" do
-      resp = post("/select/logsql/query", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=*", content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
 
@@ -228,8 +228,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "level filter produces correct subset" do
       query = URI.encode_query(%{"query" => "level:error"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 1
@@ -240,8 +240,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "sort and limit pipes work with DDNet parser" do
       query = URI.encode_query(%{"query" => "* | sort by (_time) desc | limit 2"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 2
@@ -254,8 +254,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "empty result set returns parseable empty body" do
       query = URI.encode_query(%{"query" => "level:debug"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
       logs = ddnet_parse_ndjson(resp.body)
@@ -272,8 +272,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "stats count response is parseable by DDNet" do
       query = URI.encode_query(%{"query" => "* | stats count() as total"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
       count = ddnet_parse_count(resp.body)
@@ -283,8 +283,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "filtered stats count returns correct total" do
       query = URI.encode_query(%{"query" => "level:info | stats count() as total"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       count = ddnet_parse_count(resp.body)
       assert count == 3
@@ -293,8 +293,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "stats count with no matches returns 0" do
       query = URI.encode_query(%{"query" => "level:debug | stats count() as total"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       count = ddnet_parse_count(resp.body)
       assert count == 0
@@ -308,8 +308,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "level field_values parseable by DDNet" do
-      resp = post("/select/logsql/field_values?field=level", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=level", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
       values = ddnet_parse_field_values(resp.body)
@@ -319,8 +321,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "service field_values parseable by DDNet" do
-      resp = post("/select/logsql/field_values?field=service", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=service", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       values = ddnet_parse_field_values(resp.body)
       assert "api" in values
@@ -330,8 +334,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "app field_values parseable by DDNet" do
-      resp = post("/select/logsql/field_values?field=app", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=app", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       values = ddnet_parse_field_values(resp.body)
       assert "myapp" in values
@@ -339,8 +345,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "node field_values parseable by DDNet" do
-      resp = post("/select/logsql/field_values?field=node", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=node", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       values = ddnet_parse_field_values(resp.body)
       assert "node1@host" in values
@@ -349,8 +357,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "field with no values returns empty list" do
-      resp = post("/select/logsql/field_values?field=nonexistent", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=nonexistent", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       values = ddnet_parse_field_values(resp.body)
       assert values == []
@@ -364,8 +374,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "field_names parseable by DDNet and includes standard fields" do
-      resp = post("/select/logsql/field_names", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_names", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
       names = ddnet_parse_field_names(resp.body)
@@ -377,8 +389,10 @@ defmodule TimelessLogs.VLogsCompatTest do
     end
 
     test "field_names includes metadata keys" do
-      resp = post("/select/logsql/field_names", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_names", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       names = ddnet_parse_field_names(resp.body)
 
@@ -402,8 +416,8 @@ defmodule TimelessLogs.VLogsCompatTest do
     test "DDNet default query: _time:1h | sort by (_time) desc | limit 50" do
       query = URI.encode_query(%{"query" => "_time:1h | sort by (_time) desc | limit 50"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
       logs = ddnet_parse_ndjson(resp.body)
@@ -417,8 +431,8 @@ defmodule TimelessLogs.VLogsCompatTest do
           "query" => "_time:1h level:error | sort by (_time) desc | limit 50"
         })
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 1
@@ -431,8 +445,8 @@ defmodule TimelessLogs.VLogsCompatTest do
           "query" => "_time:1h service:api | sort by (_time) desc | limit 50"
         })
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 2
@@ -445,8 +459,8 @@ defmodule TimelessLogs.VLogsCompatTest do
           "query" => "_time:1h | sort by (_time) desc | offset 2 | limit 50"
         })
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 3
@@ -458,16 +472,18 @@ defmodule TimelessLogs.VLogsCompatTest do
           "query" => "_time:1h level:info | stats count() as total"
         })
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       count = ddnet_parse_count(resp.body)
       assert count == 3
     end
 
     test "DDNet field_values with time filter" do
-      resp = post("/select/logsql/field_values?field=level", "query=_time%3A1h",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=level", "query=_time%3A1h",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       values = ddnet_parse_field_values(resp.body)
       assert "info" in values
@@ -479,8 +495,8 @@ defmodule TimelessLogs.VLogsCompatTest do
       query =
         URI.encode_query(%{"query" => "_time:1h \"timeout\" | sort by (_time) desc | limit 50"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       logs = ddnet_parse_ndjson(resp.body)
       assert length(logs) == 1

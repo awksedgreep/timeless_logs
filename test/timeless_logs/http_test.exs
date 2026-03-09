@@ -81,8 +81,10 @@ defmodule TimelessLogs.HTTPTest do
     test "uses custom _msg_field and _time_field" do
       body = ~s({"body":"custom msg","ts":"2024-06-15T12:00:00Z","level":"warning"})
 
-      resp = post("/insert/jsonline?_msg_field=body&_time_field=ts", body,
-        content_type: "application/x-ndjson")
+      resp =
+        post("/insert/jsonline?_msg_field=body&_time_field=ts", body,
+          content_type: "application/x-ndjson"
+        )
 
       assert resp.status == 204
 
@@ -201,8 +203,8 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns all logs with wildcard query" do
-      resp = post("/select/logsql/query", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=*", content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
 
@@ -214,8 +216,10 @@ defmodule TimelessLogs.HTTPTest do
     end
 
     test "filters by level via LogsQL" do
-      resp = post("/select/logsql/query", "query=level%3Aerror",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", "query=level%3Aerror",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
 
@@ -227,8 +231,8 @@ defmodule TimelessLogs.HTTPTest do
     test "stats count query returns total" do
       query = URI.encode_query(%{"query" => "* | stats count() as total"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
       body = :json.decode(resp.body)
@@ -238,8 +242,8 @@ defmodule TimelessLogs.HTTPTest do
     test "respects limit pipe" do
       query = URI.encode_query(%{"query" => "* | limit 1"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
 
@@ -250,8 +254,8 @@ defmodule TimelessLogs.HTTPTest do
     test "filters by metadata field" do
       query = URI.encode_query(%{"query" => "service:web"})
 
-      resp = post("/select/logsql/query", query,
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
 
       assert resp.status == 200
 
@@ -267,8 +271,10 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns distinct values for level field" do
-      resp = post("/select/logsql/field_values?field=level", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=level", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
       body = json_body(resp)
@@ -281,8 +287,10 @@ defmodule TimelessLogs.HTTPTest do
     end
 
     test "returns distinct values for metadata field" do
-      resp = post("/select/logsql/field_values?field=service", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_values?field=service", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
       body = json_body(resp)
@@ -299,8 +307,10 @@ defmodule TimelessLogs.HTTPTest do
     setup :ingest_test_data
 
     test "returns all field names" do
-      resp = post("/select/logsql/field_names", "query=*",
-        content_type: "application/x-www-form-urlencoded")
+      resp =
+        post("/select/logsql/field_names", "query=*",
+          content_type: "application/x-www-form-urlencoded"
+        )
 
       assert resp.status == 200
       body = json_body(resp)
@@ -408,8 +418,10 @@ defmodule TimelessLogs.HTTPTest do
     test "403 when token is wrong" do
       :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
 
-      resp = get("/select/logsql/stats",
-        headers: [{"authorization", "Bearer wrong"}])
+      resp =
+        get("/select/logsql/stats",
+          headers: [{"authorization", "Bearer wrong"}]
+        )
 
       assert resp.status == 403
       assert json_body(resp)["error"] == "forbidden"
@@ -418,8 +430,10 @@ defmodule TimelessLogs.HTTPTest do
     test "passes with correct bearer token" do
       :persistent_term.put({TimelessLogs.HTTP, :bearer_token}, "secret")
 
-      resp = get("/select/logsql/stats",
-        headers: [{"authorization", "Bearer secret"}])
+      resp =
+        get("/select/logsql/stats",
+          headers: [{"authorization", "Bearer secret"}]
+        )
 
       assert resp.status == 200
     end
