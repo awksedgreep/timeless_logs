@@ -46,12 +46,8 @@ defmodule TimelessLogs.Index do
 
   @spec stats() :: {:ok, TimelessLogs.Stats.t()}
   def stats do
-    rows = :ets.tab2list(@blocks_table)
-
     {total_blocks, total_entries, total_bytes, oldest, newest, format_stats} =
-      Enum.reduce(
-        rows,
-        {0, 0, 0, nil, nil, %{}},
+      :ets.foldl(
         fn {_bid, _fp, byte_size, entry_count, ts_min, ts_max, format, _created_at},
            {blocks, entries, bytes, old, new, fstats} ->
           new_old = if old == nil or ts_min < old, do: ts_min, else: old
@@ -68,7 +64,9 @@ defmodule TimelessLogs.Index do
 
           {blocks + 1, entries + entry_count, bytes + byte_size, new_old, new_new,
            Map.put(fstats, fmt_key, updated)}
-        end
+        end,
+        {0, 0, 0, nil, nil, %{}},
+        @blocks_table
       )
 
     index_size =
@@ -176,11 +174,11 @@ defmodule TimelessLogs.Index do
 
   @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
   def raw_block_ids do
-    @blocks_table
-    |> :ets.tab2list()
-    |> Enum.filter(fn {_bid, _fp, _bs, _ec, _tsmin, _tsmax, format, _ca} -> format == :raw end)
-    |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
-    |> Enum.map(fn {bid, fp, bs, _ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp, bs} end)
+    :ets.select(@blocks_table, [
+      {{:"$1", :"$2", :"$3", :_, :"$4", :_, :raw, :_}, [], [{{:"$4", :"$1", :"$2", :"$3"}}]}
+    ])
+    |> Enum.sort_by(fn {ts_min, _bid, _fp, _bs} -> ts_min end)
+    |> Enum.map(fn {_ts_min, bid, fp, bs} -> {bid, fp, bs} end)
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
@@ -815,38 +813,52 @@ defmodule TimelessLogs.Index do
           |> Enum.reduce(&MapSet.intersection/2)
       end
 
-    # Collect all blocks from ETS, apply filters
-    all_blocks = :ets.tab2list(@blocks_table)
+    matching =
+      :ets.foldl(
+        fn {bid, fp, _bs, _ec, ts_min, ts_max, fmt, _ca}, acc ->
+          term_match =
+            case candidate_bids do
+              nil -> true
+              bids -> MapSet.member?(bids, bid)
+            end
 
-    all_blocks
-    |> Enum.filter(fn {bid, _fp, _bs, _ec, ts_min, ts_max, _fmt, _ca} ->
-      term_match =
-        case candidate_bids do
-          nil -> true
-          bids -> MapSet.member?(bids, bid)
-        end
+          time_match =
+            term_match and
+              Enum.all?(time_filters, fn
+                {:since, ts} -> ts_max >= to_unix(ts)
+                {:until, ts} -> ts_min <= to_unix(ts)
+              end)
 
-      time_match =
-        Enum.all?(time_filters, fn
-          {:since, ts} -> ts_max >= to_unix(ts)
-          {:until, ts} -> ts_min <= to_unix(ts)
-        end)
+          if term_match and time_match do
+            [{ts_min, bid, fp, fmt} | acc]
+          else
+            acc
+          end
+        end,
+        [],
+        @blocks_table
+      )
 
-      term_match and time_match
-    end)
+    matching
     |> Enum.sort_by(
-      fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end,
+      fn {ts_min, _bid, _fp, _fmt} -> ts_min end,
       if(order == :asc, do: :asc, else: :desc)
     )
-    |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, fmt, _ca} -> {bid, fp, fmt} end)
+    |> Enum.map(fn {_ts_min, bid, fp, fmt} -> {bid, fp, fmt} end)
   end
 
   # --- ETS-based deletion helpers ---
 
   defp collect_terms_for_blocks_ets(block_ids) do
-    Enum.flat_map(block_ids, fn id ->
-      :ets.match_object(@term_index_table, {:_, id})
-    end)
+    bid_set = MapSet.new(block_ids)
+
+    :ets.foldl(
+      fn {term, bid}, acc ->
+        if MapSet.member?(bid_set, bid), do: [{term, bid} | acc], else: acc
+      end,
+      [],
+      @term_index_table
+    )
   end
 
   defp remove_block_ids_from_index(_old_ids, old_terms) do
@@ -894,26 +906,22 @@ defmodule TimelessLogs.Index do
   end
 
   defp do_delete_over_size_ets(max_bytes, storage) do
-    total =
+    {total, rows} =
       :ets.foldl(
-        fn {_bid, _fp, byte_size, _ec, _tsmin, _tsmax, _fmt, _ca}, acc -> acc + byte_size end,
-        0,
+        fn {bid, _fp, byte_size, _ec, ts_min, _tsmax, _fmt, _ca}, {sum, acc} ->
+          {sum + byte_size, [{ts_min, bid, byte_size} | acc]}
+        end,
+        {0, []},
         @blocks_table
       )
 
     if total <= max_bytes do
       {0, []}
     else
-      # Get all blocks sorted by ts_min ascending
-      rows =
-        @blocks_table
-        |> :ets.tab2list()
-        |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
+      sorted = Enum.sort_by(rows, fn {ts_min, _bid, _bs} -> ts_min end)
 
       {to_delete, _} =
-        Enum.reduce_while(rows, {[], total}, fn {bid, _fp, byte_size, _ec, _tsmin, _tsmax, _fmt,
-                                                 _ca},
-                                                {acc, remaining} ->
+        Enum.reduce_while(sorted, {[], total}, fn {_ts_min, bid, byte_size}, {acc, remaining} ->
           if remaining > max_bytes do
             {:cont, {[bid | acc], remaining - byte_size}}
           else
@@ -938,14 +946,25 @@ defmodule TimelessLogs.Index do
     if current_size <= max_entries do
       {0, []}
     else
-      # Get all blocks with their term counts, sorted by ts_min
+      # Single pass over term_index to build block_id => term_count map
+      term_counts =
+        :ets.foldl(
+          fn {_term, bid}, acc ->
+            Map.update(acc, bid, 1, &(&1 + 1))
+          end,
+          %{},
+          @term_index_table
+        )
+
+      # Single pass over blocks to collect {ts_min, bid} tuples
       rows =
-        @blocks_table
-        |> :ets.tab2list()
-        |> Enum.map(fn {bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} ->
-          term_count = length(:ets.match_object(@term_index_table, {:_, bid}))
-          {ts_min, bid, term_count}
-        end)
+        :ets.foldl(
+          fn {bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca}, acc ->
+            [{ts_min, bid, Map.get(term_counts, bid, 0)} | acc]
+          end,
+          [],
+          @blocks_table
+        )
         |> Enum.sort_by(fn {ts_min, _bid, _tc} -> ts_min end)
 
       {to_delete, _} =
@@ -1056,7 +1075,13 @@ defmodule TimelessLogs.Index do
     |> MapSet.to_list()
   end
 
-  # --- Querying (parallel, runs in caller's process) ---
+  # --- Querying (with early-exit limit) ---
+  #
+  # Blocks arrive pre-sorted in the requested timestamp order from
+  # find_matching_blocks_ets (newest-first for :desc, oldest-first for :asc).
+  # We read blocks sequentially (or in parallel batches for disk) and stop
+  # as soon as we've accumulated enough filtered entries (offset + limit).
+  # This turns an O(all_entries) scan into O(limit) for the common case.
 
   defp do_query_parallel(block_ids, storage, pagination, search_filters) do
     start_time = System.monotonic_time()
@@ -1064,11 +1089,90 @@ defmodule TimelessLogs.Index do
     limit = Keyword.get(pagination, :limit, @default_limit)
     offset = Keyword.get(pagination, :offset, @default_offset)
     order = Keyword.get(pagination, :order, :desc)
-    blocks_read = length(block_ids)
+    need = offset + limit
 
-    all_matching =
-      if storage == :disk and blocks_read > 1 do
-        block_ids
+    {collected, blocks_read} =
+      collect_with_early_exit(block_ids, storage, search_filters, need)
+
+    sorted =
+      case order do
+        :asc -> Enum.sort_by(collected, & &1.timestamp, :asc)
+        :desc -> Enum.sort_by(collected, & &1.timestamp, :desc)
+      end
+
+    total = length(sorted)
+    page = sorted |> Enum.drop(offset) |> Enum.take(limit)
+    duration = System.monotonic_time() - start_time
+
+    TimelessLogs.Telemetry.event(
+      [:timeless_logs, :query, :stop],
+      %{duration: duration, total: total, blocks_read: blocks_read},
+      %{filters: search_filters}
+    )
+
+    {:ok,
+     %TimelessLogs.Result{
+       entries: page,
+       total: total,
+       limit: limit,
+       offset: offset
+     }}
+  end
+
+  defp collect_with_early_exit(block_ids, storage, search_filters, need) do
+    if storage == :disk and length(block_ids) > 1 do
+      collect_parallel_early_exit(block_ids, search_filters, need)
+    else
+      collect_sequential_early_exit(block_ids, storage, search_filters, need)
+    end
+  end
+
+  defp collect_sequential_early_exit(block_ids, storage, search_filters, need) do
+    Enum.reduce_while(block_ids, {[], 0}, fn {block_id, file_path, format}, {acc, count} ->
+      format_atom = to_format_atom(format)
+
+      read_result =
+        case storage do
+          :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
+          :memory -> read_block_data(block_id)
+        end
+
+      case read_result do
+        {:ok, entries} ->
+          filtered =
+            entries
+            |> TimelessLogs.Filter.filter(search_filters)
+            |> Enum.map(&TimelessLogs.Entry.from_map/1)
+
+          new_acc = acc ++ filtered
+          new_count = count + 1
+
+          if length(new_acc) >= need do
+            {:halt, {new_acc, new_count}}
+          else
+            {:cont, {new_acc, new_count}}
+          end
+
+        {:error, reason} ->
+          TimelessLogs.Telemetry.event(
+            [:timeless_logs, :block, :error],
+            %{},
+            %{file_path: file_path, reason: reason}
+          )
+
+          {:cont, {acc, count + 1}}
+      end
+    end)
+  end
+
+  defp collect_parallel_early_exit(block_ids, search_filters, need) do
+    batch_size = System.schedulers_online()
+
+    block_ids
+    |> Enum.chunk_every(batch_size)
+    |> Enum.reduce_while({[], 0}, fn batch, {acc, count} ->
+      batch_results =
+        batch
         |> Task.async_stream(
           fn {_block_id, file_path, format} ->
             format_atom = to_format_atom(format)
@@ -1089,61 +1193,20 @@ defmodule TimelessLogs.Index do
                 []
             end
           end,
-          max_concurrency: System.schedulers_online(),
+          max_concurrency: batch_size,
           ordered: false
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
+
+      new_acc = acc ++ batch_results
+      new_count = count + length(batch)
+
+      if length(new_acc) >= need do
+        {:halt, {new_acc, new_count}}
       else
-        Enum.flat_map(block_ids, fn {block_id, file_path, format} ->
-          format_atom = to_format_atom(format)
-
-          read_result =
-            case storage do
-              :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
-              :memory -> read_block_data(block_id)
-            end
-
-          case read_result do
-            {:ok, entries} ->
-              entries
-              |> TimelessLogs.Filter.filter(search_filters)
-              |> Enum.map(&TimelessLogs.Entry.from_map/1)
-
-            {:error, reason} ->
-              TimelessLogs.Telemetry.event(
-                [:timeless_logs, :block, :error],
-                %{},
-                %{file_path: file_path, reason: reason}
-              )
-
-              []
-          end
-        end)
+        {:cont, {new_acc, new_count}}
       end
-
-    sorted =
-      case order do
-        :asc -> Enum.sort_by(all_matching, & &1.timestamp, :asc)
-        :desc -> Enum.sort_by(all_matching, & &1.timestamp, :desc)
-      end
-
-    total = length(sorted)
-    page = sorted |> Enum.drop(offset) |> Enum.take(limit)
-    duration = System.monotonic_time() - start_time
-
-    TimelessLogs.Telemetry.event(
-      [:timeless_logs, :query, :stop],
-      %{duration: duration, total: total, blocks_read: blocks_read},
-      %{filters: search_filters}
-    )
-
-    {:ok,
-     %TimelessLogs.Result{
-       entries: page,
-       total: total,
-       limit: limit,
-       offset: offset
-     }}
+    end)
   end
 
   # --- Query building ---
