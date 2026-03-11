@@ -473,7 +473,7 @@ defmodule TimelessLogs.Index do
       :ordered_set,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
 
     :ets.new(@term_index_table, [
@@ -481,7 +481,7 @@ defmodule TimelessLogs.Index do
       :bag,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
 
     :ets.new(@compression_stats_table, [
@@ -496,7 +496,7 @@ defmodule TimelessLogs.Index do
       :set,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
   end
 
