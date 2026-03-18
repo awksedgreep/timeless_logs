@@ -31,11 +31,12 @@ defmodule TimelessLogs.MemoryTest do
       assert %TimelessLogs.Entry{} = entry
     end
 
-    test "no files created on disk" do
+    test "no block files created on disk" do
       Logger.info("no disk")
       TimelessLogs.flush()
 
-      refute File.exists?("test/tmp/memory_should_not_exist")
+      # SQLite index file will exist, but no block files should be written
+      refute File.exists?("test/tmp/memory_should_not_exist/blocks")
     end
 
     test "multiple entries in one flush" do
@@ -135,7 +136,6 @@ defmodule TimelessLogs.MemoryTest do
     test "stats/0 works in memory mode" do
       {:ok, stats} = TimelessLogs.stats()
       assert stats.total_blocks == 0
-      assert stats.index_size == 0
 
       Logger.info("entry")
       TimelessLogs.flush()

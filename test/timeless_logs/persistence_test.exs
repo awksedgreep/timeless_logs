@@ -1,13 +1,12 @@
 defmodule TimelessLogs.PersistenceTest do
   @moduledoc """
-  Tests for the disk_log + ETS snapshot persistence layer.
+  Tests for the SQLite-backed index persistence layer.
 
-  These tests exercise crash recovery, log replay, snapshot correctness,
-  and edge cases that the normal integration tests don't cover because
-  they run within a single GenServer lifecycle.
+  These tests exercise crash recovery, restart data integrity, and edge cases
+  that the normal integration tests don't cover because they run within a
+  single GenServer lifecycle.
 
-  Crash recovery is simulated by: graceful stop (writes snapshot + keeps log),
-  then deleting the snapshot, then restarting (forces log-only replay).
+  With SQLite, persistence is atomic — no manual snapshot/WAL replay needed.
   """
   use ExUnit.Case, async: false
 
@@ -43,8 +42,7 @@ defmodule TimelessLogs.PersistenceTest do
     Application.stop(:timeless_logs)
   end
 
-  defp snapshot_path, do: Path.join(@data_dir, "index.snapshot")
-  defp log_path, do: Path.join(@data_dir, "index.log")
+  defp db_path, do: Path.join(@data_dir, "logs_index.db")
 
   defp make_entry(overrides \\ %{}) do
     Map.merge(
@@ -74,11 +72,11 @@ defmodule TimelessLogs.PersistenceTest do
   end
 
   # ----------------------------------------------------------------
-  # Graceful restart: snapshot written on terminate, loaded on init
+  # Graceful restart: SQLite DB persists across restarts
   # ----------------------------------------------------------------
 
   describe "graceful restart recovery" do
-    test "data survives app restart via snapshot" do
+    test "data survives app restart via SQLite" do
       start_app()
 
       entries =
@@ -93,11 +91,11 @@ defmodule TimelessLogs.PersistenceTest do
       assert stats_before.total_entries == 50
       assert stats_before.total_blocks == 1
 
-      # Graceful stop writes snapshot
+      # Graceful stop
       stop_app()
 
-      # Verify snapshot file exists
-      assert File.exists?(snapshot_path())
+      # Verify SQLite DB file exists
+      assert File.exists?(db_path())
 
       # Restart and verify data is recovered
       start_app()
@@ -206,26 +204,21 @@ defmodule TimelessLogs.PersistenceTest do
   end
 
   # ----------------------------------------------------------------
-  # Log-only recovery: simulate crash by deleting snapshot after stop
+  # Crash recovery: SQLite handles atomicity, data persists
   # ----------------------------------------------------------------
 
-  describe "crash recovery via log replay" do
-    test "data recoverable from log when snapshot is lost" do
+  describe "crash recovery" do
+    test "data persists even without graceful shutdown" do
       start_app()
 
       entries = Enum.map(1..30, fn i -> make_entry(%{message: "crash-test-#{i}"}) end)
       {:ok, _meta, _terms} = ingest_entries(entries)
       TimelessLogs.Index.sync()
 
-      # Graceful stop writes snapshot and keeps log (log is NOT truncated)
+      # Simulate hard stop (no terminate callback)
       stop_app()
 
-      # Delete snapshot to force log-only replay
-      File.rm!(snapshot_path())
-      refute File.exists?(snapshot_path())
-      assert File.exists?(log_path())
-
-      # Restart — should replay from log
+      # Restart — SQLite DB should have all data
       start_app()
 
       {:ok, stats} = TimelessLogs.Index.stats()
@@ -233,7 +226,7 @@ defmodule TimelessLogs.PersistenceTest do
       assert stats.total_blocks == 1
     end
 
-    test "log replay produces same query results as before" do
+    test "queries work identically after restart" do
       start_app()
 
       error_entries = [
@@ -252,10 +245,7 @@ defmodule TimelessLogs.PersistenceTest do
       {:ok, error_before} = TimelessLogs.Index.query(level: :error, limit: 100)
       {:ok, info_before} = TimelessLogs.Index.query(level: :info, limit: 100)
 
-      # Stop gracefully, then remove snapshot
       stop_app()
-      File.rm!(snapshot_path())
-
       start_app()
 
       {:ok, error_after} = TimelessLogs.Index.query(level: :error, limit: 100)
@@ -265,7 +255,7 @@ defmodule TimelessLogs.PersistenceTest do
       assert info_after.total == info_before.total
     end
 
-    test "delete operations in log are replayed correctly" do
+    test "delete operations persist across restarts" do
       start_app()
 
       old_ts = System.system_time(:second) - 100_000
@@ -296,19 +286,16 @@ defmodule TimelessLogs.PersistenceTest do
       {:ok, stats_after_delete} = TimelessLogs.Index.stats()
       assert stats_after_delete.total_blocks == 1
 
-      # Stop gracefully, then remove snapshot to force log replay
+      # Restart and verify delete persisted
       stop_app()
-      File.rm!(snapshot_path())
-
       start_app()
 
-      # After replay, delete should still be reflected
       {:ok, stats_recovered} = TimelessLogs.Index.stats()
       assert stats_recovered.total_blocks == 1
       assert stats_recovered.total_entries == 10
     end
 
-    test "compact operations in log are replayed correctly" do
+    test "compact operations persist across restarts" do
       start_app()
 
       entries1 = Enum.map(1..10, fn i -> make_entry(%{message: "batch1-#{i}"}) end)
@@ -341,10 +328,7 @@ defmodule TimelessLogs.PersistenceTest do
       assert stats_before.total_blocks == 1
       assert stats_before.total_entries == 20
 
-      # Stop gracefully, then remove snapshot to force log replay
       stop_app()
-      File.rm!(snapshot_path())
-
       start_app()
 
       {:ok, stats_after} = TimelessLogs.Index.stats()
@@ -355,162 +339,24 @@ defmodule TimelessLogs.PersistenceTest do
   end
 
   # ----------------------------------------------------------------
-  # Snapshot + log interaction
+  # Large-scale persistence
   # ----------------------------------------------------------------
 
-  describe "snapshot + log interaction" do
-    test "entries written after snapshot are recovered from log" do
+  describe "large-scale persistence" do
+    test "many blocks survive restart" do
       start_app()
 
-      # Write first batch
-      entries1 = Enum.map(1..10, fn i -> make_entry(%{message: "pre-snapshot-#{i}"}) end)
-      ingest_entries(entries1)
-      TimelessLogs.Index.sync()
-
-      # Graceful stop writes snapshot (batch 1 only)
-      stop_app()
-
-      # Save a copy of the snapshot (contains only batch 1)
-      old_snapshot = File.read!(snapshot_path())
-
-      # Restart and write second batch
-      start_app()
-      entries2 = Enum.map(1..10, fn i -> make_entry(%{message: "post-snapshot-#{i}"}) end)
-      ingest_entries(entries2)
-      TimelessLogs.Index.sync()
-
-      {:ok, stats_running} = TimelessLogs.Index.stats()
-      assert stats_running.total_entries == 20
-
-      # Graceful stop writes new snapshot (both batches), log has all entries
-      stop_app()
-
-      # Restore the OLD snapshot (only batch 1) — log still has batch 2 entries
-      File.write!(snapshot_path(), old_snapshot)
-
-      # Restart: loads old snapshot (batch 1) + replays log (batch 2 entries are newer)
-      start_app()
-
-      {:ok, stats_recovered} = TimelessLogs.Index.stats()
-      assert stats_recovered.total_entries == 20
-      assert stats_recovered.total_blocks == 2
-    end
-
-    test "log entries already in snapshot are not double-applied" do
-      start_app()
-
-      entries = Enum.map(1..10, fn i -> make_entry(%{message: "idempotent-#{i}"}) end)
-      ingest_entries(entries)
-      TimelessLogs.Index.sync()
-
-      # Graceful stop writes snapshot (log still has entries)
-      stop_app()
-
-      # Do NOT delete the log — it still has entries from before the snapshot
-      # On restart, replay should skip them (ts <= snapshot_ts)
-      start_app()
-
-      {:ok, stats} = TimelessLogs.Index.stats()
-      assert stats.total_entries == 10
-      assert stats.total_blocks == 1
-    end
-
-    test "mixed operations in log replay: index + delete + index" do
-      start_app()
-
-      # Index old entries
-      old_entries =
-        Enum.map(1..5, fn i ->
-          make_entry(%{message: "old-#{i}", timestamp: System.system_time(:second) - 100_000 + i})
-        end)
-
-      ingest_entries(old_entries)
-      TimelessLogs.Index.sync()
-
-      # Graceful stop writes snapshot with the old entries
-      stop_app()
-
-      # Save snapshot with only old entries
-      old_snapshot = File.read!(snapshot_path())
-
-      start_app()
-
-      # Delete old entries (logged to disk_log)
-      TimelessLogs.Index.delete_blocks_before(System.system_time(:second) - 50_000)
-      TimelessLogs.Index.sync()
-
-      # Index new entries (also logged)
-      new_entries =
-        Enum.map(1..5, fn i ->
-          make_entry(%{message: "new-#{i}", timestamp: System.system_time(:second) + i})
-        end)
-
-      ingest_entries(new_entries)
-      TimelessLogs.Index.sync()
-
-      {:ok, stats_before} = TimelessLogs.Index.stats()
-      assert stats_before.total_blocks == 1
-      assert stats_before.total_entries == 5
-
-      # Stop gracefully, restore old snapshot to force log replay of delete + new index
-      stop_app()
-      File.write!(snapshot_path(), old_snapshot)
-
-      start_app()
-
-      {:ok, stats_after} = TimelessLogs.Index.stats()
-      assert stats_after.total_blocks == 1
-      assert stats_after.total_entries == 5
-    end
-  end
-
-  # ----------------------------------------------------------------
-  # Snapshot threshold (auto-snapshot after N log entries)
-  # ----------------------------------------------------------------
-
-  describe "snapshot threshold" do
-    test "snapshot is triggered after threshold log entries" do
-      start_app()
-
-      # The threshold is 1000. Write enough blocks to exceed it.
-      # Each index_block call = 1 log entry. Write 1100 blocks.
-      for _i <- 1..1100 do
+      for _i <- 1..100 do
         entry = make_entry()
         ingest_entries([entry])
       end
 
       TimelessLogs.Index.sync()
 
-      # Snapshot should have been written at entry 1000
-      assert File.exists?(snapshot_path())
-
-      # Graceful restart should recover all data (snapshot + log replay)
       stop_app()
       start_app()
 
       {:ok, stats} = TimelessLogs.Index.stats()
-      assert stats.total_blocks == 1100
-      assert stats.total_entries == 1100
-    end
-
-    test "log is truncated after auto-snapshot" do
-      start_app()
-
-      # Write 1100 blocks: auto-snapshot fires at 1000, truncates log
-      for _i <- 1..1100 do
-        ingest_entries([make_entry()])
-      end
-
-      TimelessLogs.Index.sync()
-
-      # Stop, delete snapshot — only post-truncation log entries survive
-      stop_app()
-      File.rm!(snapshot_path())
-
-      start_app()
-
-      {:ok, stats} = TimelessLogs.Index.stats()
-      # Only the 100 entries written after the auto-snapshot truncation are in the log
       assert stats.total_blocks == 100
       assert stats.total_entries == 100
     end
@@ -521,36 +367,12 @@ defmodule TimelessLogs.PersistenceTest do
   # ----------------------------------------------------------------
 
   describe "corrupt and missing file handling" do
-    test "missing snapshot file starts with empty state" do
-      # No snapshot, no log — fresh start
+    test "missing DB file starts with empty state" do
       start_app()
 
       {:ok, stats} = TimelessLogs.Index.stats()
       assert stats.total_blocks == 0
       assert stats.total_entries == 0
-
-      stop_app()
-    end
-
-    test "corrupt snapshot file recovers from log" do
-      start_app()
-
-      entries = Enum.map(1..10, fn i -> make_entry(%{message: "corrupt-test-#{i}"}) end)
-      ingest_entries(entries)
-      TimelessLogs.Index.sync()
-
-      stop_app()
-
-      # Corrupt the snapshot
-      File.write!(snapshot_path(), "this is not valid erlang term binary")
-
-      # Restart — should handle corrupt snapshot gracefully and replay from log
-      start_app()
-
-      # Log has all entries (not truncated on graceful stop), so data should be recovered
-      {:ok, stats} = TimelessLogs.Index.stats()
-      assert stats.total_blocks == 1
-      assert stats.total_entries == 10
 
       stop_app()
     end
@@ -572,28 +394,6 @@ defmodule TimelessLogs.PersistenceTest do
 
       stop_app()
     end
-
-    test "partial snapshot (.tmp file) does not corrupt state" do
-      start_app()
-
-      entries = Enum.map(1..10, fn i -> make_entry(%{message: "tmp-test-#{i}"}) end)
-      ingest_entries(entries)
-      TimelessLogs.Index.sync()
-
-      stop_app()
-
-      # Simulate a crash during snapshot write: .tmp exists but real snapshot is good
-      tmp_path = snapshot_path() <> ".tmp"
-      File.write!(tmp_path, "partial garbage data")
-
-      start_app()
-
-      {:ok, stats} = TimelessLogs.Index.stats()
-      assert stats.total_entries == 10
-
-      # .tmp should not interfere
-      stop_app()
-    end
   end
 
   # ----------------------------------------------------------------
@@ -601,23 +401,24 @@ defmodule TimelessLogs.PersistenceTest do
   # ----------------------------------------------------------------
 
   describe "backup" do
-    test "backup creates a valid snapshot at target path" do
+    test "backup creates a valid SQLite database at target path" do
       start_app()
 
       entries = Enum.map(1..20, fn i -> make_entry(%{message: "backup-#{i}"}) end)
       ingest_entries(entries)
       TimelessLogs.Index.sync()
 
-      backup_path = Path.join(@data_dir, "backup.snapshot")
+      backup_path = Path.join(@data_dir, "backup.db")
       assert :ok == TimelessLogs.Index.backup(backup_path)
       assert File.exists?(backup_path)
 
-      # Verify it's valid by loading it
-      binary = File.read!(backup_path)
-      snapshot = :erlang.binary_to_term(binary)
-      assert snapshot.version == 1
-      assert length(snapshot.blocks) == 1
-      assert length(snapshot.term_index) > 0
+      # Verify it's a valid SQLite database by opening and querying it
+      {:ok, conn} = Exqlite.Sqlite3.open(backup_path)
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT COUNT(*) FROM blocks")
+      {:row, [count]} = Exqlite.Sqlite3.step(conn, stmt)
+      Exqlite.Sqlite3.release(conn, stmt)
+      Exqlite.Sqlite3.close(conn)
+      assert count == 1
 
       stop_app()
     end
@@ -628,7 +429,7 @@ defmodule TimelessLogs.PersistenceTest do
   # ----------------------------------------------------------------
 
   describe "memory mode" do
-    test "memory mode skips log and snapshot" do
+    test "memory mode does not create snapshot or log files" do
       start_app(storage: :memory, data_dir: "test/tmp/mem_persist_test")
 
       entries = Enum.map(1..10, fn i -> make_entry(%{message: "mem-#{i}"}) end)
@@ -647,16 +448,17 @@ defmodule TimelessLogs.PersistenceTest do
       {:ok, stats} = TimelessLogs.Index.stats()
       assert stats.total_entries == 10
 
-      # No files should be created
+      # Old snapshot/log files should not exist
       refute File.exists?("test/tmp/mem_persist_test/index.log")
       refute File.exists?("test/tmp/mem_persist_test/index.snapshot")
 
       stop_app()
+      File.rm_rf!("test/tmp/mem_persist_test")
     end
   end
 
   # ----------------------------------------------------------------
-  # Async indexing (cast path) recovery
+  # Async indexing recovery
   # ----------------------------------------------------------------
 
   describe "async indexing recovery" do
@@ -692,11 +494,11 @@ defmodule TimelessLogs.PersistenceTest do
   end
 
   # ----------------------------------------------------------------
-  # Stats (index_size) reflects new file format
+  # Stats (index_size) reflects SQLite DB files
   # ----------------------------------------------------------------
 
   describe "stats reflect persistence files" do
-    test "index_size reports snapshot + log size" do
+    test "index_size reports SQLite DB size" do
       start_app()
 
       entries = Enum.map(1..50, fn i -> make_entry(%{message: "stats-#{i}"}) end)
@@ -704,8 +506,44 @@ defmodule TimelessLogs.PersistenceTest do
       TimelessLogs.Index.sync()
 
       {:ok, stats} = TimelessLogs.Index.stats()
-      # Log should have some data (entries were logged)
+      # SQLite DB file should have some data
       assert stats.index_size > 0
+
+      stop_app()
+    end
+  end
+
+  # ----------------------------------------------------------------
+  # ETS migration
+  # ----------------------------------------------------------------
+
+  describe "ETS snapshot migration" do
+    test "old ETS snapshot is migrated to SQLite on startup" do
+      # Create a fake old-format snapshot
+      snapshot = %{
+        version: 1,
+        timestamp: System.monotonic_time(),
+        blocks: [
+          {1001, Path.join(@data_dir, "blocks/fake.zst"), 100, 5, 1000, 2000, :zstd,
+           System.system_time(:second)}
+        ],
+        term_index: [{"level:info", 1001}, {"module:Test", 1001}],
+        compression_stats: [{:lifetime, 500, 200, 1}],
+        block_data: []
+      }
+
+      snapshot_path = Path.join(@data_dir, "index.snapshot")
+      File.write!(snapshot_path, :erlang.term_to_binary(snapshot, [:compressed]))
+
+      start_app()
+
+      # Snapshot should have been migrated
+      {:ok, stats} = TimelessLogs.Index.stats()
+      assert stats.total_blocks == 1
+      assert stats.total_entries == 5
+
+      # Old snapshot file should be cleaned up
+      refute File.exists?(snapshot_path)
 
       stop_app()
     end

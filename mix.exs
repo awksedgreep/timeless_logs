@@ -27,6 +27,7 @@ defmodule TimelessLogs.MixProject do
     [
       {:ezstd, "~> 1.2"},
       {:ex_openzl, "~> 0.4.0"},
+      {:exqlite, "~> 0.27"},
       {:rocket, github: "awksedgreep/rocket"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
