@@ -268,7 +268,11 @@ defmodule TimelessLogs.Index do
     {:reply, result, state}
   end
 
-  def handle_call({:compact_blocks, old_block_ids, new_terms_list, compression_sizes}, _from, state) do
+  def handle_call(
+        {:compact_blocks, old_block_ids, new_terms_list, compression_sizes},
+        _from,
+        state
+      ) do
     state = flush_pending(state)
 
     # Get file paths for old blocks before deleting
@@ -277,7 +281,11 @@ defmodule TimelessLogs.Index do
         ph = placeholders(old_block_ids)
 
         {:ok, rows} =
-          TimelessLogs.DB.read(state.db, "SELECT file_path FROM blocks WHERE block_id IN (#{ph})", old_block_ids)
+          TimelessLogs.DB.read(
+            state.db,
+            "SELECT file_path FROM blocks WHERE block_id IN (#{ph})",
+            old_block_ids
+          )
 
         for [fp] <- rows, is_binary(fp), do: fp
       else
@@ -289,9 +297,24 @@ defmodule TimelessLogs.Index do
         # Delete old blocks
         if old_block_ids != [] do
           ph = placeholders(old_block_ids)
-          TimelessLogs.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", old_block_ids)
-          TimelessLogs.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", old_block_ids)
-          TimelessLogs.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", old_block_ids)
+
+          TimelessLogs.DB.execute(
+            conn,
+            "DELETE FROM term_index WHERE block_id IN (#{ph})",
+            old_block_ids
+          )
+
+          TimelessLogs.DB.execute(
+            conn,
+            "DELETE FROM block_data WHERE block_id IN (#{ph})",
+            old_block_ids
+          )
+
+          TimelessLogs.DB.execute(
+            conn,
+            "DELETE FROM blocks WHERE block_id IN (#{ph})",
+            old_block_ids
+          )
         end
 
         # Insert new blocks
@@ -379,7 +402,16 @@ defmodule TimelessLogs.Index do
     TimelessLogs.DB.execute(
       conn,
       "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-      [meta.block_id, meta[:file_path], meta.byte_size, meta.entry_count, meta.ts_min, meta.ts_max, format, created_at]
+      [
+        meta.block_id,
+        meta[:file_path],
+        meta.byte_size,
+        meta.entry_count,
+        meta.ts_min,
+        meta.ts_max,
+        format,
+        created_at
+      ]
     )
   end
 
@@ -414,7 +446,9 @@ defmodule TimelessLogs.Index do
 
   defp do_delete_before(db, cutoff, storage) do
     {:ok, rows} =
-      TimelessLogs.DB.read(db, "SELECT block_id, file_path FROM blocks WHERE ts_max < ?1", [cutoff])
+      TimelessLogs.DB.read(db, "SELECT block_id, file_path FROM blocks WHERE ts_max < ?1", [
+        cutoff
+      ])
 
     if rows == [] do
       0
@@ -439,7 +473,10 @@ defmodule TimelessLogs.Index do
       0
     else
       {:ok, rows} =
-        TimelessLogs.DB.read(db, "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC")
+        TimelessLogs.DB.read(
+          db,
+          "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC"
+        )
 
       {to_delete, _} =
         Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs], {acc, remaining} ->
@@ -511,8 +548,18 @@ defmodule TimelessLogs.Index do
 
     {:ok, _} =
       TimelessLogs.DB.write_transaction(db, fn conn ->
-        TimelessLogs.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", block_ids)
-        TimelessLogs.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", block_ids)
+        TimelessLogs.DB.execute(
+          conn,
+          "DELETE FROM term_index WHERE block_id IN (#{ph})",
+          block_ids
+        )
+
+        TimelessLogs.DB.execute(
+          conn,
+          "DELETE FROM block_data WHERE block_id IN (#{ph})",
+          block_ids
+        )
+
         TimelessLogs.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", block_ids)
       end)
   end
@@ -807,12 +854,22 @@ defmodule TimelessLogs.Index do
 
           {:ok, _} =
             TimelessLogs.DB.write_transaction(db, fn conn ->
-              for {block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at} <-
+              for {block_id, file_path, byte_size, entry_count, ts_min, ts_max, format,
+                   created_at} <-
                     snapshot.blocks do
                 TimelessLogs.DB.execute(
                   conn,
                   "INSERT OR IGNORE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                  [block_id, file_path, byte_size, entry_count, ts_min, ts_max, to_string(format), created_at]
+                  [
+                    block_id,
+                    file_path,
+                    byte_size,
+                    entry_count,
+                    ts_min,
+                    ts_max,
+                    to_string(format),
+                    created_at
+                  ]
                 )
               end
 
