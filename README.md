@@ -20,7 +20,7 @@
 
 Embedded log compression and indexing for Elixir applications. Add one dependency, configure a data directory, and your app gets compressed, searchable logs with zero external infrastructure.
 
-Logs are written to raw blocks, automatically compacted with OpenZL (~12.8x compression ratio), and indexed in ETS for lock-free querying. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
+Logs are written to raw blocks, automatically compacted with OpenZL (~12.8x compression ratio), and indexed in SQLite for crash-safe persistence. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
 
 ## Documentation
 
@@ -164,7 +164,7 @@ Create a consistent online backup without stopping the application:
 # %{path: "/tmp/logs_backup", files: [...], total_bytes: 24_000_000}
 ```
 
-Writes an ETS index snapshot and copies block files in parallel.
+Creates a consistent SQLite backup (VACUUM INTO) and copies block files.
 
 ## Retention
 
@@ -270,6 +270,38 @@ When `bearer_token` is configured, all endpoints except `/health` require either
 - Header: `Authorization: Bearer <token>`
 - Query param: `?token=<token>`
 
+## Reducing Overhead
+
+The biggest source of logging overhead in most Elixir apps is stdout/console
+output, not the log capture itself. For production or embedded use, disable
+the default console handler and let TimelessLogs be the sole destination:
+
+```elixir
+# config/prod.exs (or config/config.exs for all environments)
+config :logger,
+  backends: [],
+  handle_otp_reports: true,
+  handle_sasl_reports: false
+
+# Remove the default handler on boot
+config :logger, :default_handler, false
+```
+
+This eliminates the cost of formatting and writing every log line to stdout
+while TimelessLogs captures everything at the level you choose:
+
+```elixir
+# Only capture :info and above (skip :debug in production)
+config :logger, level: :info
+```
+
+If you still want console output during development:
+
+```elixir
+# config/dev.exs
+config :logger, :default_handler, %{level: :debug}
+```
+
 ## Configuration
 
 | Option | Default | Description |
@@ -309,8 +341,8 @@ TimelessLogs emits telemetry events for monitoring:
 3. Events buffer in a GenServer, flushing every 1s or 1000 entries
 4. Each flush writes a raw (uncompressed) block file
 5. A background compactor merges raw blocks into OpenZL-compressed blocks (~12.8x ratio)
-6. Block metadata and an inverted index of terms are indexed into ETS immediately, with changes journaled to a disk log and periodically snapshotted
-7. Queries run directly against public ETS tables — no GenServer round-trip needed — to find relevant blocks, decompress only those in parallel, and filter entries
+6. Block metadata and an inverted term index are stored in SQLite (WAL mode, single writer + reader pool) for crash-safe persistence
+7. Queries use the SQLite reader pool to find relevant blocks, decompress only those in parallel, and filter entries
 8. Real-time subscribers receive matching entries as they're buffered
 
 ## Benchmarks
