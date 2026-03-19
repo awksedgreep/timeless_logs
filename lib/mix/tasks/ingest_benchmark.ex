@@ -117,7 +117,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
 
     # Pre-generate log arguments (messages + metadata) to exclude string building from timing
     log_args =
-      Enum.map(1..entry_count, fn i ->
+      Enum.map(1..entry_count, fn _i ->
         msg = "Request #{method()} #{path()} completed in #{:rand.uniform(500)}ms"
 
         meta = [
@@ -208,7 +208,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
   defp generate_entries(count) do
     base_ts = System.system_time(:second) - 86400
 
-    Enum.map(1..count, fn i ->
+    Enum.map(1..count, fn _i ->
       ts = base_ts + div(i, 10)
       level = Enum.random([:info, :info, :info, :debug, :debug, :warning, :error])
 
