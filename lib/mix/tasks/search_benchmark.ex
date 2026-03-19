@@ -112,19 +112,24 @@ defmodule Mix.Tasks.TimelessLogs.SearchBenchmark do
   end
 
   defp ingest_all(entries, data_dir) do
-    entries
-    |> Enum.chunk_every(1000)
-    |> Enum.reduce(0, fn chunk, count ->
-      case TimelessLogs.Writer.write_block(chunk, data_dir) do
-        {:ok, meta} ->
-          terms = TimelessLogs.Index.extract_terms(chunk)
-          TimelessLogs.Index.index_block(meta, chunk, terms)
-          count + 1
+    count =
+      entries
+      |> Enum.chunk_every(1000)
+      |> Enum.reduce(0, fn chunk, count ->
+        case TimelessLogs.Writer.write_block(chunk, data_dir) do
+          {:ok, meta} ->
+            terms = TimelessLogs.Index.extract_terms(chunk)
+            TimelessLogs.Index.index_block_async(meta, chunk, terms)
+            count + 1
 
-        _ ->
-          count
-      end
-    end)
+          _ ->
+            count
+        end
+      end)
+
+    # Ensure all async blocks are flushed before querying
+    TimelessLogs.Index.sync()
+    count
   end
 
   defp pick_request_id(entries) do

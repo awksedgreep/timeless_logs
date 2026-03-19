@@ -630,20 +630,58 @@ defmodule TimelessLogs.Index do
 
   defp flush_pending(%{pending: pending} = state) do
     resolved = Enum.reverse(pending)
+    created_at = System.system_time(:second)
+
+    # Collect all block params and term params across all pending blocks
+    {block_params_list, term_params_list, data_params_list} =
+      Enum.reduce(resolved, {[], [], []}, fn {meta, _entries, terms}, {bp, tp, dp} ->
+        format = Map.get(meta, :format, :zstd) |> to_string()
+
+        block_row = [
+          meta.block_id,
+          meta[:file_path],
+          meta.byte_size,
+          meta.entry_count,
+          meta.ts_min,
+          meta.ts_max,
+          format,
+          created_at
+        ]
+
+        term_rows = Enum.map(terms, &[&1, meta.block_id])
+
+        data_rows =
+          if state.storage == :memory and meta[:data] do
+            [[meta.block_id, meta[:data]]]
+          else
+            []
+          end
+
+        {[block_row | bp], term_rows ++ tp, data_rows ++ dp}
+      end)
 
     {:ok, _} =
       TimelessLogs.DB.write_transaction(state.db, fn conn ->
-        for {meta, _entries, terms} <- resolved do
-          insert_block_sql(conn, meta)
-          insert_terms_sql(conn, terms, meta.block_id)
+        TimelessLogs.DB.execute_batch(
+          conn,
+          "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          Enum.reverse(block_params_list)
+        )
 
-          if state.storage == :memory and meta[:data] do
-            TimelessLogs.DB.execute(
-              conn,
-              "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
-              [meta.block_id, meta[:data]]
-            )
-          end
+        if term_params_list != [] do
+          TimelessLogs.DB.execute_batch(
+            conn,
+            "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+            term_params_list
+          )
+        end
+
+        if data_params_list != [] do
+          TimelessLogs.DB.execute_batch(
+            conn,
+            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+            data_params_list
+          )
         end
       end)
 
