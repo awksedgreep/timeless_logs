@@ -103,11 +103,103 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Wall time: #{fmt_ms(pipe_us)}")
     IO.puts("  Throughput: #{fmt_number(round(pipe_eps))} entries/sec\n")
 
+    # Phase 4: Full Logger path (Logger.info → Handler → Buffer → Writer → Index)
+    # with stdout/console disabled
+    IO.puts("--- Phase 4: Logger path, no stdout ---")
+    logger_dir = Path.join(data_dir, "logger_bench")
+    File.mkdir_p!(Path.join(logger_dir, "blocks"))
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, logger_dir)
+    Application.ensure_all_started(:timeless_logs)
+
+    # Remove the default console handler so only TimelessLogs receives logs
+    :logger.remove_handler(:default)
+
+    # Pre-generate log arguments (messages + metadata) to exclude string building from timing
+    log_args =
+      Enum.map(1..entry_count, fn i ->
+        msg = "Request #{method()} #{path()} completed in #{:rand.uniform(500)}ms"
+
+        meta = [
+          request_id: random_hex(16),
+          module: Enum.random(~w(Phoenix.Logger Ecto.Adapters.SQL MyApp.UserController)),
+          status: Enum.random([200, 200, 200, 201, 301, 400, 404, 500]),
+          user_id: :rand.uniform(10_000)
+        ]
+
+        {msg, meta}
+      end)
+
+    require Logger
+
+    {logger_us, _} =
+      :timer.tc(fn ->
+        for {msg, meta} <- log_args do
+          Logger.info(msg, meta)
+        end
+
+        TimelessLogs.Buffer.flush()
+        TimelessLogs.Index.sync()
+      end)
+
+    logger_eps = entry_count / (logger_us / 1_000_000)
+    {:ok, logger_stats} = TimelessLogs.Index.stats()
+
+    IO.puts(
+      "  #{logger_stats.total_blocks} blocks, #{fmt_number(logger_stats.total_entries)} entries indexed"
+    )
+
+    IO.puts("  Wall time: #{fmt_ms(logger_us)}")
+    IO.puts("  Throughput: #{fmt_number(round(logger_eps))} entries/sec\n")
+
+    # Phase 5: Same but with stdout re-enabled for comparison
+    IO.puts("--- Phase 5: Logger path, WITH stdout (for comparison) ---")
+    stdout_dir = Path.join(data_dir, "stdout_bench")
+    File.mkdir_p!(Path.join(stdout_dir, "blocks"))
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, stdout_dir)
+    Application.ensure_all_started(:timeless_logs)
+
+    # Re-add default console handler
+    :logger.add_handler(:default, :logger_std_h, %{
+      level: :info,
+      formatter: {:logger_formatter, %{template: [:message, "\n"]}}
+    })
+
+    # Redirect stdout to /dev/null so we measure the IO cost without filling the terminal
+    {:ok, devnull} = File.open("/dev/null", [:write])
+    old_gl = Process.group_leader()
+    Process.group_leader(self(), devnull)
+
+    {stdout_us, _} =
+      :timer.tc(fn ->
+        for {msg, meta} <- log_args do
+          Logger.info(msg, meta)
+        end
+
+        TimelessLogs.Buffer.flush()
+        TimelessLogs.Index.sync()
+      end)
+
+    Process.group_leader(self(), old_gl)
+    File.close(devnull)
+    :logger.remove_handler(:default)
+
+    stdout_eps = entry_count / (stdout_us / 1_000_000)
+
+    IO.puts("  Wall time: #{fmt_ms(stdout_us)}")
+    IO.puts("  Throughput: #{fmt_number(round(stdout_eps))} entries/sec")
+    overhead_pct = (stdout_us - logger_us) / max(logger_us, 1) * 100
+
+    IO.puts("  stdout overhead: #{:erlang.float_to_binary(overhead_pct, decimals: 1)}% slower\n")
+
     # Summary
     IO.puts("=== Summary ===")
-    IO.puts("  Writer only:      #{fmt_number(round(writer_eps))} entries/sec")
-    IO.puts("  Writer + Index:   #{fmt_number(round(idx_eps))} entries/sec")
-    IO.puts("  Full pipeline:    #{fmt_number(round(pipe_eps))} entries/sec")
+    IO.puts("  Writer only:              #{fmt_number(round(writer_eps))} entries/sec")
+    IO.puts("  Writer + Index (sync):    #{fmt_number(round(idx_eps))} entries/sec")
+    IO.puts("  Buffer pipeline:          #{fmt_number(round(pipe_eps))} entries/sec")
+    IO.puts("  Logger (no stdout):       #{fmt_number(round(logger_eps))} entries/sec")
+    IO.puts("  Logger (with stdout):     #{fmt_number(round(stdout_eps))} entries/sec")
 
     Application.stop(:timeless_logs)
     File.rm_rf!(data_dir)
