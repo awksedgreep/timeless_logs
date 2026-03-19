@@ -211,6 +211,24 @@ defmodule TimelessLogs.DB do
     execute_with_retry(conn, sql, params, @max_retries)
   end
 
+  @doc "Prepare once, execute many times with different params. Use inside write_transaction."
+  def execute_batch(conn, sql, params_list) when is_list(params_list) do
+    case Exqlite.Sqlite3.prepare(conn, sql) do
+      {:ok, stmt} ->
+        Enum.each(params_list, fn params ->
+          :ok = Exqlite.Sqlite3.bind(stmt, params)
+          :done = Exqlite.Sqlite3.step(conn, stmt)
+          :ok = Exqlite.Sqlite3.reset(stmt)
+        end)
+
+        Exqlite.Sqlite3.release(conn, stmt)
+        :ok
+
+      {:error, reason} ->
+        raise "SQLite execute_batch failed: #{inspect(reason)} (sql: #{sql})"
+    end
+  end
+
   defp execute_with_retry(conn, sql, params, retries) do
     case Exqlite.Sqlite3.prepare(conn, sql) do
       {:ok, stmt} ->

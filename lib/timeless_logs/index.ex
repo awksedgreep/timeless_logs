@@ -415,14 +415,14 @@ defmodule TimelessLogs.Index do
     )
   end
 
+  defp insert_terms_sql(_conn, [], _block_id), do: :ok
+
   defp insert_terms_sql(conn, terms, block_id) do
-    for term <- terms do
-      TimelessLogs.DB.execute(
-        conn,
-        "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
-        [term, block_id]
-      )
-    end
+    TimelessLogs.DB.execute_batch(
+      conn,
+      "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+      Enum.map(terms, &[&1, block_id])
+    )
   end
 
   defp update_compression_stats_sql(conn, raw_in, compressed_out) do
