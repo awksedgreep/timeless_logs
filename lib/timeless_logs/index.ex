@@ -355,7 +355,7 @@ defmodule TimelessLogs.Index do
 
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
-    TimelessLogs.DB.write(state.db, "PRAGMA wal_checkpoint(PASSIVE)")
+    TimelessLogs.DB.write(state.db, "PRAGMA wal_checkpoint(TRUNCATE)")
     {:reply, :ok, state}
   end
 
@@ -708,14 +708,61 @@ defmodule TimelessLogs.Index do
       acc = MapSet.put(acc, "level:#{entry.level}")
 
       Enum.reduce(entry.metadata, acc, fn {k, v}, inner_acc ->
-        if is_binary(v) or is_atom(v) or is_number(v) do
-          MapSet.put(inner_acc, "#{k}:#{v}")
-        else
-          inner_acc
+        case indexed_metadata_term(k, v) do
+          nil -> inner_acc
+          term -> MapSet.put(inner_acc, term)
         end
       end)
     end)
     |> MapSet.to_list()
+  end
+
+  @indexed_metadata_keys MapSet.new([
+                           "application",
+                           "cache",
+                           "key",
+                           "job",
+                           "method",
+                           "path",
+                           "reason",
+                           "service",
+                           "status",
+                           "table"
+                         ])
+
+  defp indexed_metadata_term(key, value)
+       when (is_binary(value) or is_atom(value)) and is_atom(key) do
+    indexed_metadata_term(Atom.to_string(key), value)
+  end
+
+  defp indexed_metadata_term(key, value)
+       when (is_binary(value) or is_atom(value)) and is_binary(key) do
+    if MapSet.member?(@indexed_metadata_keys, key) and low_cardinality_value?(value) do
+      "#{key}:#{value}"
+    end
+  end
+
+  defp indexed_metadata_term(_key, _value), do: nil
+
+  defp low_cardinality_value?(value) when is_atom(value),
+    do: low_cardinality_value?(Atom.to_string(value))
+
+  defp low_cardinality_value?(value) when is_binary(value) do
+    byte_size(value) <= 64 and
+      not likely_identifier?(value) and
+      not mostly_numeric?(value)
+  end
+
+  defp low_cardinality_value?(_value), do: false
+
+  defp likely_identifier?(value) do
+    (String.contains?(value, ["-", "_"]) and String.length(value) >= 12) or
+      String.match?(value, ~r/\A[0-9a-f]{12,}\z/i)
+  end
+
+  defp mostly_numeric?(value) do
+    digits = String.replace(value, ~r/\D/, "")
+    digits != "" and String.length(digits) >= max(div(String.length(value) * 3, 4), 6)
   end
 
   # --- Querying (with early-exit limit) ---

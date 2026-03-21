@@ -56,6 +56,32 @@ defmodule TimelessLogsTest do
       assert hd(results).metadata["request_id"] == "abc"
     end
 
+    test "extract_terms keeps stable low-cardinality metadata and skips identifier-like values" do
+      entries = [
+        %{
+          timestamp: System.os_time(:microsecond),
+          level: :info,
+          message: "request completed",
+          metadata: %{
+            service: "api",
+            path: "/users",
+            request_id: "9f6e7c19f0a24f91a3c2d4b5e6f70809",
+            duration_ms: 123,
+            webhook_id: "evt_01hxyz8j6m9r4s2t7u0v"
+          }
+        }
+      ]
+
+      terms = TimelessLogs.Index.extract_terms(entries)
+
+      assert "level:info" in terms
+      assert "service:api" in terms
+      assert "path:/users" in terms
+      refute Enum.any?(terms, &String.starts_with?(&1, "request_id:"))
+      refute Enum.any?(terms, &String.starts_with?(&1, "duration_ms:"))
+      refute Enum.any?(terms, &String.starts_with?(&1, "webhook_id:"))
+    end
+
     test "message substring search" do
       Logger.info("user logged in successfully")
       Logger.info("user logged out")
