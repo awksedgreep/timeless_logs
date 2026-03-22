@@ -28,7 +28,7 @@ for i <- 1..100 do
   Logger.log(level, "Request #{i} processed",
     service: service,
     host: host,
-    request_id: "req-#{i}",
+    path: Enum.random(["/health", "/checkout", "/orders"]),
     duration_ms: :rand.uniform(500)
   )
 end
@@ -132,13 +132,17 @@ TimelessLogs installs a Logger handler automatically on startup. Any standard
 ```elixir
 require Logger
 
-Logger.info("Request completed", request_id: "abc123", duration_ms: 42)
+Logger.info("Request completed", service: "payments", path: "/checkout", duration_ms: 42)
 Logger.warning("Slow query detected", query: "SELECT *", duration_ms: 1500)
 Logger.error("Connection timeout", service: "payments", host: "pay-1")
 ```
 
-All metadata key/value pairs are indexed and queryable. There is no need to
-call any TimelessLogs function directly for ingestion — just use `Logger`.
+All metadata is stored with the entry. A curated set of stable low-cardinality
+keys is also indexed for fast filtering, including fields like `service`,
+`path`, `method`, `status`, `table`, `job`, `cache`, `reason`, and `key`.
+Identifier-like values are still present on the entry, but they are not added
+to the inverted term index. There is no need to call any TimelessLogs function
+directly for ingestion — just use `Logger`.
 
 ### Flush the Buffer
 
@@ -169,8 +173,9 @@ Query parameters control which JSON fields map to the message and timestamp:
 | `_msg_field`  | `"_msg"`  | JSON field containing the log message |
 | `_time_field` | `"_time"` | JSON field containing the timestamp   |
 
-All other JSON fields become searchable metadata. Returns `204 No Content` on
-success.
+All other JSON fields become entry metadata. Indexed filtering is intentionally
+selective, but substring search still scans message text and metadata values.
+Returns `204 No Content` on success.
 
 ## Querying Logs (Elixir)
 
@@ -212,7 +217,7 @@ All filters are optional and can be combined:
   until: DateTime.utc_now()
 )
 
-# By metadata key/value
+# By indexed metadata key/value
 {:ok, result} = TimelessLogs.query(metadata: %{"service" => "payments"})
 
 # Combined filters with pagination

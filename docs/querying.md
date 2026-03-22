@@ -24,7 +24,7 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
   timestamp: 1700000000000000,   # microseconds since epoch
   level: :error,                 # :debug | :info | :warning | :error
   message: "Connection timeout",
-  metadata: %{"service" => "api", "request_id" => "abc123"}
+  metadata: %{"service" => "api", "path" => "/checkout"}
 }
 ```
 
@@ -36,7 +36,7 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 | `:message` | string | Case-insensitive substring match on message text and metadata values |
 | `:since` | DateTime or integer | Lower time bound (integers are unix timestamps in microseconds) |
 | `:until` | DateTime or integer | Upper time bound |
-| `:metadata` | map | Exact match on key/value pairs (atom or string keys) |
+| `:metadata` | map | Exact match on indexed key/value pairs (atom or string keys) |
 | `:limit` | integer | Max entries to return (default: 100) |
 | `:offset` | integer | Skip N entries (default: 0) |
 | `:order` | atom | `:desc` (newest first, default) or `:asc` (oldest first) |
@@ -79,11 +79,11 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 ### Metadata filtering
 
 ```elixir
-# Exact metadata match
-{:ok, result} = TimelessLogs.query(metadata: %{request_id: "abc123"})
+# Exact match on indexed metadata
+{:ok, result} = TimelessLogs.query(metadata: %{service: "api"})
 
-# Multiple metadata keys (all must match)
-{:ok, result} = TimelessLogs.query(metadata: %{service: "api", env: "production"})
+# Multiple indexed metadata keys (all must match)
+{:ok, result} = TimelessLogs.query(metadata: %{service: "api", status: 500})
 ```
 
 ### Combined filters
@@ -156,7 +156,9 @@ TimelessLogs.stream(level: :error)
 
 ### Inverted index
 
-When you filter by `:level` or `:metadata`, TimelessLogs uses an inverted term index to skip blocks that can't contain matching entries. For example, querying `level: :error` only decompresses blocks known to contain error-level entries.
+When you filter by `:level` or indexed `:metadata`, TimelessLogs uses an inverted term index to skip blocks that can't contain matching entries. For example, querying `level: :error` only decompresses blocks known to contain error-level entries.
+
+Indexed metadata is intentionally selective. TimelessLogs indexes level terms plus a small allowlist of stable low-cardinality metadata keys such as `service`, `path`, `method`, `status`, `table`, `job`, `cache`, `reason`, and `key`. Identifier-like values such as `request_id` are still stored with each entry, but they are not added to the inverted term index.
 
 ### Time range pruning
 
@@ -172,7 +174,7 @@ Benchmarked with 1.1M indexed entries:
 
 | Query | Median latency |
 |-------|---------------|
-| Specific metadata key (`request_id: "abc123"`) | 0.6ms |
+| Specific indexed metadata key (`service: "api"`) | 0.6ms |
 | Last 1h + level=error | 2.4ms |
 | Last 1 hour (all levels) | 4.4ms |
 | level=error (all time) | 226ms |
@@ -180,4 +182,4 @@ Benchmarked with 1.1M indexed entries:
 | Last 24 hours | 244ms |
 | Full scan (no filters) | 1.4s |
 
-Queries using the term index (level or metadata filters) are significantly faster than message substring searches, which must scan entry contents.
+Queries using the term index (level or indexed metadata filters) are significantly faster than message substring searches, which must scan entry contents.

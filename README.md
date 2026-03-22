@@ -20,7 +20,7 @@
 
 Embedded log compression and indexing for Elixir applications. Add one dependency, configure a data directory, and your app gets compressed, searchable logs with zero external infrastructure.
 
-Logs are written to raw blocks, automatically compacted with OpenZL (~12.8x compression ratio), and indexed in SQLite for crash-safe persistence. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
+Logs are written to raw blocks, automatically compacted with OpenZL (~12.8x compression ratio), and indexed in SQLite for crash-safe persistence. The index keeps level terms plus a curated set of low-cardinality metadata terms, while message substring search still scans message text and metadata values inside matching blocks. Includes optional real-time subscriptions and a VictoriaLogs-compatible HTTP API.
 
 ## Documentation
 
@@ -60,8 +60,8 @@ That's it. TimelessLogs installs itself as a `:logger` handler on application st
 # Recent errors
 TimelessLogs.query(level: :error, since: DateTime.add(DateTime.utc_now(), -3600))
 
-# Search by metadata
-TimelessLogs.query(level: :info, metadata: %{request_id: "abc123"})
+# Search by indexed metadata
+TimelessLogs.query(level: :info, metadata: %{service: "payments"})
 
 # Substring match on message
 TimelessLogs.query(message: "timeout")
@@ -89,7 +89,7 @@ Returns a `TimelessLogs.Result` struct:
 | `:message` | string | Case-insensitive substring match on message and metadata values |
 | `:since` | DateTime or integer | Lower time bound (integers are unix timestamps) |
 | `:until` | DateTime or integer | Upper time bound |
-| `:metadata` | map | Exact match on key/value pairs |
+| `:metadata` | map | Exact match on indexed key/value pairs |
 | `:limit` | integer | Max entries to return (default 100) |
 | `:offset` | integer | Skip N entries (default 0) |
 | `:order` | atom | `:asc` (oldest first) or `:desc` (newest first, default) |
@@ -357,7 +357,7 @@ Run on a 28-core laptop. Reproduce with `mix timeless_logs.ingest_benchmark`, `m
 | Writer + Index (ETS immediate + disk log persist) | ~191K entries/sec |
 | Full pipeline (Buffer → Writer → async Index) | ~129K entries/sec |
 
-The ETS-first indexing architecture makes index overhead negligible — less than 2% throughput reduction vs. writer-only.
+The ETS-first indexing architecture keeps index overhead negligible while staying selective about metadata indexing. Only level terms and a small allowlist of stable low-cardinality metadata keys are added to the inverted index, which keeps disk usage under control without affecting substring search.
 
 On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
 
@@ -393,7 +393,7 @@ OpenZL decompresses 44% faster than zstd, which directly benefits query performa
 
 | Query | Median |
 |-------|--------|
-| Specific request_id | 845us |
+| Specific indexed metadata key | 845us |
 | Last 1h + level=error | 3.4ms |
 | Last 1 hour (all levels) | 3.9ms |
 | level=error + metadata intersection | 162ms |

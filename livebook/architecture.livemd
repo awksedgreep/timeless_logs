@@ -135,8 +135,12 @@ flowchart LR
 Terms are stored as `"key:value"` strings for inverted-index lookup:
 
 * `"level:error"` — level-based filtering
-* `"request_id:abc123"` — metadata key/value pair
-* `"service:api"` — any metadata field
+* `"service:api"` — indexed low-cardinality metadata
+* `"path:/checkout"` — indexed low-cardinality metadata
+
+Only a curated set of stable low-cardinality metadata keys is indexed. Full
+metadata is still stored with every log entry, and substring search still scans
+message text plus metadata values at query time.
 
 ## Query Path
 
@@ -168,7 +172,7 @@ sequenceDiagram
 
 | Query Pattern           | Latency (1.1M entries) |
 | ----------------------- | ---------------------- |
-| Specific metadata key   | 845us                  |
+| Specific indexed metadata key | 845us            |
 | Last 1h + level filter  | 3.4ms                  |
 | Last 1 hour, all levels | 3.9ms                  |
 | Level filter, all time  | 215ms                  |

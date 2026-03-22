@@ -34,7 +34,7 @@ TimelessLogs installs itself as an OTP `:logger` handler on application start. A
 ## Write path
 
 ```
-Logger.info("Request completed", request_id: "abc123")
+Logger.info("Request completed", service: "payments", path: "/checkout")
   │
   ▼
 TimelessLogs.Handler.log/2
@@ -137,9 +137,11 @@ On startup: load snapshot → replay log entries newer than the snapshot → ind
 The term index enables fast filtering without decompressing blocks. Each block's entries contribute terms of the form:
 
 - Level terms: `"level:error"`, `"level:info"`, etc.
-- Metadata terms: `"request_id:abc123"`, `"service:api"`, etc.
+- Indexed metadata terms: `"service:api"`, `"path:/checkout"`, `"status:500"`, etc.
 
-When querying with `:level` or `:metadata` filters, the index intersects the matching block ID sets, then only decompresses those blocks.
+Metadata indexing is intentionally selective. TimelessLogs stores full metadata on every entry, but it only adds a small allowlist of stable low-cardinality keys to the inverted index. Identifier-like values such as `request_id` stay queryable through message/content scans, but they do not inflate the term index.
+
+When querying with `:level` or indexed `:metadata` filters, the index intersects the matching block ID sets, then only decompresses those blocks.
 
 ## Compaction pipeline
 

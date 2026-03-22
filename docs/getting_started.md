@@ -40,11 +40,11 @@ Since TimelessLogs integrates with Elixir's Logger, just log normally:
 require Logger
 
 Logger.info("Application started")
-Logger.error("Connection timeout", service: "api", request_id: "abc123")
+Logger.error("Connection timeout", service: "api", path: "/checkout")
 Logger.warning("Memory usage high", host: "web-1", usage_pct: 92)
 ```
 
-Metadata key/value pairs are automatically captured and indexed for fast querying.
+Metadata key/value pairs are always captured with the entry. A small set of stable, low-cardinality keys is also indexed for fast querying, such as `service`, `path`, `method`, `status`, `table`, `job`, `cache`, `reason`, and `key`.
 
 ### Via HTTP
 
@@ -76,8 +76,8 @@ curl -X POST http://localhost:9428/insert/jsonline -d \
   level: :error,
   since: DateTime.add(DateTime.utc_now(), -3600))
 
-# Search by metadata
-{:ok, result} = TimelessLogs.query(metadata: %{request_id: "abc123"})
+# Search by indexed metadata
+{:ok, result} = TimelessLogs.query(metadata: %{service: "api"})
 
 # Substring search on messages
 {:ok, result} = TimelessLogs.query(message: "timeout")
@@ -98,7 +98,7 @@ Each entry in the result is a `TimelessLogs.Entry` struct:
   timestamp: 1700000000000000,  # microseconds
   level: :error,
   message: "Connection timeout",
-  metadata: %{"service" => "api", "request_id" => "abc123"}
+  metadata: %{"service" => "api", "path" => "/checkout"}
 }
 ```
 
