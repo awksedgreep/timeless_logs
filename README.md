@@ -347,61 +347,38 @@ TimelessLogs emits telemetry events for monitoring:
 
 ## Benchmarks
 
-Run on a 28-core laptop. Reproduce with `mix timeless_logs.ingest_benchmark`, `mix timeless_logs.benchmark`, and `mix timeless_logs.search_benchmark`.
+Run on M5 Pro (18 cores). Reproduce with `mix timeless_logs.ingest_benchmark`, `mix timeless_logs.benchmark`, and `mix timeless_logs.search_benchmark`.
 
-**Ingestion throughput** (500K entries, 1000 entries/block):
+**Ingestion** (1.1M simulated Phoenix log entries, 1 week, 1000-entry blocks):
 
-| Phase | Throughput |
-|---|---|
-| Writer only (serialization + disk I/O) | ~193K entries/sec |
-| Writer + Index (ETS immediate + disk log persist) | ~191K entries/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~129K entries/sec |
+| Path | Throughput |
+|------|------------|
+| Raw to disk | **1.1M entries/sec** |
+| Raw to memory | **4.0M entries/sec** |
 
-The ETS-first indexing architecture keeps index overhead negligible while staying selective about metadata indexing. Only level terms and a small allowlist of stable low-cardinality metadata keys are added to the inverted index, which keeps disk usage under control without affecting substring search.
+**Compression** (1.1M entries, 1000-entry blocks):
 
-On a simulated week of Phoenix logs (~1.1M entries, ~30 req/min):
+| Engine | Level | Size | Ratio | Throughput |
+|--------|-------|------|-------|------------|
+| zstd | 1 | 23.9 MB | 10.3x | 3.6M entries/sec |
+| zstd | 3 (default) | 24.7 MB | 10.0x | 6.3M entries/sec |
+| zstd | 9 | 21.7 MB | 11.4x | 941K entries/sec |
+| OpenZL | 1 | 22.0 MB | 11.2x | 978K entries/sec |
+| OpenZL | 3 | 21.8 MB | 11.3x | 2.0M entries/sec |
+| OpenZL | 9 (default) | 19.2 MB | **12.8x** | 793K entries/sec |
+| OpenZL | 19 | 17.1 MB | **14.4x** | 21.1K entries/sec |
 
-**Compression — zstd** (level 5, 1.1M simulated Phoenix log entries):
+**Head-to-head** (default levels: zstd=3, OpenZL=9):
 
-| Metric | Value |
-|--------|-------|
-| Compression ratio | 11.1x |
-| Raw size | 246 MB |
-| Compressed size | 22 MB |
-| Compression throughput | 1.2M entries/sec |
+| Metric | zstd | OpenZL | Delta |
+|--------|------|--------|-------|
+| Compressed size | 24.7 MB | **19.2 MB** | 22.2% smaller |
+| Compression time | **178 ms** | 1392 ms | 681.7% slower |
+| Decompression | 3.1M entries/sec | **3.6M entries/sec** | 12.4% faster |
+| Filtered query | 2864 ms | **379 ms** | 86.8% faster |
+| Compaction | **3.4M entries/sec** | 2.6M entries/sec | 31.0% slower |
 
-**Columnar+OpenZL** (per-column compression with reusable contexts):
-
-| Level | Ratio | Throughput |
-|-------|-------|-----------|
-| 1 | 11.2x | 706K entries/sec |
-| 3 | 11.3x | 2.1M entries/sec |
-| 5 | 11.6x | 1.2M entries/sec |
-| 9 | 12.8x | 702K entries/sec |
-| 19 | 14.4x | 17.5K entries/sec |
-
-**Decompression speed** (1.1M entries, 1128 blocks):
-
-| Format | Throughput |
-|--------|-----------|
-| zstd | 2.4M entries/sec |
-| OpenZL | 4.3M entries/sec |
-
-OpenZL decompresses 44% faster than zstd, which directly benefits query performance.
-
-**Query latency** (1.1M entries indexed, 5 iterations, median):
-
-| Query | Median |
-|-------|--------|
-| Specific indexed metadata key | 845us |
-| Last 1h + level=error | 3.4ms |
-| Last 1 hour (all levels) | 3.9ms |
-| level=error + metadata intersection | 162ms |
-| level=error (all time) | 215ms |
-| Message substring search | 238ms |
-| Last 24 hours | 157ms |
-| All logs, page 1 (no filters) | 2.6s |
-| All logs, page 50 (deep pagination) | 863ms |
+OpenZL columnar wins on filtered queries (86.8% faster) because it can skip irrelevant columns during decompression. Decompression (the read hot path) is 12.4% faster than zstd.
 
 ## License
 
