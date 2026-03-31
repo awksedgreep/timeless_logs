@@ -64,6 +64,16 @@ defmodule TimelessLogs do
   end
 
   @doc """
+  Ingest multiple log entries in one call.
+
+  This is the lower-overhead path for batch producers such as NDJSON imports.
+  """
+  @spec ingest([map()]) :: :ok
+  def ingest(entries) when is_list(entries) do
+    TimelessLogs.Buffer.log_many(entries)
+  end
+
+  @doc """
   Collect distinct values and hit counts for a given field.
 
   Handles built-in fields (`"_msg"`, `"_time"`, `"level"`) and metadata fields.

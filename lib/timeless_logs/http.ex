@@ -324,18 +324,19 @@ defmodule TimelessLogs.HTTP do
   # --- Internals ---
 
   defp ingest_ndjson(body, msg_field, time_field) do
-    body
-    |> String.split("\n", trim: true)
-    |> Enum.reduce({0, 0}, fn line, {count, errors} ->
-      case parse_log_line(line, msg_field, time_field) do
-        {:ok, entry} ->
-          TimelessLogs.Buffer.log(entry)
-          {count + 1, errors}
+    {entries, errors} =
+      body
+      |> String.split("\n", trim: true)
+      |> Enum.reduce({[], 0}, fn line, {entries, errors} ->
+        case parse_log_line(line, msg_field, time_field) do
+          {:ok, entry} -> {[entry | entries], errors}
+          :error -> {entries, errors + 1}
+        end
+      end)
 
-        :error ->
-          {count, errors + 1}
-      end
-    end)
+    entries = Enum.reverse(entries)
+    TimelessLogs.ingest(entries)
+    {length(entries), errors}
   end
 
   defp parse_log_line(line, msg_field, time_field) do

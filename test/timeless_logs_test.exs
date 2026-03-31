@@ -171,6 +171,21 @@ defmodule TimelessLogsTest do
       assert hd(results).message =~ "syslog"
     end
 
+    test "ingest/1 accepts batched entries" do
+      now = System.system_time(:second)
+
+      entries = [
+        %{timestamp: now, level: :info, message: "one", metadata: %{"service" => "api"}},
+        %{timestamp: now + 1, level: :error, message: "two", metadata: %{"service" => "api"}}
+      ]
+
+      assert :ok = TimelessLogs.ingest(entries)
+      TimelessLogs.flush()
+
+      assert {:ok, %TimelessLogs.Result{total: 2}} = TimelessLogs.query([])
+      assert {:ok, %TimelessLogs.Result{total: 1}} = TimelessLogs.query(level: :error)
+    end
+
     test "ordering asc and desc" do
       Logger.info("first")
       Process.sleep(1100)
