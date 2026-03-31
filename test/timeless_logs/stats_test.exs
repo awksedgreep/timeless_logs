@@ -14,6 +14,7 @@ defmodule TimelessLogs.StatsTest do
     Application.put_env(:timeless_logs, :retention_max_age, nil)
     Application.put_env(:timeless_logs, :retention_max_size, nil)
     Application.put_env(:timeless_logs, :compaction_interval, 600_000)
+    Application.put_env(:timeless_logs, :ingest_shard_count, 1)
     Application.delete_env(:timeless_logs, :compaction_format)
     Application.ensure_all_started(:timeless_logs)
 
@@ -21,6 +22,7 @@ defmodule TimelessLogs.StatsTest do
       Application.stop(:timeless_logs)
       Application.delete_env(:timeless_logs, :compaction_interval)
       Application.delete_env(:timeless_logs, :compaction_format)
+      Application.delete_env(:timeless_logs, :ingest_shard_count)
       File.rm_rf!(@data_dir)
     end)
 
