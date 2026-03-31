@@ -2,7 +2,7 @@ defmodule TimelessLogs.BufferShard do
   @moduledoc false
 
   def count do
-    System.schedulers_online()
+    TimelessLogs.Config.ingest_shard_count()
   end
 
   def via(entry) do

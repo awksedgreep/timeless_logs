@@ -101,4 +101,9 @@ defmodule TimelessLogs.Config do
   def max_term_index_entries do
     Application.get_env(:timeless_logs, :max_term_index_entries, 500_000)
   end
+
+  @spec ingest_shard_count() :: pos_integer()
+  def ingest_shard_count do
+    Application.get_env(:timeless_logs, :ingest_shard_count, 4)
+  end
 end

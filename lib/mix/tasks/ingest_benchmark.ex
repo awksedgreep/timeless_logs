@@ -4,16 +4,15 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
 
   @shortdoc "Benchmark log ingestion throughput (Buffer → Writer → Index)"
 
+  @shard_scenarios [1, 2, 4, 8]
+
   @impl true
   def run(_args) do
     data_dir = "ingest_bench_#{System.unique_integer([:positive])}"
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    Application.put_env(:timeless_logs, :data_dir, data_dir)
-    Application.put_env(:timeless_logs, :storage, :disk)
-    # Disable compaction during benchmark
-    Application.put_env(:timeless_logs, :compaction_interval, 600_000)
+    configure_app(data_dir)
     Mix.Task.run("app.start")
 
     IO.puts("=== TimelessLogs Ingestion Benchmark ===\n")
@@ -79,10 +78,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     # Phase 3: Full pipeline (Buffer.log → flush → Writer → async Index)
     IO.puts("--- Phase 3: Full pipeline (Buffer.log → Writer → Index) ---")
     pipe_dir = Path.join(data_dir, "pipe_bench")
-    File.mkdir_p!(Path.join(pipe_dir, "blocks"))
-    Application.stop(:timeless_logs)
-    Application.put_env(:timeless_logs, :data_dir, pipe_dir)
-    Application.ensure_all_started(:timeless_logs)
+    restart_logs(pipe_dir)
 
     {pipe_us, _} =
       :timer.tc(fn ->
@@ -105,10 +101,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
 
     IO.puts("--- Phase 3b: Batch API (TimelessLogs.ingest/1 → Writer → Index) ---")
     batch_dir = Path.join(data_dir, "batch_bench")
-    File.mkdir_p!(Path.join(batch_dir, "blocks"))
-    Application.stop(:timeless_logs)
-    Application.put_env(:timeless_logs, :data_dir, batch_dir)
-    Application.ensure_all_started(:timeless_logs)
+    restart_logs(batch_dir)
 
     {batch_us, _} =
       :timer.tc(fn ->
@@ -130,14 +123,44 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Wall time: #{fmt_ms(batch_us)}")
     IO.puts("  Throughput: #{fmt_number(round(batch_eps))} entries/sec\n")
 
+    IO.puts("--- Phase 3c: Batch API by shard count ---")
+
+    shard_results =
+      Enum.map(@shard_scenarios, fn shard_count ->
+        shard_dir = Path.join(data_dir, "batch_shards_#{shard_count}")
+        restart_logs(shard_dir, ingest_shard_count: shard_count)
+
+        {us, _} =
+          :timer.tc(fn ->
+            entries
+            |> Enum.chunk_every(1000)
+            |> Enum.each(&TimelessLogs.ingest/1)
+
+            TimelessLogs.Buffer.flush()
+            TimelessLogs.Index.sync()
+          end)
+
+        eps = entry_count / (us / 1_000_000)
+        {:ok, shard_stats} = TimelessLogs.Index.stats()
+
+        {shard_count, us, eps, shard_stats.total_entries}
+      end)
+
+    Enum.each(shard_results, fn {shard_count, us, eps, total_entries} ->
+      IO.puts(
+        "  shards=#{String.pad_leading(Integer.to_string(shard_count), 2)}  " <>
+          "#{fmt_ms(us)}  #{fmt_number(round(eps))} entries/sec  " <>
+          "#{fmt_number(total_entries)} indexed"
+      )
+    end)
+
+    IO.puts("")
+
     # Phase 4: Full Logger path (Logger.info → Handler → Buffer → Writer → Index)
     # with stdout/console disabled
     IO.puts("--- Phase 4: Logger path, no stdout ---")
     logger_dir = Path.join(data_dir, "logger_bench")
-    File.mkdir_p!(Path.join(logger_dir, "blocks"))
-    Application.stop(:timeless_logs)
-    Application.put_env(:timeless_logs, :data_dir, logger_dir)
-    Application.ensure_all_started(:timeless_logs)
+    restart_logs(logger_dir)
 
     # Remove the default console handler so only TimelessLogs receives logs
     :logger.remove_handler(:default)
@@ -182,10 +205,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     # Phase 5: Same but with stdout re-enabled for comparison
     IO.puts("--- Phase 5: Logger path, WITH stdout (for comparison) ---")
     stdout_dir = Path.join(data_dir, "stdout_bench")
-    File.mkdir_p!(Path.join(stdout_dir, "blocks"))
-    Application.stop(:timeless_logs)
-    Application.put_env(:timeless_logs, :data_dir, stdout_dir)
-    Application.ensure_all_started(:timeless_logs)
+    restart_logs(stdout_dir)
 
     # Re-add default console handler
     :logger.add_handler(:default, :logger_std_h, %{
@@ -231,6 +251,23 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
 
     Application.stop(:timeless_logs)
     File.rm_rf!(data_dir)
+  end
+
+  defp configure_app(data_dir, overrides \\ []) do
+    File.mkdir_p!(Path.join(data_dir, "blocks"))
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
+    Application.put_env(:timeless_logs, :storage, :disk)
+    Application.put_env(:timeless_logs, :compaction_interval, 600_000)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:timeless_logs, key, value)
+    end)
+  end
+
+  defp restart_logs(data_dir, overrides \\ []) do
+    Application.stop(:timeless_logs)
+    configure_app(data_dir, overrides)
+    Application.ensure_all_started(:timeless_logs)
   end
 
   defp generate_entries(count) do
