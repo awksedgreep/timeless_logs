@@ -123,6 +123,45 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Wall time: #{fmt_ms(batch_us)}")
     IO.puts("  Throughput: #{fmt_number(round(batch_eps))} entries/sec\n")
 
+    IO.puts("--- Phase 3d: Handler path (prebuilt logger events) ---")
+    handler_dir = Path.join(data_dir, "handler_bench")
+    restart_logs(handler_dir)
+
+    handler_events =
+      Enum.map(1..entry_count, fn _i ->
+        %{
+          level: Enum.random([:info, :info, :info, :debug, :debug, :warning, :error]),
+          msg: {:string, "Request #{method()} #{path()} completed in #{:rand.uniform(500)}ms"},
+          meta: %{
+            time: System.system_time(:microsecond),
+            request_id: random_hex(16),
+            module: Enum.random(~w(Phoenix.Logger Ecto.Adapters.SQL MyApp.UserController)),
+            status: Enum.random([200, 200, 200, 201, 301, 400, 404, 500]),
+            user_id: :rand.uniform(10_000)
+          }
+        }
+      end)
+
+    {handler_us, _} =
+      :timer.tc(fn ->
+        for event <- handler_events do
+          TimelessLogs.Handler.log(event, %{})
+        end
+
+        TimelessLogs.Buffer.flush()
+        TimelessLogs.Index.sync()
+      end)
+
+    handler_eps = entry_count / (handler_us / 1_000_000)
+    {:ok, handler_stats} = TimelessLogs.Index.stats()
+
+    IO.puts(
+      "  #{handler_stats.total_blocks} blocks, #{fmt_number(handler_stats.total_entries)} entries indexed"
+    )
+
+    IO.puts("  Wall time: #{fmt_ms(handler_us)}")
+    IO.puts("  Throughput: #{fmt_number(round(handler_eps))} entries/sec\n")
+
     IO.puts("--- Phase 3c: Batch API by shard count ---")
 
     shard_results =
@@ -246,6 +285,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Writer + Index (sync):    #{fmt_number(round(idx_eps))} entries/sec")
     IO.puts("  Buffer pipeline:          #{fmt_number(round(pipe_eps))} entries/sec")
     IO.puts("  Batch ingest API:         #{fmt_number(round(batch_eps))} entries/sec")
+    IO.puts("  Handler path:             #{fmt_number(round(handler_eps))} entries/sec")
     IO.puts("  Logger (no stdout):       #{fmt_number(round(logger_eps))} entries/sec")
     IO.puts("  Logger (with stdout):     #{fmt_number(round(stdout_eps))} entries/sec")
 
