@@ -32,7 +32,7 @@ defmodule TimelessLogs.Buffer do
     entries
     |> Enum.group_by(&TimelessLogs.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_entries} ->
-      GenServer.cast({:global, {:timeless_logs_buffer, shard}}, {:log_many, shard_entries})
+      GenServer.cast(TimelessLogs.BufferShard.name(shard), {:log_many, shard_entries})
     end)
 
     :ok
@@ -42,7 +42,7 @@ defmodule TimelessLogs.Buffer do
   def flush do
     for shard <- 0..(TimelessLogs.BufferShard.count() - 1) do
       GenServer.call(
-        {:global, {:timeless_logs_buffer, shard}},
+        TimelessLogs.BufferShard.name(shard),
         :flush,
         TimelessLogs.Config.query_timeout()
       )

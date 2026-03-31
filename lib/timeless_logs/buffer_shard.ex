@@ -6,8 +6,11 @@ defmodule TimelessLogs.BufferShard do
   end
 
   def via(entry) do
-    shard = shard_for(entry)
-    {:global, {:timeless_logs_buffer, shard}}
+    entry |> shard_for() |> name()
+  end
+
+  def name(shard) when is_integer(shard) do
+    String.to_atom("timeless_logs_buffer_#{shard}")
   end
 
   def shard_for(entry) do

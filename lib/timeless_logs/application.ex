@@ -39,7 +39,7 @@ defmodule TimelessLogs.Application do
     for shard <- 0..(TimelessLogs.BufferShard.count() - 1) do
       Supervisor.child_spec(
         {TimelessLogs.Buffer,
-         data_dir: data_dir, shard: shard, name: {:global, {:timeless_logs_buffer, shard}}},
+         data_dir: data_dir, shard: shard, name: TimelessLogs.BufferShard.name(shard)},
         id: {:timeless_logs_buffer, shard}
       )
     end
