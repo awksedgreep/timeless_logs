@@ -19,10 +19,9 @@ defmodule TimelessLogs.Application do
         {TimelessLogs.DB, name: TimelessLogs.DB, data_dir: data_dir, clean: storage == :memory},
         {TimelessLogs.Index, data_dir: data_dir, storage: storage, db: TimelessLogs.DB},
         {Task.Supervisor, name: TimelessLogs.FlushSupervisor},
-        {TimelessLogs.Buffer, data_dir: data_dir},
         {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
         {TimelessLogs.Retention, []}
-      ] ++ http_child()
+      ] ++ buffer_shards(data_dir) ++ http_child()
 
     opts = [strategy: :one_for_one, name: TimelessLogs.Supervisor]
     Supervisor.start_link(children, opts)
@@ -33,6 +32,16 @@ defmodule TimelessLogs.Application do
       false -> []
       true -> [{TimelessLogs.HTTP, []}]
       opts when is_list(opts) -> [{TimelessLogs.HTTP, opts}]
+    end
+  end
+
+  defp buffer_shards(data_dir) do
+    for shard <- 0..(TimelessLogs.BufferShard.count() - 1) do
+      Supervisor.child_spec(
+        {TimelessLogs.Buffer,
+         data_dir: data_dir, shard: shard, name: {:global, {:timeless_logs_buffer, shard}}},
+        id: {:timeless_logs_buffer, shard}
+      )
     end
   end
 end

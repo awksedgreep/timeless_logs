@@ -18,40 +18,56 @@ defmodule TimelessLogs.Buffer do
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @spec log(map()) :: :ok
   def log(entry) do
-    GenServer.cast(__MODULE__, {:log, entry})
+    GenServer.cast(TimelessLogs.BufferShard.via(entry), {:log, entry})
   end
 
   @spec log_many([map()]) :: :ok
   def log_many(entries) when is_list(entries) do
-    case entries do
-      [] -> :ok
-      _ -> GenServer.cast(__MODULE__, {:log_many, entries})
-    end
+    entries
+    |> Enum.group_by(&TimelessLogs.BufferShard.shard_for/1)
+    |> Enum.each(fn {shard, shard_entries} ->
+      GenServer.cast({:global, {:timeless_logs_buffer, shard}}, {:log_many, shard_entries})
+    end)
+
+    :ok
   end
 
   @spec flush() :: :ok
   def flush do
-    GenServer.call(__MODULE__, :flush, TimelessLogs.Config.query_timeout())
+    for shard <- 0..(TimelessLogs.BufferShard.count() - 1) do
+      GenServer.call(
+        {:global, {:timeless_logs_buffer, shard}},
+        :flush,
+        TimelessLogs.Config.query_timeout()
+      )
+    end
+
+    :ok
   end
 
   @impl true
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
+    shard = Keyword.fetch!(opts, :shard)
     interval = TimelessLogs.Config.flush_interval()
     schedule_flush(interval)
 
-    :logger.add_handler(TimelessLogs.Handler.handler_id(), TimelessLogs.Handler, %{level: :all})
+    if shard == 0 do
+      :logger.add_handler(TimelessLogs.Handler.handler_id(), TimelessLogs.Handler, %{level: :all})
+    end
 
     {:ok,
      %{
        buffer: [],
        buffer_size: 0,
        data_dir: data_dir,
+       shard: shard,
        flush_interval: interval,
        in_flight: 0,
        pending_batches: :queue.new(),
@@ -61,7 +77,10 @@ defmodule TimelessLogs.Buffer do
 
   @impl true
   def terminate(_reason, state) do
-    :logger.remove_handler(TimelessLogs.Handler.handler_id())
+    if state.shard == 0 do
+      :logger.remove_handler(TimelessLogs.Handler.handler_id())
+    end
+
     do_flush(state.buffer, state.data_dir, sync: true)
     :ok
   end
