@@ -103,6 +103,33 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Wall time: #{fmt_ms(pipe_us)}")
     IO.puts("  Throughput: #{fmt_number(round(pipe_eps))} entries/sec\n")
 
+    IO.puts("--- Phase 3b: Batch API (TimelessLogs.ingest/1 → Writer → Index) ---")
+    batch_dir = Path.join(data_dir, "batch_bench")
+    File.mkdir_p!(Path.join(batch_dir, "blocks"))
+    Application.stop(:timeless_logs)
+    Application.put_env(:timeless_logs, :data_dir, batch_dir)
+    Application.ensure_all_started(:timeless_logs)
+
+    {batch_us, _} =
+      :timer.tc(fn ->
+        entries
+        |> Enum.chunk_every(1000)
+        |> Enum.each(&TimelessLogs.ingest/1)
+
+        TimelessLogs.Buffer.flush()
+        TimelessLogs.Index.sync()
+      end)
+
+    batch_eps = entry_count / (batch_us / 1_000_000)
+    {:ok, batch_stats} = TimelessLogs.Index.stats()
+
+    IO.puts(
+      "  #{batch_stats.total_blocks} blocks, #{fmt_number(batch_stats.total_entries)} entries indexed"
+    )
+
+    IO.puts("  Wall time: #{fmt_ms(batch_us)}")
+    IO.puts("  Throughput: #{fmt_number(round(batch_eps))} entries/sec\n")
+
     # Phase 4: Full Logger path (Logger.info → Handler → Buffer → Writer → Index)
     # with stdout/console disabled
     IO.puts("--- Phase 4: Logger path, no stdout ---")
@@ -198,6 +225,7 @@ defmodule Mix.Tasks.TimelessLogs.IngestBenchmark do
     IO.puts("  Writer only:              #{fmt_number(round(writer_eps))} entries/sec")
     IO.puts("  Writer + Index (sync):    #{fmt_number(round(idx_eps))} entries/sec")
     IO.puts("  Buffer pipeline:          #{fmt_number(round(pipe_eps))} entries/sec")
+    IO.puts("  Batch ingest API:         #{fmt_number(round(batch_eps))} entries/sec")
     IO.puts("  Logger (no stdout):       #{fmt_number(round(logger_eps))} entries/sec")
     IO.puts("  Logger (with stdout):     #{fmt_number(round(stdout_eps))} entries/sec")
 

@@ -17,6 +17,14 @@ defmodule TimelessLogs.Buffer do
     GenServer.cast(__MODULE__, {:log, entry})
   end
 
+  @spec log_many([map()]) :: :ok
+  def log_many(entries) when is_list(entries) do
+    case entries do
+      [] -> :ok
+      _ -> GenServer.cast(__MODULE__, {:log_many, entries})
+    end
+  end
+
   @spec flush() :: :ok
   def flush do
     GenServer.call(__MODULE__, :flush, TimelessLogs.Config.query_timeout())
@@ -52,6 +60,19 @@ defmodule TimelessLogs.Buffer do
     broadcast_to_subscribers(entry)
     buffer = [entry | state.buffer]
     size = state.buffer_size + 1
+
+    if size >= TimelessLogs.Config.max_buffer_size() do
+      state = do_flush_async(buffer, state)
+      {:noreply, %{state | buffer: [], buffer_size: 0}}
+    else
+      {:noreply, %{state | buffer: buffer, buffer_size: size}}
+    end
+  end
+
+  def handle_cast({:log_many, entries}, state) do
+    Enum.each(entries, &broadcast_to_subscribers/1)
+    buffer = Enum.reverse(entries, state.buffer)
+    size = state.buffer_size + length(entries)
 
     if size >= TimelessLogs.Config.max_buffer_size() do
       state = do_flush_async(buffer, state)
