@@ -80,7 +80,7 @@ defmodule TimelessLogs.TelemetryTest do
 
       assert_receive {[:timeless_logs, :block, :error], ^ref, _measurements, metadata}
       assert metadata.reason == :corrupt_block
-      assert metadata.file_path == block_file
+      assert metadata.file_path == Path.expand(block_file)
     end
   end
 end

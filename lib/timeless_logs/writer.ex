@@ -87,7 +87,7 @@ defmodule TimelessLogs.Writer do
 
     block_id = System.unique_integer([:positive, :monotonic])
     filename = "#{String.pad_leading(Integer.to_string(block_id), 12, "0")}.#{ext}"
-    file_path = Path.join([data_dir, "blocks", filename])
+    file_path = Path.expand(Path.join([data_dir, "blocks", filename]))
 
     case File.write(file_path, data) do
       :ok ->

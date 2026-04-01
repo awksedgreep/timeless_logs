@@ -29,9 +29,6 @@ defmodule TimelessLogs.Config do
   # 7 days in seconds
   @default_retention_max_age 7 * 86_400
 
-  # 256 MB
-  @default_retention_max_size 256 * 1_048_576
-
   @spec retention_max_age() :: pos_integer() | nil
   def retention_max_age do
     Application.get_env(:timeless_logs, :retention_max_age, @default_retention_max_age)
@@ -39,7 +36,7 @@ defmodule TimelessLogs.Config do
 
   @spec retention_max_size() :: pos_integer() | nil
   def retention_max_size do
-    Application.get_env(:timeless_logs, :retention_max_size, @default_retention_max_size)
+    Application.get_env(:timeless_logs, :retention_max_size, nil)
   end
 
   @spec retention_check_interval() :: pos_integer()
@@ -99,7 +96,7 @@ defmodule TimelessLogs.Config do
 
   @spec max_term_index_entries() :: pos_integer() | nil
   def max_term_index_entries do
-    Application.get_env(:timeless_logs, :max_term_index_entries, 500_000)
+    Application.get_env(:timeless_logs, :max_term_index_entries, nil)
   end
 
   @spec ingest_shard_count() :: pos_integer()
