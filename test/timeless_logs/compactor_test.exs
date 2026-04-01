@@ -32,17 +32,22 @@ defmodule TimelessLogs.CompactorTest do
     :ok
   end
 
+  defp flush_and_sync do
+    TimelessLogs.flush()
+    TimelessLogs.Index.sync()
+  end
+
   describe "compact_now/0" do
     test "compacts multiple raw blocks into openzl blocks (default format)" do
       # Create 3 separate raw blocks
       Logger.info("block one entry")
-      TimelessLogs.flush()
+      flush_and_sync()
 
       Logger.info("block two entry")
-      TimelessLogs.flush()
+      flush_and_sync()
 
       Logger.info("block three entry")
-      TimelessLogs.flush()
+      flush_and_sync()
 
       blocks_dir = Path.join(@data_dir, "blocks")
       raw_before = Path.wildcard(Path.join(blocks_dir, "*.raw"))
@@ -64,14 +69,14 @@ defmodule TimelessLogs.CompactorTest do
 
     test "returns :noop when below threshold and not old enough" do
       Logger.info("single entry")
-      TimelessLogs.flush()
+      flush_and_sync()
 
       assert :noop = TimelessLogs.Compactor.compact_now()
     end
 
     test "compacts on age even when below threshold" do
       Logger.info("old entry")
-      TimelessLogs.flush()
+      flush_and_sync()
 
       # Set max age to 0 so everything is "old"
       Application.put_env(:timeless_logs, :compaction_max_raw_age, 0)
@@ -89,7 +94,7 @@ defmodule TimelessLogs.CompactorTest do
     test "preserves entry order after compaction" do
       for i <- 1..5 do
         Logger.info("entry #{i}")
-        TimelessLogs.flush()
+        flush_and_sync()
       end
 
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
@@ -107,7 +112,7 @@ defmodule TimelessLogs.CompactorTest do
       # Create raw blocks
       for i <- 1..3 do
         Logger.info("raw #{i}")
-        TimelessLogs.flush()
+        flush_and_sync()
       end
 
       # Compact them to openzl
@@ -119,7 +124,7 @@ defmodule TimelessLogs.CompactorTest do
 
       for i <- 4..6 do
         Logger.info("raw #{i}")
-        TimelessLogs.flush()
+        flush_and_sync()
       end
 
       # Now we have mixed: openzl + 3 raw
@@ -137,7 +142,7 @@ defmodule TimelessLogs.CompactorTest do
       # Create and compact some blocks
       for i <- 1..3 do
         Logger.info("stream #{i}")
-        TimelessLogs.flush()
+        flush_and_sync()
       end
 
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
