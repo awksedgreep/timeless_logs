@@ -47,8 +47,3 @@ jobs:
 
       - name: Check formatting
         run: mix format --check-formatted
-
-      - name: Publish to Hex
-        run: mix hex.publish --yes
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
