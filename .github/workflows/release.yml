@@ -1,4 +1,4 @@
-name: Release
+name: Release Validation
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
       - "v*"
 
 jobs:
-  publish:
-    name: Publish to Hex
+  validate:
+    name: Validate Release
     runs-on: ubuntu-latest
 
     strategy:
