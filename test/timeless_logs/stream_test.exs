@@ -3,12 +3,12 @@ defmodule TimelessLogs.StreamTest do
 
   require Logger
 
-  @data_dir "test/tmp/stream"
-
   setup do
+    data_dir = "test/tmp/stream_#{System.unique_integer([:positive])}"
+
     Application.stop(:timeless_logs)
-    File.rm_rf!(@data_dir)
-    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    File.rm_rf!(data_dir)
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
     Application.put_env(:timeless_logs, :flush_interval, 60_000)
     Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
     Application.put_env(:timeless_logs, :retention_max_age, nil)
@@ -17,10 +17,10 @@ defmodule TimelessLogs.StreamTest do
 
     on_exit(fn ->
       Application.stop(:timeless_logs)
-      File.rm_rf!(@data_dir)
+      File.rm_rf!(data_dir)
     end)
 
-    :ok
+    {:ok, data_dir: data_dir}
   end
 
   test "stream/1 lazily yields entries" do

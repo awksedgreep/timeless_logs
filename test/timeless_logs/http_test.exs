@@ -3,13 +3,14 @@ defmodule TimelessLogs.HTTPTest do
 
   require Logger
 
-  @data_dir "test/tmp/http_test"
-  @port 19_428
-
   setup do
+    uniq = System.unique_integer([:positive])
+    data_dir = "test/tmp/http_test_#{uniq}"
+    port = 19_428 + rem(uniq, 1000)
+
     Application.stop(:timeless_logs)
-    File.rm_rf!(@data_dir)
-    Application.put_env(:timeless_logs, :data_dir, @data_dir)
+    File.rm_rf!(data_dir)
+    Application.put_env(:timeless_logs, :data_dir, data_dir)
     Application.put_env(:timeless_logs, :flush_interval, 60_000)
     Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
     Application.put_env(:timeless_logs, :http, false)
@@ -21,23 +22,31 @@ defmodule TimelessLogs.HTTPTest do
     # Remove logger handler so Rocket startup logs don't pollute the buffer
     :logger.remove_handler(TimelessLogs.Handler.handler_id())
 
-    start_supervised!({TimelessLogs.HTTP, port: @port})
+    Process.put(:http_test_port, port)
+    Process.put(:http_test_data_dir, data_dir)
+
+    start_supervised!({TimelessLogs.HTTP, port: port})
 
     on_exit(fn ->
       Application.stop(:timeless_logs)
-      File.rm_rf!(@data_dir)
+      File.rm_rf!(data_dir)
+      Process.delete(:http_test_port)
+      Process.delete(:http_test_data_dir)
     end)
 
-    :ok
+    {:ok, port: port, data_dir: data_dir}
   end
 
   defp get(path, opts \\ []) do
-    TimelessLogs.TestHTTP.get(@port, path, opts)
+    TimelessLogs.TestHTTP.get(current_port(), path, opts)
   end
 
   defp post(path, body, opts) do
-    TimelessLogs.TestHTTP.post(@port, path, body, opts)
+    TimelessLogs.TestHTTP.post(current_port(), path, body, opts)
   end
+
+  defp current_port, do: Process.get(:http_test_port)
+  defp current_data_dir, do: Process.get(:http_test_data_dir)
 
   defp json_body(resp) do
     :json.decode(resp.body)
@@ -384,7 +393,7 @@ defmodule TimelessLogs.HTTPTest do
     end
 
     test "creates backup with custom path" do
-      backup_dir = Path.join(@data_dir, "custom_backup")
+      backup_dir = Path.join(current_data_dir(), "custom_backup")
 
       body = ~s({"_msg":"backup test","level":"info"})
       post("/insert/jsonline", body, content_type: "application/x-ndjson")
