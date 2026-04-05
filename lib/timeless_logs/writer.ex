@@ -164,6 +164,11 @@ defmodule TimelessLogs.Writer do
       {:ok, data} ->
         decompress_block(data, format)
 
+      {:error, :enoent} ->
+        # A concurrent compaction/retention pass may remove the block after a
+        # reader selected it from the index. Treat that as a benign miss.
+        {:error, :enoent}
+
       {:error, reason} ->
         Logger.warning("TimelessLogs: cannot read block #{file_path}: #{inspect(reason)}")
         {:error, reason}
