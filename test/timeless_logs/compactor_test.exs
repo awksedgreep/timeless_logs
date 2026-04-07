@@ -138,6 +138,57 @@ defmodule TimelessLogs.CompactorTest do
       {:ok, %TimelessLogs.Result{total: 6}} = TimelessLogs.query([])
     end
 
+    test "count_total false matches exact pages after compaction and mixed blocks" do
+      base = System.system_time(:second) - 3_000
+
+      for block <- 1..4 do
+        entries =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            %{
+              timestamp: base + seq,
+              level: :info,
+              message: "compact-page-#{seq}",
+              metadata: %{"service" => "compactpage"}
+            }
+          end
+
+        assert :ok = TimelessLogs.ingest(entries)
+        flush_and_sync()
+      end
+
+      Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      assert :ok = TimelessLogs.Compactor.compact_now()
+
+      for block <- 5..6 do
+        entries =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            %{
+              timestamp: base + seq,
+              level: :info,
+              message: "compact-page-#{seq}",
+              metadata: %{"service" => "compactpage"}
+            }
+          end
+
+        assert :ok = TimelessLogs.ingest(entries)
+        flush_and_sync()
+      end
+
+      pagination = [limit: 4, offset: 4, order: :desc, metadata: %{service: "compactpage"}]
+
+      {:ok, %TimelessLogs.Result{entries: exact_entries, total: 18}} =
+        TimelessLogs.query(pagination)
+
+      {:ok, %TimelessLogs.Result{entries: fast_entries, total: 9, has_more: true}} =
+        TimelessLogs.query(Keyword.put(pagination, :count_total, false))
+
+      assert Enum.map(fast_entries, & &1.message) == Enum.map(exact_entries, & &1.message)
+    end
+
     test "stream works across mixed raw and openzl blocks" do
       # Create and compact some blocks
       for i <- 1..3 do

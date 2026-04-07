@@ -205,5 +205,42 @@ defmodule TimelessLogs.MemoryTest do
 
       assert length(page) == 5
     end
+
+    test "full page walk is stable in memory mode" do
+      for i <- 1..15 do
+        Logger.info(
+          "memory-page-#{String.pad_leading(Integer.to_string(i), 2, "0")}",
+          service: "memory-page"
+        )
+      end
+
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: all_entries, total: 15}} =
+        TimelessLogs.query(limit: 15, order: :asc, metadata: %{service: "memory-page"})
+
+      expected_messages = Enum.map(all_entries, & &1.message)
+      page_size = 4
+
+      paged_messages =
+        0..3
+        |> Enum.flat_map(fn page_index ->
+          offset = page_index * page_size
+
+          {:ok,
+           %TimelessLogs.Result{entries: entries, total: 15, offset: ^offset, limit: ^page_size}} =
+            TimelessLogs.query(
+              limit: page_size,
+              offset: offset,
+              order: :asc,
+              metadata: %{service: "memory-page"}
+            )
+
+          Enum.map(entries, & &1.message)
+        end)
+
+      assert paged_messages == expected_messages
+      assert Enum.uniq(paged_messages) == paged_messages
+    end
   end
 end

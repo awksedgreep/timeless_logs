@@ -233,5 +233,257 @@ defmodule TimelessLogsTest do
 
       assert hd(desc).timestamp >= hd(asc).timestamp
     end
+
+    test "count_total false preserves page slices for multi-block disk queries" do
+      for block <- 1..6 do
+        for item <- 1..4 do
+          Logger.info("disk page block=#{block} item=#{item}", service: "disk-page")
+        end
+
+        TimelessLogs.flush()
+      end
+
+      {:ok, %TimelessLogs.Result{entries: all_entries, total: 24}} =
+        TimelessLogs.query(limit: 24, order: :desc, metadata: %{service: "disk-page"})
+
+      expected_messages = Enum.map(all_entries, & &1.message)
+      page_size = 5
+
+      paged_messages =
+        0..4
+        |> Enum.flat_map(fn page_index ->
+          offset = page_index * page_size
+
+          {:ok,
+           %TimelessLogs.Result{
+             entries: entries,
+             has_more: has_more,
+             total: reported_total,
+             offset: ^offset,
+             limit: ^page_size
+           }} =
+            TimelessLogs.query(
+              limit: page_size,
+              offset: offset,
+              order: :desc,
+              count_total: false,
+              metadata: %{service: "disk-page"}
+            )
+
+          expected_count = min(page_size, max(length(expected_messages) - offset, 0))
+
+          assert length(entries) == expected_count
+
+          assert Enum.map(entries, & &1.message) ==
+                   Enum.slice(expected_messages, offset, expected_count)
+
+          assert has_more == offset + expected_count < length(expected_messages)
+
+          expected_total =
+            if has_more do
+              offset + expected_count + 1
+            else
+              length(expected_messages)
+            end
+
+          assert reported_total == expected_total
+
+          Enum.map(entries, & &1.message)
+        end)
+
+      assert paged_messages == expected_messages
+      assert Enum.uniq(paged_messages) == paged_messages
+    end
+
+    test "count_total true and false return identical entries for the same page" do
+      base = System.system_time(:second) - 1_000
+
+      for block <- 1..4 do
+        entries =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            %{
+              timestamp: base + seq,
+              level: :info,
+              message: "slice check block=#{block} item=#{item}",
+              metadata: %{"service" => "slice-check"}
+            }
+          end
+
+        assert :ok = TimelessLogs.ingest(entries)
+        TimelessLogs.flush()
+      end
+
+      pagination = [limit: 4, offset: 4, order: :desc, metadata: %{service: "slice-check"}]
+
+      {:ok, %TimelessLogs.Result{entries: exact_entries, total: exact_total, has_more: false}} =
+        TimelessLogs.query(pagination)
+
+      {:ok,
+       %TimelessLogs.Result{entries: fast_entries, total: fast_total, has_more: fast_has_more}} =
+        TimelessLogs.query(Keyword.put(pagination, :count_total, false))
+
+      assert Enum.map(fast_entries, & &1.message) == Enum.map(exact_entries, & &1.message)
+      assert fast_has_more
+      assert exact_total == 12
+      assert fast_total == 9
+    end
+
+    test "count_total false matches exact pages when disk blocks have uneven read cost" do
+      large_payload = String.duplicate("x", 200_000)
+      base = System.system_time(:second) - 2_000
+
+      slow_entries =
+        for item <- 1..3 do
+          %{
+            timestamp: base + item,
+            level: :info,
+            message: "slow-old block item=#{item} #{large_payload}",
+            metadata: %{"service" => "uneven-page"}
+          }
+        end
+
+      assert :ok = TimelessLogs.ingest(slow_entries)
+      TimelessLogs.flush()
+
+      for block <- 2..4 do
+        entries =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            %{
+              timestamp: base + seq,
+              level: :info,
+              message: "fast block=#{block} item=#{item}",
+              metadata: %{"service" => "uneven-page"}
+            }
+          end
+
+        assert :ok = TimelessLogs.ingest(entries)
+        TimelessLogs.flush()
+      end
+
+      for order <- [:asc, :desc] do
+        for offset <- [0, 3, 6] do
+          pagination = [
+            limit: 3,
+            offset: offset,
+            order: order,
+            metadata: %{service: "uneven-page"}
+          ]
+
+          {:ok, %TimelessLogs.Result{entries: exact_entries, total: 12}} =
+            TimelessLogs.query(pagination)
+
+          {:ok,
+           %TimelessLogs.Result{
+             entries: fast_entries,
+             has_more: fast_has_more,
+             total: fast_total
+           }} =
+            TimelessLogs.query(Keyword.put(pagination, :count_total, false))
+
+          assert Enum.map(fast_entries, & &1.message) == Enum.map(exact_entries, & &1.message)
+          assert fast_has_more == offset + 3 < 12
+
+          expected_total =
+            if fast_has_more do
+              offset + 4
+            else
+              12
+            end
+
+          assert fast_total == expected_total
+        end
+      end
+    end
+
+    test "time filters preserve exact page slices for count_total false" do
+      base = System.system_time(:second) - 5_000
+
+      entries =
+        for idx <- 1..18 do
+          %{
+            timestamp: base + idx,
+            level: :info,
+            message: "time-slice-#{idx}",
+            metadata: %{"service" => "time-slice"}
+          }
+        end
+
+      entries
+      |> Enum.chunk_every(3)
+      |> Enum.each(fn chunk ->
+        assert :ok = TimelessLogs.ingest(chunk)
+        TimelessLogs.flush()
+      end)
+
+      filters = [
+        since: base + 5,
+        until: base + 14,
+        metadata: %{service: "time-slice"},
+        order: :asc
+      ]
+
+      {:ok, %TimelessLogs.Result{entries: all_entries, total: 10}} =
+        TimelessLogs.query([limit: 10] ++ filters)
+
+      expected_messages = Enum.map(all_entries, & &1.message)
+
+      for offset <- [0, 4, 8] do
+        {:ok, %TimelessLogs.Result{entries: exact_entries, total: 10}} =
+          TimelessLogs.query([limit: 4, offset: offset] ++ filters)
+
+        {:ok,
+         %TimelessLogs.Result{
+           entries: fast_entries,
+           total: fast_total,
+           has_more: fast_has_more
+         }} =
+          TimelessLogs.query([limit: 4, offset: offset, count_total: false] ++ filters)
+
+        expected_count = min(4, max(length(expected_messages) - offset, 0))
+
+        assert Enum.map(exact_entries, & &1.message) ==
+                 Enum.slice(expected_messages, offset, expected_count)
+
+        assert Enum.map(fast_entries, & &1.message) == Enum.map(exact_entries, & &1.message)
+        assert fast_has_more == offset + expected_count < 10
+        assert fast_total == if(fast_has_more, do: offset + expected_count + 1, else: 10)
+      end
+    end
+
+    test "equal timestamps still produce stable page equivalence" do
+      timestamp = System.system_time(:second) - 9_000
+
+      entries =
+        for idx <- 1..12 do
+          %{
+            timestamp: timestamp,
+            level: :info,
+            message: "same-time-#{String.pad_leading(Integer.to_string(idx), 2, "0")}",
+            metadata: %{"service" => "same-time"}
+          }
+        end
+
+      entries
+      |> Enum.chunk_every(3)
+      |> Enum.each(fn chunk ->
+        assert :ok = TimelessLogs.ingest(chunk)
+        TimelessLogs.flush()
+      end)
+
+      pagination = [limit: 4, offset: 4, order: :desc, metadata: %{service: "same-time"}]
+
+      {:ok, %TimelessLogs.Result{entries: exact_entries, total: 12}} =
+        TimelessLogs.query(pagination)
+
+      {:ok, %TimelessLogs.Result{entries: fast_entries, total: fast_total, has_more: true}} =
+        TimelessLogs.query(Keyword.put(pagination, :count_total, false))
+
+      assert Enum.map(fast_entries, & &1.message) == Enum.map(exact_entries, & &1.message)
+      assert fast_total == 9
+    end
   end
 end

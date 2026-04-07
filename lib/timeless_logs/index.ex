@@ -795,7 +795,15 @@ defmodule TimelessLogs.Index do
     collect_need = if count_total, do: need, else: need + 1
 
     {collected, total, blocks_read} =
-      collect_with_early_exit(block_ids, db, storage, search_filters, collect_need, count_total)
+      collect_with_early_exit(
+        block_ids,
+        db,
+        storage,
+        search_filters,
+        collect_need,
+        count_total,
+        order
+      )
 
     sorted =
       case order do
@@ -827,15 +835,31 @@ defmodule TimelessLogs.Index do
      }}
   end
 
-  defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total) do
+  defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total, order) do
     if storage == :disk and length(block_ids) > 1 do
-      collect_parallel_early_exit(block_ids, search_filters, need, count_total)
+      collect_parallel_early_exit(block_ids, search_filters, need, count_total, order)
     else
-      collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total)
+      collect_sequential_early_exit(
+        block_ids,
+        db,
+        storage,
+        search_filters,
+        need,
+        count_total,
+        order
+      )
     end
   end
 
-  defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total) do
+  defp collect_sequential_early_exit(
+         block_ids,
+         db,
+         storage,
+         search_filters,
+         need,
+         count_total,
+         order
+       ) do
     Enum.reduce_while(block_ids, {[], 0, 0}, fn {block_id, file_path, format},
                                                 {acc, total, count} ->
       format_atom = to_format_atom(format)
@@ -852,6 +876,7 @@ defmodule TimelessLogs.Index do
             entries
             |> TimelessLogs.Filter.filter(search_filters)
             |> Enum.map(&TimelessLogs.Entry.from_map/1)
+            |> sort_entries(order)
 
           new_total = total + length(filtered)
           new_count = count + 1
@@ -878,7 +903,7 @@ defmodule TimelessLogs.Index do
     end)
   end
 
-  defp collect_parallel_early_exit(block_ids, search_filters, need, count_total) do
+  defp collect_parallel_early_exit(block_ids, search_filters, need, count_total, order) do
     batch_size = System.schedulers_online()
 
     block_ids
@@ -910,6 +935,7 @@ defmodule TimelessLogs.Index do
           ordered: false
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
+        |> sort_entries(order)
 
       new_total = total + length(batch_results)
       new_count = count + length(batch)
@@ -925,6 +951,9 @@ defmodule TimelessLogs.Index do
       end
     end)
   end
+
+  defp sort_entries(entries, :asc), do: Enum.sort_by(entries, & &1.timestamp, :asc)
+  defp sort_entries(entries, :desc), do: Enum.sort_by(entries, & &1.timestamp, :desc)
 
   # --- Query building ---
 
