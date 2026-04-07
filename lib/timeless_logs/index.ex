@@ -907,7 +907,7 @@ defmodule TimelessLogs.Index do
             end
           end,
           max_concurrency: batch_size,
-          ordered: true
+          ordered: false
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
 
