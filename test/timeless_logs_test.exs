@@ -180,6 +180,50 @@ defmodule TimelessLogsTest do
       assert hd(page1).timestamp != hd(page2).timestamp || hd(page1).message != hd(page2).message
     end
 
+    test "pagination stays stable across many disk blocks" do
+      Application.stop(:timeless_logs)
+
+      data_dir = "test/tmp/pagination_disk_#{System.unique_integer([:positive])}"
+      File.rm_rf!(data_dir)
+      Application.put_env(:timeless_logs, :storage, :disk)
+      Application.put_env(:timeless_logs, :data_dir, data_dir)
+      Application.put_env(:timeless_logs, :flush_interval, 60_000)
+      Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
+      Application.ensure_all_started(:timeless_logs)
+
+      on_exit(fn ->
+        Application.stop(:timeless_logs)
+        File.rm_rf!(data_dir)
+      end)
+
+      batch_count = System.schedulers_online() + 2
+
+      for batch <- 0..(batch_count - 1) do
+        for i <- 0..2 do
+          Logger.info("page-log-#{batch}-#{i}",
+            page_test: true,
+            request_id: "req-#{batch}-#{i}"
+          )
+        end
+
+        TimelessLogs.flush()
+      end
+
+      {:ok, %TimelessLogs.Result{entries: page1, has_more: true}} =
+        TimelessLogs.query(limit: 5, count_total: false)
+
+      {:ok, %TimelessLogs.Result{entries: page2, offset: 5}} =
+        TimelessLogs.query(limit: 5, offset: 5, count_total: false)
+
+      page1_messages = Enum.map(page1, & &1.message)
+      page2_messages = Enum.map(page2, & &1.message)
+
+      assert length(page1_messages) == 5
+      assert length(page2_messages) == 5
+      assert page1_messages != page2_messages
+      assert Enum.sort(page1_messages) != Enum.sort(page2_messages)
+    end
+
     test "nested map metadata does not crash extract_terms" do
       # Simulate VictoriaLogs-style ingest with nested meta (e.g. syslog)
       entry = %{
