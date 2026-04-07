@@ -720,6 +720,7 @@ defmodule TimelessLogs.Index do
   @indexed_metadata_keys MapSet.new([
                            "application",
                            "cache",
+                           "host",
                            "key",
                            "job",
                            "method",
@@ -737,12 +738,22 @@ defmodule TimelessLogs.Index do
 
   defp indexed_metadata_term(key, value)
        when (is_binary(value) or is_atom(value)) and is_binary(key) do
-    if MapSet.member?(@indexed_metadata_keys, key) and low_cardinality_value?(value) do
+    if MapSet.member?(@indexed_metadata_keys, key) and
+         low_cardinality_value?(key, value) do
       "#{key}:#{value}"
     end
   end
 
   defp indexed_metadata_term(_key, _value), do: nil
+
+  defp low_cardinality_value?("host", value) when is_atom(value),
+    do: low_cardinality_value?("host", Atom.to_string(value))
+
+  defp low_cardinality_value?("host", value) when is_binary(value) do
+    byte_size(value) <= 255
+  end
+
+  defp low_cardinality_value?(_key, value), do: low_cardinality_value?(value)
 
   defp low_cardinality_value?(value) when is_atom(value),
     do: low_cardinality_value?(Atom.to_string(value))
@@ -779,10 +790,12 @@ defmodule TimelessLogs.Index do
     limit = Keyword.get(pagination, :limit, @default_limit)
     offset = Keyword.get(pagination, :offset, @default_offset)
     order = Keyword.get(pagination, :order, :desc)
+    count_total = Keyword.get(pagination, :count_total, true)
     need = offset + limit
+    collect_need = if count_total, do: need, else: need + 1
 
     {collected, total, blocks_read} =
-      collect_with_early_exit(block_ids, db, storage, search_filters, need)
+      collect_with_early_exit(block_ids, db, storage, search_filters, collect_need, count_total)
 
     sorted =
       case order do
@@ -790,34 +803,41 @@ defmodule TimelessLogs.Index do
         :desc -> Enum.sort_by(collected, & &1.timestamp, :desc)
       end
 
-    page = sorted |> Enum.drop(offset) |> Enum.take(limit)
+    has_more = length(sorted) > need
+    page = sorted |> Enum.take(need) |> Enum.drop(offset) |> Enum.take(limit)
+
+    reported_total =
+      if count_total, do: total, else: offset + length(page) + if(has_more, do: 1, else: 0)
+
     duration = System.monotonic_time() - start_time
 
     TimelessLogs.Telemetry.event(
       [:timeless_logs, :query, :stop],
-      %{duration: duration, total: total, blocks_read: blocks_read},
-      %{filters: search_filters}
+      %{duration: duration, total: reported_total, blocks_read: blocks_read},
+      %{filters: search_filters, count_total: count_total}
     )
 
     {:ok,
      %TimelessLogs.Result{
        entries: page,
-       total: total,
+       total: reported_total,
        limit: limit,
-       offset: offset
+       offset: offset,
+       has_more: has_more
      }}
   end
 
-  defp collect_with_early_exit(block_ids, db, storage, search_filters, need) do
+  defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total) do
     if storage == :disk and length(block_ids) > 1 do
-      collect_parallel_early_exit(block_ids, search_filters, need)
+      collect_parallel_early_exit(block_ids, search_filters, need, count_total)
     else
-      collect_sequential_early_exit(block_ids, db, storage, search_filters, need)
+      collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total)
     end
   end
 
-  defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need) do
-    Enum.reduce(block_ids, {[], 0, 0}, fn {block_id, file_path, format}, {acc, total, count} ->
+  defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total) do
+    Enum.reduce_while(block_ids, {[], 0, 0}, fn {block_id, file_path, format},
+                                                {acc, total, count} ->
       format_atom = to_format_atom(format)
 
       read_result =
@@ -838,7 +858,13 @@ defmodule TimelessLogs.Index do
           remaining = max(need - length(acc), 0)
           new_acc = if remaining > 0, do: acc ++ Enum.take(filtered, remaining), else: acc
 
-          {new_acc, new_total, new_count}
+          result = {new_acc, new_total, new_count}
+
+          if count_total or length(new_acc) < need do
+            {:cont, result}
+          else
+            {:halt, result}
+          end
 
         {:error, reason} ->
           TimelessLogs.Telemetry.event(
@@ -847,17 +873,17 @@ defmodule TimelessLogs.Index do
             %{file_path: file_path, reason: reason}
           )
 
-          {acc, total, count + 1}
+          {:cont, {acc, total, count + 1}}
       end
     end)
   end
 
-  defp collect_parallel_early_exit(block_ids, search_filters, need) do
+  defp collect_parallel_early_exit(block_ids, search_filters, need, count_total) do
     batch_size = System.schedulers_online()
 
     block_ids
     |> Enum.chunk_every(batch_size)
-    |> Enum.reduce({[], 0, 0}, fn batch, {acc, total, count} ->
+    |> Enum.reduce_while({[], 0, 0}, fn batch, {acc, total, count} ->
       batch_results =
         batch
         |> Task.async_stream(
@@ -890,7 +916,13 @@ defmodule TimelessLogs.Index do
       remaining = max(need - length(acc), 0)
       new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
 
-      {new_acc, new_total, new_count}
+      result = {new_acc, new_total, new_count}
+
+      if count_total or length(new_acc) < need do
+        {:cont, result}
+      else
+        {:halt, result}
+      end
     end)
   end
 
@@ -898,7 +930,7 @@ defmodule TimelessLogs.Index do
 
   defp split_pagination(filters) do
     {pagination, search} =
-      Enum.split_with(filters, fn {k, _v} -> k in [:limit, :offset, :order] end)
+      Enum.split_with(filters, fn {k, _v} -> k in [:limit, :offset, :order, :count_total] end)
 
     {search, pagination}
   end

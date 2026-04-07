@@ -56,6 +56,19 @@ defmodule TimelessLogsTest do
       assert hd(results).metadata["request_id"] == "abc"
     end
 
+    test "metadata filtering works for host" do
+      Logger.info("host-specific log", host: "prod-web-cache-01", service: "api")
+      Logger.info("other host log", host: "web-02", service: "api")
+
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: results, total: 1}} =
+        TimelessLogs.query(metadata: %{"host" => "prod-web-cache-01"})
+
+      assert length(results) == 1
+      assert hd(results).metadata["host"] == "prod-web-cache-01"
+    end
+
     test "extract_terms keeps stable low-cardinality metadata and skips identifier-like values" do
       entries = [
         %{
@@ -93,6 +106,26 @@ defmodule TimelessLogsTest do
         TimelessLogs.query(message: "logged")
 
       assert length(results) == 2
+    end
+
+    test "pagination can skip exact totals" do
+      for i <- 1..20 do
+        Logger.info("paged log #{i}", page_test: true)
+      end
+
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: page1, has_more: has_more, limit: 5}} =
+        TimelessLogs.query(limit: 5, count_total: false)
+
+      assert length(page1) == 5
+      assert has_more
+
+      {:ok, %TimelessLogs.Result{entries: page4, has_more: has_more_last, offset: 15}} =
+        TimelessLogs.query(limit: 5, offset: 15, count_total: false)
+
+      assert length(page4) == 5
+      refute has_more_last
     end
 
     test "blocks are initially written as raw" do
