@@ -286,17 +286,6 @@ defmodule TimelessLogs.Buffer do
   defp matches_subscription?(_entry, []), do: true
 
   defp matches_subscription?(entry, opts) do
-    Enum.all?(opts, fn
-      {:level, level} ->
-        entry.level == level
-
-      {:metadata, map} ->
-        Enum.all?(map, fn {k, v} ->
-          Map.get(entry.metadata, to_string(k)) == to_string(v)
-        end)
-
-      _ ->
-        true
-    end)
+    TimelessLogs.Filter.matches?(entry, opts)
   end
 end

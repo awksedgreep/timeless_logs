@@ -34,6 +34,14 @@ defmodule TimelessLogs.Filter do
           to_string(val) == to_string(v)
         end)
 
+      {:metadata_any, pairs} ->
+        Enum.any?(pairs, fn {k, v} ->
+          str_key = to_string(k)
+          atom_key = if is_atom(k), do: k, else: String.to_atom(str_key)
+          val = Map.get(entry.metadata, atom_key) || Map.get(entry.metadata, str_key)
+          to_string(val) == to_string(v)
+        end)
+
       _ ->
         true
     end)

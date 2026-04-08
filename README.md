@@ -81,6 +81,30 @@ Returns a `TimelessLogs.Result` struct:
 }}
 ```
 
+### Semantic Host and Service Filtering
+
+`TimelessLogs` supports semantic host/service filtering so callers do not need
+to hardcode one raw metadata key for every producer.
+
+When you query with:
+
+```elixir
+TimelessLogs.query(metadata: %{host: "web-01"})
+TimelessLogs.query(metadata: %{service: "payments"})
+```
+
+TimelessLogs expands those filters across common aliases:
+
+- `host` matches `host.name`, `host`, `hostname`, and `node`
+- `service` matches `service.name`, `service`, and `application`
+
+The same semantic expansion applies to real-time subscriptions:
+
+```elixir
+TimelessLogs.subscribe(metadata: %{host: "web-01"})
+TimelessLogs.subscribe(metadata: %{service: "payments"})
+```
+
 ### Query Filters
 
 | Filter | Type | Description |
@@ -89,7 +113,7 @@ Returns a `TimelessLogs.Result` struct:
 | `:message` | string | Case-insensitive substring match on message and metadata values |
 | `:since` | DateTime or integer | Lower time bound (integers are unix timestamps) |
 | `:until` | DateTime or integer | Upper time bound |
-| `:metadata` | map | Exact match on indexed key/value pairs |
+| `:metadata` | map | Exact match on metadata key/value pairs, with semantic alias expansion for `host` and `service` |
 | `:limit` | integer | Max entries to return (default 100) |
 | `:offset` | integer | Skip N entries (default 0) |
 | `:order` | atom | `:asc` (oldest first) or `:desc` (newest first, default) |

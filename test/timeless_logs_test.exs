@@ -69,6 +69,48 @@ defmodule TimelessLogsTest do
       assert hd(results).metadata["host"] == "prod-web-cache-01"
     end
 
+    test "semantic host filtering matches host.name metadata" do
+      Logger.info("canonical host log", [{:"host.name", "vpn"}, service: "api"])
+      Logger.info("other canonical host log", [{:"host.name", "web-02"}, service: "api"])
+
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: results, total: 1}} =
+        TimelessLogs.query(metadata: %{"host" => "vpn"})
+
+      assert length(results) == 1
+      assert hd(results).metadata["host.name"] == "vpn"
+    end
+
+    test "semantic service filtering matches service.name and application metadata" do
+      Logger.info("otel-style service log", [{:"service.name", "api"}])
+      Logger.info("application-style service log", application: "api")
+      Logger.info("different service log", service: "worker")
+
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: results, total: 2}} =
+        TimelessLogs.query(metadata: %{"service" => "api"}, limit: 10)
+
+      assert Enum.map(results, & &1.message) |> Enum.sort() == [
+               "application-style service log",
+               "otel-style service log"
+             ]
+    end
+
+    test "semantic host filtering also works for live subscriptions" do
+      {:ok, _pid} = TimelessLogs.subscribe(metadata: %{"host" => "vpn"})
+
+      Logger.info("matching subscription log", [{:"host.name", "vpn"}])
+      Logger.info("non-matching subscription log", [{:"host.name", "web-02"}])
+
+      assert_receive {:timeless_logs, :entry, entry}
+      assert entry.message == "matching subscription log"
+      refute_receive {:timeless_logs, :entry, _other}, 100
+    after
+      TimelessLogs.unsubscribe()
+    end
+
     test "extract_terms keeps stable low-cardinality metadata and skips identifier-like values" do
       entries = [
         %{

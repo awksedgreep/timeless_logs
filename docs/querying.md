@@ -36,7 +36,7 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 | `:message` | string | Case-insensitive substring match on message text and metadata values |
 | `:since` | DateTime or integer | Lower time bound (integers are unix timestamps in microseconds) |
 | `:until` | DateTime or integer | Upper time bound |
-| `:metadata` | map | Exact match on indexed key/value pairs (atom or string keys) |
+| `:metadata` | map | Exact match on metadata key/value pairs (atom or string keys). `host` and `service` expand across common aliases. |
 | `:limit` | integer | Max entries to return (default: 100) |
 | `:offset` | integer | Skip N entries (default: 0) |
 | `:order` | atom | `:desc` (newest first, default) or `:asc` (oldest first) |
@@ -84,7 +84,20 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 
 # Multiple indexed metadata keys (all must match)
 {:ok, result} = TimelessLogs.query(metadata: %{service: "api", status: 500})
+
+# Semantic host lookup across host.name / host / hostname / node
+{:ok, result} = TimelessLogs.query(metadata: %{host: "web-01"})
 ```
+
+## Semantic Metadata Aliases
+
+For cross-framework log ingestion, `TimelessLogs` treats `host` and `service`
+as semantic dimensions instead of one fixed raw field name.
+
+- `host` expands to `host.name`, `host`, `hostname`, and `node`
+- `service` expands to `service.name`, `service`, and `application`
+
+This alias expansion applies to both `query/1` and `subscribe/1`.
 
 ### Combined filters
 

@@ -52,7 +52,9 @@ defmodule TimelessLogs do
   """
   @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()} | {:error, term()}
   def query(filters \\ []) do
-    TimelessLogs.Index.query(filters)
+    filters
+    |> normalize_filters()
+    |> TimelessLogs.Index.query()
   end
 
   @doc """
@@ -85,6 +87,8 @@ defmodule TimelessLogs do
   """
   @spec field_values(String.t(), keyword()) :: {:ok, list(map())}
   def field_values(field_name, filters \\ []) do
+    filters = normalize_filters(filters)
+
     counts =
       stream(filters)
       |> Enum.reduce(%{}, fn entry, acc ->
@@ -117,6 +121,8 @@ defmodule TimelessLogs do
   """
   @spec field_names(keyword()) :: {:ok, list(map())}
   def field_names(filters \\ []) do
+    filters = normalize_filters(filters)
+
     counts =
       stream(filters)
       |> Enum.reduce(%{}, fn entry, acc ->
@@ -183,6 +189,7 @@ defmodule TimelessLogs do
   """
   @spec stream(keyword()) :: Enumerable.t()
   def stream(filters \\ []) do
+    filters = normalize_filters(filters)
     block_ids = TimelessLogs.Index.matching_block_ids(filters)
     search_filters = Keyword.drop(filters, [:limit, :offset, :order])
     storage = TimelessLogs.Config.storage()
@@ -245,7 +252,7 @@ defmodule TimelessLogs do
   """
   @spec subscribe(keyword()) :: {:ok, pid()}
   def subscribe(opts \\ []) do
-    Registry.register(TimelessLogs.Registry, :log_entries, opts)
+    Registry.register(TimelessLogs.Registry, :log_entries, normalize_filters(opts))
   end
 
   @doc """
@@ -255,6 +262,49 @@ defmodule TimelessLogs do
   def unsubscribe do
     Registry.unregister(TimelessLogs.Registry, :log_entries)
   end
+
+  @spec normalize_filters(keyword()) :: keyword()
+  def normalize_filters(filters) do
+    {metadata_any, metadata} =
+      filters
+      |> Keyword.get(:metadata, %{})
+      |> Enum.reduce({[], %{}}, fn {key, value}, {any_filters, exact_filters} ->
+        case semantic_metadata_aliases(key, value) do
+          nil ->
+            {any_filters, Map.put(exact_filters, key, value)}
+
+          aliases ->
+            {[{:metadata_any, aliases} | any_filters], exact_filters}
+        end
+      end)
+
+    filters =
+      case metadata do
+        map when map_size(map) == 0 -> Keyword.delete(filters, :metadata)
+        _ -> Keyword.put(filters, :metadata, metadata)
+      end
+
+    Keyword.merge(filters, Enum.reverse(metadata_any))
+  end
+
+  defp semantic_metadata_aliases(key, value) when key in [:host, "host"] do
+    [
+      {"host.name", value},
+      {"host", value},
+      {"hostname", value},
+      {"node", value}
+    ]
+  end
+
+  defp semantic_metadata_aliases(key, value) when key in [:service, "service"] do
+    [
+      {"service.name", value},
+      {"service", value},
+      {"application", value}
+    ]
+  end
+
+  defp semantic_metadata_aliases(_key, _value), do: nil
 
   @doc """
   Merge multiple small compressed blocks into fewer, larger blocks.
