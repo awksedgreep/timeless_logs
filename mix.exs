@@ -4,7 +4,7 @@ defmodule TimelessLogs.MixProject do
   def project do
     [
       app: :timeless_logs,
-      version: "1.4.11",
+      version: "1.4.12",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -26,7 +26,7 @@ defmodule TimelessLogs.MixProject do
   defp deps do
     [
       {:ezstd, "~> 1.2"},
-      {:ex_openzl, "~> 0.4.0"},
+      {:ex_openzl, "~> 0.4"},
       {:exqlite, "~> 0.27"},
       {:rocket, "~> 0.2"},
       {:telemetry, "~> 1.0"},

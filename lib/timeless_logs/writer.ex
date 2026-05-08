@@ -15,6 +15,7 @@ defmodule TimelessLogs.Writer do
     emergency: 3
   }
   @int_to_level %{0 => :debug, 1 => :info, 2 => :warning, 3 => :error}
+  @openzl_etf_fallback_tag :timeless_logs_openzl_etf_v1
 
   @type block_meta :: %{
           block_id: integer(),
@@ -146,14 +147,12 @@ defmodule TimelessLogs.Writer do
   end
 
   def decompress_block(compressed, :openzl) do
-    try do
-      {:ok, dctx} = ExOpenzl.create_decompression_context()
-      {:ok, outputs} = ExOpenzl.decompress_multi_typed(dctx, compressed)
-      {:ok, columnar_deserialize(outputs)}
-    rescue
-      e ->
-        Logger.warning("TimelessLogs: corrupt openzl block data: #{inspect(e)}")
-        {:error, :corrupt_block}
+    case decompress_openzl_columnar(compressed) do
+      {:ok, outputs} ->
+        decompress_openzl_outputs(outputs, compressed)
+
+      {:error, _reason} ->
+        decompress_openzl_etf(compressed)
     end
   end
 
@@ -207,7 +206,57 @@ defmodule TimelessLogs.Writer do
       {:string, meta_bin, meta_lengths_bin}
     ]
 
-    ExOpenzl.compress_multi_typed(cctx, inputs)
+    case ExOpenzl.compress_multi_typed(cctx, inputs) do
+      {:ok, _compressed} = ok ->
+        ok
+
+      {:error, _reason} ->
+        openzl_etf_serialize(entries, level)
+    end
+  end
+
+  defp openzl_etf_serialize(entries, level) do
+    with {:ok, cctx} <- ExOpenzl.create_compression_context(),
+         :ok <- ExOpenzl.set_compression_level(cctx, level) do
+      ExOpenzl.compress(cctx, :erlang.term_to_binary({@openzl_etf_fallback_tag, entries}))
+    end
+  end
+
+  defp decompress_openzl_columnar(compressed) do
+    with {:ok, dctx} <- ExOpenzl.create_decompression_context() do
+      ExOpenzl.decompress_multi_typed(dctx, compressed)
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  defp decompress_openzl_outputs(
+         [_ts_info, _levels_info, _msgs_info, _meta_info] = outputs,
+         compressed
+       ) do
+    try do
+      {:ok, columnar_deserialize(outputs)}
+    rescue
+      _e ->
+        decompress_openzl_etf(compressed)
+    end
+  end
+
+  defp decompress_openzl_outputs(_outputs, compressed), do: decompress_openzl_etf(compressed)
+
+  defp decompress_openzl_etf(compressed) do
+    with {:ok, decompressed} <- ExOpenzl.decompress(compressed),
+         {@openzl_etf_fallback_tag, entries} <- :erlang.binary_to_term(decompressed) do
+      {:ok, entries}
+    else
+      _ ->
+        Logger.warning("TimelessLogs: corrupt openzl block data")
+        {:error, :corrupt_block}
+    end
+  rescue
+    e ->
+      Logger.warning("TimelessLogs: corrupt openzl block data: #{inspect(e)}")
+      {:error, :corrupt_block}
   end
 
   @doc false
