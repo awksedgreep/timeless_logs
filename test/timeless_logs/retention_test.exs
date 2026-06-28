@@ -101,6 +101,7 @@ defmodule TimelessLogs.RetentionTest do
   describe "block file cleanup" do
     test "removes block files from disk when deleting" do
       Logger.info("will be deleted")
+      Logger.flush()
       TimelessLogs.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")

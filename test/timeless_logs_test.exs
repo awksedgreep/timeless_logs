@@ -175,6 +175,7 @@ defmodule TimelessLogsTest do
         Logger.info("log entry number #{i}", iteration: "#{i}")
       end
 
+      Logger.flush()
       TimelessLogs.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
