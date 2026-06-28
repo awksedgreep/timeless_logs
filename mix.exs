@@ -4,7 +4,7 @@ defmodule TimelessLogs.MixProject do
   def project do
     [
       app: :timeless_logs,
-      version: "1.4.13",
+      version: "1.4.14",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
       test_ignore_filters: [~r"test/support/"],
