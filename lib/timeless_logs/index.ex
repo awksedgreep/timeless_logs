@@ -952,8 +952,20 @@ defmodule TimelessLogs.Index do
     end)
   end
 
-  defp sort_entries(entries, :asc), do: Enum.sort_by(entries, & &1.timestamp, :asc)
-  defp sort_entries(entries, :desc), do: Enum.sort_by(entries, & &1.timestamp, :desc)
+  defp sort_entries(entries, :asc), do: Enum.sort(entries, &entry_before?(&1, &2, :asc))
+  defp sort_entries(entries, :desc), do: Enum.sort(entries, &entry_before?(&1, &2, :desc))
+
+  defp entry_before?(left, right, :asc) do
+    left.timestamp < right.timestamp or
+      (left.timestamp == right.timestamp and entry_tie_key(left) <= entry_tie_key(right))
+  end
+
+  defp entry_before?(left, right, :desc) do
+    left.timestamp > right.timestamp or
+      (left.timestamp == right.timestamp and entry_tie_key(left) <= entry_tie_key(right))
+  end
+
+  defp entry_tie_key(entry), do: {entry.message, entry.level, entry.metadata}
 
   # --- Query building ---
 
