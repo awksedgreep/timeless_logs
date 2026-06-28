@@ -308,8 +308,6 @@ defmodule TimelessLogs.Compactor do
       :noop
   end
 
-  defp format_from_path(nil), do: :raw
-
   defp format_from_path(path) do
     case Path.extname(path) do
       ".ozl" -> :openzl

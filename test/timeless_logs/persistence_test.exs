@@ -434,14 +434,9 @@ defmodule TimelessLogs.PersistenceTest do
 
       entries = Enum.map(1..10, fn i -> make_entry(%{message: "mem-#{i}"}) end)
 
-      case TimelessLogs.Writer.write_block(entries, :memory, :raw) do
-        {:ok, meta} ->
-          terms = TimelessLogs.Index.extract_terms(entries)
-          TimelessLogs.Index.index_block(meta, entries, terms)
-
-        _ ->
-          flunk("Failed to write memory block")
-      end
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :raw)
+      terms = TimelessLogs.Index.extract_terms(entries)
+      TimelessLogs.Index.index_block(meta, entries, terms)
 
       TimelessLogs.Index.sync()
 

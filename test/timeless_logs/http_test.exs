@@ -1,8 +1,6 @@
 defmodule TimelessLogs.HTTPTest do
   use ExUnit.Case, async: false
 
-  require Logger
-
   setup do
     uniq = System.unique_integer([:positive])
     data_dir = "test/tmp/http_test_#{uniq}"

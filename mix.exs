@@ -4,9 +4,10 @@ defmodule TimelessLogs.MixProject do
   def project do
     [
       app: :timeless_logs,
-      version: "1.4.12",
-      elixir: "~> 1.18",
+      version: "1.4.13",
+      elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
+      test_ignore_filters: [~r"test/support/"],
       deps: deps(),
       description: "Embedded log compression and indexing for Elixir applications.",
       source_url: "https://github.com/awksedgreep/timeless_logs",

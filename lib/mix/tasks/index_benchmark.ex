@@ -151,9 +151,6 @@ defmodule Mix.Tasks.TimelessLogs.IndexBenchmark do
         {:ok, meta} ->
           terms = TimelessLogs.Index.extract_terms(chunk)
           TimelessLogs.Index.index_block(meta, chunk, terms)
-
-        _ ->
-          :ok
       end
     end
   end

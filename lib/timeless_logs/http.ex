@@ -1,6 +1,4 @@
 defmodule TimelessLogs.HTTP do
-  require Logger
-
   @moduledoc """
   Optional HTTP interface compatible with VictoriaLogs.
 

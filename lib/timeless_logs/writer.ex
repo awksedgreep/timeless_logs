@@ -315,7 +315,7 @@ defmodule TimelessLogs.Writer do
   defp split_by_lengths(_bin, []), do: []
 
   defp split_by_lengths(bin, [len | rest]) do
-    <<chunk::binary-size(len), remaining::binary>> = bin
+    <<chunk::binary-size(^len), remaining::binary>> = bin
     [chunk | split_by_lengths(remaining, rest)]
   end
 end

@@ -2,7 +2,6 @@ defmodule TimelessLogs.WriterTest do
   use ExUnit.Case, async: true
 
   @data_dir "test/tmp/writer_#{System.unique_integer([:positive])}"
-
   setup do
     blocks_dir = Path.join(@data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
@@ -175,6 +174,45 @@ defmodule TimelessLogs.WriterTest do
       assert read_entries == entries
     end
 
+    test "small blocks roundtrip through native columnar openzl frame" do
+      entries = [
+        %{timestamp: 1000, level: :info, message: "hello", metadata: %{}},
+        %{timestamp: 1001, level: :error, message: "boom", metadata: %{"key" => "val"}}
+      ]
+
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
+
+      {:ok, dctx} = ExOpenzl.create_decompression_context()
+
+      assert {:ok, [_ts_info, _levels_info, _msgs_info, _meta_info]} =
+               ExOpenzl.decompress_multi_typed(dctx, meta.data)
+
+      assert {:ok, read_entries} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
+      assert read_entries == entries
+    end
+
+    test "large blocks roundtrip through native columnar openzl frame" do
+      entries = large_openzl_entries()
+
+      {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
+
+      {:ok, dctx} = ExOpenzl.create_decompression_context()
+
+      assert {:ok, [_ts_info, _levels_info, _msgs_info, _meta_info]} =
+               ExOpenzl.decompress_multi_typed(dctx, meta.data)
+
+      assert {:ok, read_entries} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
+      assert read_entries == entries
+    end
+
+    test "legacy per-entry metadata columnar frames still roundtrip" do
+      entries = large_openzl_entries()
+      compressed = legacy_per_entry_metadata_openzl_frame!(entries)
+
+      assert {:ok, read_entries} = TimelessLogs.Writer.decompress_block(compressed, :openzl)
+      assert read_entries == entries
+    end
+
     test "corrupt openzl returns error" do
       corrupt_path = Path.join([@data_dir, "blocks", "corrupt.ozl"])
       File.write!(corrupt_path, "not valid openzl data")
@@ -282,19 +320,59 @@ defmodule TimelessLogs.WriterTest do
     end
 
     test "large block (500 entries) roundtrip" do
-      entries =
-        for i <- 1..500 do
-          %{
-            timestamp: 1000 + i,
-            level: Enum.at([:debug, :info, :warning, :error], rem(i, 4)),
-            message: "log message number #{i} with some content",
-            metadata: %{"index" => "#{i}", "module" => "TestModule"}
-          }
-        end
+      entries = large_openzl_entries()
 
       {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
       {:ok, read_entries} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
       assert read_entries == entries
     end
   end
+
+  defp large_openzl_entries do
+    for i <- 1..500 do
+      %{
+        timestamp: 1000 + i,
+        level: Enum.at([:debug, :info, :warning, :error], rem(i, 4)),
+        message: "log message number #{i} with some content",
+        metadata: %{"index" => "#{i}", "module" => "TestModule"}
+      }
+    end
+  end
+
+  defp legacy_per_entry_metadata_openzl_frame!(entries) do
+    {ts_bin, levels_bin, msg_concat, msg_lengths_bin, meta_concat, meta_lengths_bin} =
+      Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>, <<>>, <<>>}, fn entry,
+                                                                    {ts_acc, lv_acc, msg_acc,
+                                                                     msg_len_acc, meta_acc,
+                                                                     meta_len_acc} ->
+        msg = entry.message
+        meta = :erlang.term_to_binary(entry.metadata)
+
+        {
+          <<ts_acc::binary, entry.timestamp::little-unsigned-64>>,
+          <<lv_acc::binary, level_to_int(entry.level)::unsigned-8>>,
+          <<msg_acc::binary, msg::binary>>,
+          <<msg_len_acc::binary, byte_size(msg)::little-unsigned-32>>,
+          <<meta_acc::binary, meta::binary>>,
+          <<meta_len_acc::binary, byte_size(meta)::little-unsigned-32>>
+        }
+      end)
+
+    inputs = [
+      {:numeric, ts_bin, 8},
+      {:numeric, levels_bin, 1},
+      {:string, msg_concat, msg_lengths_bin},
+      {:string, meta_concat, meta_lengths_bin}
+    ]
+
+    {:ok, cctx} = ExOpenzl.create_compression_context()
+    :ok = ExOpenzl.set_compression_level(cctx, TimelessLogs.Config.openzl_compression_level())
+    {:ok, compressed} = ExOpenzl.compress_multi_typed(cctx, inputs)
+    compressed
+  end
+
+  defp level_to_int(:debug), do: 0
+  defp level_to_int(:info), do: 1
+  defp level_to_int(:warning), do: 2
+  defp level_to_int(:error), do: 3
 end
