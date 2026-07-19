@@ -26,6 +26,22 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :query_timeout, 30_000)
   end
 
+  # Queued entries per shard (buffer + pending batches + in-flight flushes)
+  # above which batch ingest switches from cast to call, pacing producers
+  # to the durable drain rate. Sized to absorb bursts at full speed.
+  @spec ingest_soft_watermark() :: pos_integer()
+  def ingest_soft_watermark do
+    Application.get_env(:timeless_logs, :ingest_soft_watermark, 50_000)
+  end
+
+  # Raw (uncompacted) block bytes on disk above which batch ingest also
+  # paces, letting the compactor catch up before queries drown in raw
+  # blocks. The compactor maintains the gauge.
+  @spec ingest_raw_debt_limit() :: pos_integer()
+  def ingest_raw_debt_limit do
+    Application.get_env(:timeless_logs, :ingest_raw_debt_limit, 2_000_000_000)
+  end
+
   # 7 days in seconds
   @default_retention_max_age 7 * 86_400
 

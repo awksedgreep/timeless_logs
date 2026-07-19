@@ -27,12 +27,32 @@ defmodule TimelessLogs.Buffer do
     GenServer.cast(TimelessLogs.BufferShard.via(entry), {:log, entry})
   end
 
+  # How long a paced producer will wait for the shard to accept its batch
+  # before the call raises. Only reachable when the drain pipeline has
+  # stalled outright (e.g. dead disk) — surfacing that beats hanging.
+  @backpressure_timeout 60_000
+
   @spec log_many([map()]) :: :ok
   def log_many(entries) when is_list(entries) do
     entries
     |> Enum.group_by(&TimelessLogs.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_entries} ->
-      GenServer.cast(TimelessLogs.BufferShard.name(shard), {:log_many, shard_entries})
+      name = TimelessLogs.BufferShard.name(shard)
+
+      if TimelessLogs.IngestPressure.overloaded?(shard) do
+        # Above the watermark: synchronous accept. The reply comes only
+        # after the shard has worked through its mailbox, so producers
+        # pace-match the drain rate. Nothing is dropped or refused.
+        TimelessLogs.Telemetry.event(
+          [:timeless_logs, :ingest, :backpressure],
+          %{entry_count: length(shard_entries)},
+          %{shard: shard}
+        )
+
+        GenServer.call(name, {:log_many, shard_entries}, @backpressure_timeout)
+      else
+        GenServer.cast(name, {:log_many, shard_entries})
+      end
     end)
 
     :ok
@@ -71,6 +91,8 @@ defmodule TimelessLogs.Buffer do
        flush_interval: interval,
        in_flight: 0,
        pending_batches: :queue.new(),
+       pending_entries: 0,
+       inflight_entries: 0,
        flush_waiters: []
      }}
   end
@@ -81,38 +103,31 @@ defmodule TimelessLogs.Buffer do
       :logger.remove_handler(TimelessLogs.Handler.handler_id())
     end
 
+    # Graceful shutdown drains queued batches too, not just the buffer;
+    # in-flight flush tasks finish under their own supervisor.
+    :queue.to_list(state.pending_batches)
+    |> Enum.each(&do_flush_work(&1, state.data_dir, sync: true))
+
     do_flush(state.buffer, state.data_dir, sync: true)
     :ok
   end
 
   @impl true
   def handle_cast({:log, entry}, state) do
-    broadcast_to_subscribers(entry)
-    buffer = [entry | state.buffer]
-    size = state.buffer_size + 1
-
-    if size >= TimelessLogs.Config.max_buffer_size() do
-      state = dispatch_or_queue_batch(Enum.reverse(buffer), state)
-      {:noreply, %{state | buffer: [], buffer_size: 0}}
-    else
-      {:noreply, %{state | buffer: buffer, buffer_size: size}}
-    end
+    {:noreply, accept_entries(state, [entry], 1)}
   end
 
   def handle_cast({:log_many, entries}, state) do
-    Enum.each(entries, &broadcast_to_subscribers/1)
-    buffer = Enum.reverse(entries, state.buffer)
-    size = state.buffer_size + length(entries)
-
-    if size >= TimelessLogs.Config.max_buffer_size() do
-      state = dispatch_or_queue_batch(Enum.reverse(buffer), state)
-      {:noreply, %{state | buffer: [], buffer_size: 0}}
-    else
-      {:noreply, %{state | buffer: buffer, buffer_size: size}}
-    end
+    {:noreply, accept_entries(state, entries, length(entries))}
   end
 
   @impl true
+  def handle_call({:log_many, entries}, _from, state) do
+    # Backpressure path: identical to the cast, but the producer waited
+    # behind this shard's mailbox for the reply.
+    {:reply, :ok, accept_entries(state, entries, length(entries))}
+  end
+
   def handle_call(:flush, from, state) do
     state =
       if state.buffer != [] do
@@ -122,7 +137,7 @@ defmodule TimelessLogs.Buffer do
         state
       end
 
-    state = dispatch_queued_batches(state)
+    state = state |> dispatch_queued_batches() |> sync_pressure_gauge()
 
     if idle?(state) do
       {:reply, :ok, state}
@@ -141,17 +156,38 @@ defmodule TimelessLogs.Buffer do
       end
 
     schedule_flush(state.flush_interval)
-    {:noreply, %{state | buffer: [], buffer_size: 0}}
+    {:noreply, sync_pressure_gauge(%{state | buffer: [], buffer_size: 0})}
   end
 
-  def handle_info({:flush_done, _ref}, state) do
-    state = %{state | in_flight: max(state.in_flight - 1, 0)}
-    {:noreply, state |> dispatch_queued_batches() |> maybe_reply_flush_waiters()}
+  def handle_info({:flush_done, entry_count}, state) do
+    state = %{
+      state
+      | in_flight: max(state.in_flight - 1, 0),
+        inflight_entries: max(state.inflight_entries - entry_count, 0)
+    }
+
+    {:noreply,
+     state |> dispatch_queued_batches() |> sync_pressure_gauge() |> maybe_reply_flush_waiters()}
   end
 
   def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
     state = %{state | in_flight: max(state.in_flight - 1, 0)}
     {:noreply, state |> dispatch_queued_batches() |> maybe_reply_flush_waiters()}
+  end
+
+  defp accept_entries(state, entries, count) do
+    Enum.each(entries, &broadcast_to_subscribers/1)
+    buffer = Enum.reverse(entries, state.buffer)
+    size = state.buffer_size + count
+
+    state =
+      if size >= TimelessLogs.Config.max_buffer_size() do
+        %{dispatch_or_queue_batch(Enum.reverse(buffer), state) | buffer: [], buffer_size: 0}
+      else
+        %{state | buffer: buffer, buffer_size: size}
+      end
+
+    sync_pressure_gauge(state)
   end
 
   defp dispatch_or_queue_batch([], state), do: state
@@ -160,7 +196,11 @@ defmodule TimelessLogs.Buffer do
     if state.in_flight < @max_in_flight do
       start_flush_task(state, entries)
     else
-      %{state | pending_batches: :queue.in(entries, state.pending_batches)}
+      %{
+        state
+        | pending_batches: :queue.in(entries, state.pending_batches),
+          pending_entries: state.pending_entries + length(entries)
+      }
     end
   end
 
@@ -172,6 +212,7 @@ defmodule TimelessLogs.Buffer do
         {{:value, entries}, rest} ->
           state
           |> Map.put(:pending_batches, rest)
+          |> Map.update!(:pending_entries, &max(&1 - length(entries), 0))
           |> start_flush_task(entries)
           |> dispatch_queued_batches()
 
@@ -184,13 +225,27 @@ defmodule TimelessLogs.Buffer do
   defp start_flush_task(state, entries) do
     data_dir = state.data_dir
     caller = self()
+    entry_count = length(entries)
 
     Task.Supervisor.start_child(TimelessLogs.FlushSupervisor, fn ->
       do_flush_work(entries, data_dir)
-      send(caller, {:flush_done, make_ref()})
+      send(caller, {:flush_done, entry_count})
     end)
 
-    %{state | in_flight: state.in_flight + 1}
+    %{
+      state
+      | in_flight: state.in_flight + 1,
+        inflight_entries: state.inflight_entries + entry_count
+    }
+  end
+
+  defp sync_pressure_gauge(state) do
+    TimelessLogs.IngestPressure.set_queued(
+      state.shard,
+      state.buffer_size + state.pending_entries + state.inflight_entries
+    )
+
+    state
   end
 
   defp maybe_reply_flush_waiters(state) do
