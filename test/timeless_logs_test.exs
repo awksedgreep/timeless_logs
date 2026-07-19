@@ -129,12 +129,55 @@ defmodule TimelessLogsTest do
 
       terms = TimelessLogs.Index.extract_terms(entries)
 
-      assert "level:info" in terms
-      assert "service:api" in terms
-      assert "path:/users" in terms
-      refute Enum.any?(terms, &String.starts_with?(&1, "request_id:"))
-      refute Enum.any?(terms, &String.starts_with?(&1, "duration_ms:"))
-      refute Enum.any?(terms, &String.starts_with?(&1, "webhook_id:"))
+      assert terms["level:info"] == 1
+      assert terms["service:api"] == 1
+      assert terms["path:/users"] == 1
+      refute Enum.any?(Map.keys(terms), &String.starts_with?(&1, "request_id:"))
+      refute Enum.any?(Map.keys(terms), &String.starts_with?(&1, "duration_ms:"))
+      refute Enum.any?(Map.keys(terms), &String.starts_with?(&1, "webhook_id:"))
+    end
+
+    test "metadata queries on non-indexed keys fall back to scanning" do
+      Logger.info("checkout started", request_id: "9f6e7c19f0a24f91")
+      Logger.info("checkout started", request_id: "other-request-id")
+      TimelessLogs.flush()
+
+      {:ok, %TimelessLogs.Result{entries: results, total: total}} =
+        TimelessLogs.query(metadata: %{"request_id" => "9f6e7c19f0a24f91"})
+
+      assert total == 1
+      assert length(results) == 1
+      assert hd(results).metadata["request_id"] == "9f6e7c19f0a24f91"
+    end
+
+    test "count/1 answers term and time filters without materializing entries" do
+      Logger.info("a")
+      Logger.info("b")
+      Logger.error("boom")
+      TimelessLogs.flush()
+
+      assert {:ok, 3} = TimelessLogs.count([])
+      assert {:ok, 1} = TimelessLogs.count(level: :error)
+      assert {:ok, 2} = TimelessLogs.count(level: :info)
+      assert {:ok, 0} = TimelessLogs.count(level: :error, since: System.os_time(:microsecond))
+
+      # Not representable in the term index -> scanning fallback
+      assert {:ok, 1} = TimelessLogs.count(message: "boom")
+    end
+
+    test "second and DateTime time filters match microsecond entries" do
+      Logger.info("cross-unit entry")
+      TimelessLogs.flush()
+
+      since_seconds = System.system_time(:second) - 10
+      {:ok, %{entries: by_seconds}} = TimelessLogs.query(since: since_seconds)
+      assert length(by_seconds) >= 1
+
+      since_dt = DateTime.add(DateTime.utc_now(), -10, :second)
+      {:ok, %{entries: by_datetime}} = TimelessLogs.query(since: since_dt)
+      assert length(by_datetime) >= 1
+
+      {:ok, %{entries: []}} = TimelessLogs.query(since: DateTime.add(DateTime.utc_now(), 3600))
     end
 
     test "message substring search" do

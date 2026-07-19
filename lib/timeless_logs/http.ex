@@ -163,7 +163,7 @@ defmodule TimelessLogs.HTTP do
         {params, _} = Rocket.Request.query_params(req)
         filters = build_query_filters(params)
 
-        case TimelessLogs.query(filters) do
+        case TimelessLogs.query([{:count_total, false} | filters]) do
           {:ok, %{entries: entries}} ->
             send_ndjson_response(req, entries)
 
@@ -185,8 +185,8 @@ defmodule TimelessLogs.HTTP do
 
         case TimelessLogs.LogsQL.parse(query_str) do
           {:stats_count, filters} ->
-            case TimelessLogs.query(filters) do
-              {:ok, %{total: total}} ->
+            case TimelessLogs.count(filters) do
+              {:ok, total} ->
                 ndjson_resp(req, 200, json_encode!(%{total: total}))
 
               {:error, reason} ->
@@ -194,7 +194,7 @@ defmodule TimelessLogs.HTTP do
             end
 
           {:query, filters} ->
-            case TimelessLogs.query(filters) do
+            case TimelessLogs.query([{:count_total, false} | filters]) do
               {:ok, %{entries: entries}} ->
                 send_ndjson_response(req, entries)
 
@@ -374,8 +374,8 @@ defmodule TimelessLogs.HTTP do
   defp parse_ingest_time(nil), do: System.os_time(:microsecond)
 
   defp parse_ingest_time(val) when is_integer(val) do
-    # Unix seconds → microseconds
-    val * 1_000_000
+    # Accepts unix seconds, milliseconds, microseconds, or nanoseconds
+    TimelessLogs.Timestamp.to_microseconds(val)
   end
 
   defp parse_ingest_time(val) when is_binary(val) do

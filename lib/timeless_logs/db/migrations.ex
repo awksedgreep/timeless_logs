@@ -101,7 +101,35 @@ defmodule TimelessLogs.DB.Migrations do
     run_from(conn, 1)
   end
 
-  defp run_from(_conn, 1), do: :ok
+  defp run_from(conn, 1) do
+    execute(conn, "BEGIN")
+
+    # Per-term entry counts let pure term+time queries answer COUNT via
+    # SUM over the index instead of decompressing blocks. Legacy rows keep
+    # entry_count = 0, which readers treat as "unknown — scan the block".
+    execute(conn, "ALTER TABLE term_index ADD COLUMN entry_count INTEGER NOT NULL DEFAULT 0")
+
+    # Normalize block time bounds to the canonical microsecond unit.
+    # Entries stored inside legacy blocks keep their original units; block
+    # selection, ordering, and retention operate on these bounds.
+    for col <- ["ts_min", "ts_max"] do
+      execute(conn, """
+      UPDATE blocks SET #{col} = CASE
+        WHEN #{col} < 100000000000 THEN #{col} * 1000000
+        WHEN #{col} < 100000000000000 THEN #{col} * 1000
+        WHEN #{col} < 100000000000000000 THEN #{col}
+        ELSE #{col} / 1000
+      END
+      """)
+    end
+
+    set_version(conn, 2)
+    execute(conn, "COMMIT")
+
+    run_from(conn, 2)
+  end
+
+  defp run_from(_conn, 2), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     execute_with_retry(conn, sql, params, @max_retries)

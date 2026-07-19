@@ -62,7 +62,8 @@ defmodule TimelessLogs.Retention do
   end
 
   defp cleanup_by_age(max_age_seconds) do
-    cutoff = System.system_time(:second) - max_age_seconds
+    # Block ts bounds are microseconds (canonical unit)
+    cutoff = System.os_time(:microsecond) - max_age_seconds * 1_000_000
     TimelessLogs.Index.delete_blocks_before(cutoff)
   end
 

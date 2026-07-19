@@ -72,7 +72,28 @@ defmodule TimelessLogs do
   """
   @spec ingest([map()]) :: :ok
   def ingest(entries) when is_list(entries) do
-    TimelessLogs.Buffer.log_many(entries)
+    entries
+    |> Enum.map(&normalize_entry_timestamp/1)
+    |> TimelessLogs.Buffer.log_many()
+  end
+
+  defp normalize_entry_timestamp(%{timestamp: ts} = entry),
+    do: %{entry | timestamp: TimelessLogs.Timestamp.to_microseconds(ts)}
+
+  defp normalize_entry_timestamp(entry),
+    do: Map.put(entry, :timestamp, System.os_time(:microsecond))
+
+  @doc """
+  Count entries matching the given filters without materializing them.
+
+  Answered from per-term index counts when the filters allow (level,
+  indexed metadata, time range); otherwise falls back to a scanning count.
+  """
+  @spec count(keyword()) :: {:ok, non_neg_integer()}
+  def count(filters \\ []) do
+    filters
+    |> normalize_filters()
+    |> TimelessLogs.Index.count()
   end
 
   @doc """

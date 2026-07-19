@@ -47,6 +47,5 @@ defmodule TimelessLogs.Filter do
     end)
   end
 
-  defp to_unix(%DateTime{} = dt), do: DateTime.to_unix(dt)
-  defp to_unix(ts) when is_integer(ts), do: ts
+  defp to_unix(ts), do: TimelessLogs.Timestamp.to_microseconds(ts)
 end

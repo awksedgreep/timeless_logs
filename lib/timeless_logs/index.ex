@@ -100,6 +100,131 @@ defmodule TimelessLogs.Index do
      }}
   end
 
+  @doc """
+  Count entries matching the given filters without materializing them.
+
+  When every filter is fully representable in the term index (level,
+  indexed metadata, time range) and at most one term is involved, the
+  count is answered from per-term index counts plus a scan of only the
+  time-boundary blocks. Otherwise falls back to the scanning query path.
+  """
+  @spec count(keyword()) :: {:ok, non_neg_integer()}
+  def count(filters) do
+    db = :persistent_term.get({__MODULE__, :db})
+    storage = :persistent_term.get({__MODULE__, :storage})
+
+    {search_filters, _pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    terms = build_query_terms(term_filters)
+
+    if index_countable?(search_filters, terms) do
+      count_via_index(db, storage, terms, time_filters, search_filters)
+    else
+      {:ok, %{total: total}} =
+        search_filters
+        |> Keyword.merge(limit: 1, count_total: true)
+        |> query()
+
+      {:ok, total}
+    end
+  end
+
+  defp index_countable?(search_filters, terms) do
+    length(terms) <= 1 and
+      Enum.all?(search_filters, fn
+        {:level, _} -> true
+        {:metadata, map} -> Enum.all?(map, fn {k, v} -> indexed_metadata_term(k, v) != nil end)
+        {:since, _} -> true
+        {:until, _} -> true
+        _ -> false
+      end)
+  end
+
+  defp count_via_index(db, storage, terms, time_filters, search_filters) do
+    since_us =
+      case Keyword.get(time_filters, :since) do
+        nil -> nil
+        ts -> to_unix(ts)
+      end
+
+    until_us =
+      case Keyword.get(time_filters, :until) do
+        nil -> nil
+        ts -> to_unix(ts)
+      end
+
+    # A block is "covered" when the time range fully contains it: its
+    # counts apply verbatim. Blocks merely overlapping the range (or with
+    # unknown legacy term counts) are scanned with the full filter set.
+    covered = time_cond(since_us, "b.ts_min >=") ++ time_cond(until_us, "b.ts_max <=")
+    in_range = time_cond(since_us, "b.ts_max >=") ++ time_cond(until_us, "b.ts_min <=")
+    covered_sql = and_clause(covered)
+    not_covered_sql = if covered == [], do: "0", else: "NOT (#{covered_sql})"
+    in_range_sql = and_clause(in_range)
+
+    {sum_sql, sum_params, scan_sql, scan_params} =
+      case terms do
+        [] ->
+          {"SELECT COALESCE(SUM(b.entry_count), 0) FROM blocks b WHERE #{covered_sql}", [],
+           "SELECT b.block_id, b.file_path, b.format FROM blocks b " <>
+             "WHERE #{in_range_sql} AND #{not_covered_sql}", []}
+
+        [term] ->
+          {"SELECT COALESCE(SUM(ti.entry_count), 0) FROM term_index ti " <>
+             "JOIN blocks b ON b.block_id = ti.block_id " <>
+             "WHERE ti.term = ?1 AND ti.entry_count > 0 AND #{covered_sql}", [term],
+           "SELECT b.block_id, b.file_path, b.format FROM term_index ti " <>
+             "JOIN blocks b ON b.block_id = ti.block_id " <>
+             "WHERE ti.term = ?1 AND #{in_range_sql} " <>
+             "AND (ti.entry_count = 0 OR #{not_covered_sql})", [term]}
+      end
+
+    {:ok, [[covered_total]]} = TimelessLogs.DB.read(db, sum_sql, sum_params)
+    {:ok, scan_rows} = TimelessLogs.DB.read(db, scan_sql, scan_params)
+
+    scan_blocks = Enum.map(scan_rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
+
+    {:ok, covered_total + scan_count(scan_blocks, db, storage, search_filters)}
+  end
+
+  defp time_cond(nil, _op), do: []
+  defp time_cond(ts, op), do: ["#{op} #{ts}"]
+
+  defp and_clause([]), do: "1 = 1"
+  defp and_clause(conds), do: Enum.join(conds, " AND ")
+
+  defp scan_count([], _db, _storage, _search_filters), do: 0
+
+  defp scan_count(blocks, db, storage, search_filters) do
+    blocks
+    |> Task.async_stream(
+      fn {block_id, file_path, format} ->
+        read_result =
+          case storage do
+            :disk -> TimelessLogs.Writer.read_block(file_path, format)
+            :memory -> read_block_from_db(db, block_id)
+          end
+
+        case read_result do
+          {:ok, entries} ->
+            entries |> TimelessLogs.Filter.filter(search_filters) |> length()
+
+          {:error, reason} ->
+            TimelessLogs.Telemetry.event(
+              [:timeless_logs, :block, :error],
+              %{},
+              %{file_path: file_path, reason: reason}
+            )
+
+            0
+        end
+      end,
+      max_concurrency: System.schedulers_online(),
+      ordered: false
+    )
+    |> Enum.reduce(0, fn {:ok, n}, acc -> acc + n end)
+  end
+
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
   def matching_block_ids(filters) do
     db = :persistent_term.get({__MODULE__, :db})
@@ -415,14 +540,27 @@ defmodule TimelessLogs.Index do
     )
   end
 
-  defp insert_terms_sql(_conn, [], _block_id), do: :ok
-
   defp insert_terms_sql(conn, terms, block_id) do
-    TimelessLogs.DB.execute_batch(
-      conn,
-      "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
-      Enum.map(terms, &[&1, block_id])
-    )
+    case term_rows(terms, block_id) do
+      [] ->
+        :ok
+
+      rows ->
+        TimelessLogs.DB.execute_batch(
+          conn,
+          "INSERT OR REPLACE INTO term_index (term, block_id, entry_count) VALUES (?1, ?2, ?3)",
+          rows
+        )
+    end
+  end
+
+  # Accepts the %{term => count} map from extract_terms/1; plain term lists
+  # (legacy callers/tests) get entry_count 0, meaning "unknown — scan".
+  defp term_rows(terms, block_id) do
+    Enum.map(terms, fn
+      {term, count} -> [term, block_id, count]
+      term when is_binary(term) -> [term, block_id, 0]
+    end)
   end
 
   defp update_compression_stats_sql(conn, raw_in, compressed_out) do
@@ -648,7 +786,7 @@ defmodule TimelessLogs.Index do
           created_at
         ]
 
-        term_rows = Enum.map(terms, &[&1, meta.block_id])
+        term_rows = term_rows(terms, meta.block_id)
 
         data_rows =
           if state.storage == :memory and meta[:data] do
@@ -671,7 +809,7 @@ defmodule TimelessLogs.Index do
         if term_params_list != [] do
           TimelessLogs.DB.execute_batch(
             conn,
-            "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO term_index (term, block_id, entry_count) VALUES (?1, ?2, ?3)",
             term_params_list
           )
         end
@@ -701,20 +839,18 @@ defmodule TimelessLogs.Index do
 
   # --- Indexing ---
 
-  @spec extract_terms([map()]) :: [String.t()]
+  @spec extract_terms([map()]) :: %{String.t() => pos_integer()}
   def extract_terms(entries) do
-    entries
-    |> Enum.reduce(MapSet.new(), fn entry, acc ->
-      acc = MapSet.put(acc, "level:#{entry.level}")
+    Enum.reduce(entries, %{}, fn entry, acc ->
+      acc = Map.update(acc, "level:#{entry.level}", 1, &(&1 + 1))
 
       Enum.reduce(entry.metadata, acc, fn {k, v}, inner_acc ->
         case indexed_metadata_term(k, v) do
           nil -> inner_acc
-          term -> MapSet.put(inner_acc, term)
+          term -> Map.update(inner_acc, term, 1, &(&1 + 1))
         end
       end)
     end)
-    |> MapSet.to_list()
   end
 
   @indexed_metadata_keys MapSet.new([
@@ -988,9 +1124,23 @@ defmodule TimelessLogs.Index do
 
   defp build_query_terms(term_filters) do
     Enum.flat_map(term_filters, fn
-      {:level, level} -> ["level:#{level}"]
-      {:metadata, map} -> Enum.map(map, fn {k, v} -> "#{k}:#{v}" end)
-      _ -> []
+      {:level, level} ->
+        ["level:#{level}"]
+
+      {:metadata, map} ->
+        # Only terms the write side would actually have indexed may narrow
+        # block selection. A filter on a non-indexed key or high-cardinality
+        # value has no term rows — using it here would silently return
+        # nothing; the per-entry filter handles it instead.
+        Enum.flat_map(map, fn {k, v} ->
+          case indexed_metadata_term(k, v) do
+            nil -> []
+            term -> [term]
+          end
+        end)
+
+      _ ->
+        []
     end)
   end
 
@@ -1074,8 +1224,7 @@ defmodule TimelessLogs.Index do
     list |> Enum.with_index(1) |> Enum.map_join(", ", fn {_, i} -> "?#{i}" end)
   end
 
-  defp to_unix(%DateTime{} = dt), do: DateTime.to_unix(dt)
-  defp to_unix(ts) when is_integer(ts), do: ts
+  defp to_unix(ts), do: TimelessLogs.Timestamp.to_microseconds(ts)
 
   defp to_format_atom("raw"), do: :raw
   defp to_format_atom("zstd"), do: :zstd

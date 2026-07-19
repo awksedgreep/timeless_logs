@@ -22,10 +22,11 @@ defmodule TimelessLogs.Handler do
 
   @spec log(map(), map()) :: :ok
   def log(%{level: level, msg: msg, meta: meta}, _config) do
+    # Canonical unit is microseconds; logger meta time is already µs.
     timestamp =
       case meta do
-        %{time: time} -> div(time, 1_000_000)
-        _ -> System.system_time(:second)
+        %{time: time} -> time
+        _ -> System.os_time(:microsecond)
       end
 
     message = format_msg(msg)
