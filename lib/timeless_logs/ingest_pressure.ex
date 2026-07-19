@@ -21,10 +21,27 @@ defmodule TimelessLogs.IngestPressure do
     :ok
   end
 
-  @spec set_queued(non_neg_integer(), non_neg_integer()) :: :ok
-  def set_queued(shard, n) do
+  # The gauge is a producer-side counter, incremented before the message
+  # is sent and decremented when entries reach disk (or are dropped).
+  # Counting at the send point is what bounds the shard MAILBOX — a
+  # server-side mirror of processed-but-unflushed entries misses casts
+  # queued in the mailbox, which is exactly where overload accumulates.
+  @spec add(non_neg_integer(), pos_integer()) :: :ok
+  def add(shard, n) do
     {ref, _count} = :persistent_term.get(@key)
-    :atomics.put(ref, shard + 1, n)
+    :atomics.add(ref, shard + 1, n)
+  end
+
+  @spec sub(non_neg_integer(), pos_integer()) :: :ok
+  def sub(shard, n) do
+    {ref, _count} = :persistent_term.get(@key)
+    :atomics.sub(ref, shard + 1, n)
+  end
+
+  @spec reset(non_neg_integer()) :: :ok
+  def reset(shard) do
+    {ref, _count} = :persistent_term.get(@key)
+    :atomics.put(ref, shard + 1, 0)
   end
 
   @spec queued(non_neg_integer()) :: non_neg_integer()

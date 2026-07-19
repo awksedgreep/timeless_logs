@@ -21,9 +21,14 @@ defmodule TimelessLogs.Index do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries, terms})
   end
 
-  @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()], [String.t()]) :: :ok
-  def index_block_async(block_meta, entries, terms) do
-    GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms})
+  # `shard`, when given, is credited back to the ingest-pressure gauge
+  # once the block row lands in SQLite — the gauge covers an entry's whole
+  # journey (shard mailbox, flush task, index mailbox), not just the part
+  # before the disk write.
+  @spec index_block_async(TimelessLogs.Writer.block_meta(), [map()], term(), integer() | nil) ::
+          :ok
+  def index_block_async(block_meta, entries, terms, shard \\ nil) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms, shard})
   end
 
   # --- Read functions (use DB reader pool, run in caller's process via DB GenServer) ---
@@ -487,8 +492,8 @@ defmodule TimelessLogs.Index do
   # --- handle_cast ---
 
   @impl true
-  def handle_cast({:index_block, meta, entries, terms}, state) do
-    pending = [{meta, entries, terms} | state.pending]
+  def handle_cast({:index_block, meta, entries, terms, shard}, state) do
+    pending = [{meta, entries, terms, shard} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -772,7 +777,7 @@ defmodule TimelessLogs.Index do
 
     # Collect all block params and term params across all pending blocks
     {block_params_list, term_params_list, data_params_list} =
-      Enum.reduce(resolved, {[], [], []}, fn {meta, _entries, terms}, {bp, tp, dp} ->
+      Enum.reduce(resolved, {[], [], []}, fn {meta, _entries, terms, _shard}, {bp, tp, dp} ->
         format = Map.get(meta, :format, :zstd) |> to_string()
 
         block_row = [
@@ -822,6 +827,15 @@ defmodule TimelessLogs.Index do
           )
         end
       end)
+
+    # Entries are durable and visible now — credit the ingest gauge.
+    Enum.each(resolved, fn
+      {meta, _entries, _terms, shard} when is_integer(shard) ->
+        TimelessLogs.IngestPressure.sub(shard, meta.entry_count)
+
+      _ ->
+        :ok
+    end)
 
     if state.flush_timer do
       Process.cancel_timer(state.flush_timer)

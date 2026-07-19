@@ -42,6 +42,14 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :ingest_raw_debt_limit, 2_000_000_000)
   end
 
+  # How long a paced producer waits for drain capacity before accepting
+  # anyway (with a loud error). Only reachable when the pipeline has
+  # stalled outright.
+  @spec ingest_backpressure_timeout() :: pos_integer()
+  def ingest_backpressure_timeout do
+    Application.get_env(:timeless_logs, :ingest_backpressure_timeout, 60_000)
+  end
+
   # 7 days in seconds
   @default_retention_max_age 7 * 86_400
 

@@ -18,6 +18,7 @@ defmodule TimelessLogs.BackpressureTest do
       Application.stop(:timeless_logs)
       Application.delete_env(:timeless_logs, :ingest_shard_count)
       Application.delete_env(:timeless_logs, :ingest_soft_watermark)
+      Application.delete_env(:timeless_logs, :ingest_backpressure_timeout)
       File.rm_rf!(@data_dir)
     end)
 
@@ -49,8 +50,10 @@ defmodule TimelessLogs.BackpressureTest do
     assert total == 100
   end
 
-  test "ingest above the watermark paces via call, loses nothing" do
+  test "ingest above the watermark paces the producer, loses nothing" do
     Application.put_env(:timeless_logs, :ingest_soft_watermark, 50)
+    # Nothing drains until the explicit flush below, so cap the wait
+    Application.put_env(:timeless_logs, :ingest_backpressure_timeout, 200)
 
     handler_id = {:bp_test, make_ref()}
     parent = self()
