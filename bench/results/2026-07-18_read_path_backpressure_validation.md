@@ -63,12 +63,48 @@ goes.
   cleanup while ingest is backed up; no atom creation from client input;
   shard count scales with cores (4→8 on i185)
 
+## Hot tail (added after the numbers above)
+
+Recent entries are additionally served from an in-memory ETS tail
+(insert at accept — entries are queryable the moment ingest returns;
+window 30s / 250K entries; queries partition at a boundary timestamp so
+tail∪disk is exact with no dedup; retention purges the matching range).
+
+Same workload, tail enabled:
+
+| Ingest | Query p50 (no tail) | Query p50 (tail) | Query p99 (tail) |
+|-------:|--------------------:|-----------------:|-----------------:|
+| 8K/s | 8.0ms | **3.7ms** | 40ms |
+| 63K/s | 34ms | **4.9ms** | 263ms |
+| 126K/s | 96ms | **5.9ms** | 482ms |
+| 227K/s (wall) | 252ms | **11.4ms** | 1.97s |
+
+RSS stays bounded (1.24GB at bench end); the durable ingest wall is
+unchanged. The p99s are the `stats count(*)` queries: exact counts over
+the hot window are a linear chunked pass over up to 250K tail entries —
+the one remaining linear cost (candidate fix: per-term counters in the
+tail, if it ever matters).
+
+It took two iterations to make the tail *help* under load — the first
+full-selected the tail per query (12s p50, 9GB RSS: worse than no tail).
+Same lesson as the disk side, in memory: reads must be bounded
+(prev/next walks for pages, select-continuation chunks for counts,
+select_delete for pruning).
+
 ## Known ceiling / next lever
 
-The durable wall (~212K entries/s here) is the write+index drain —
+The durable wall (~212-227K entries/s here) is the write+index drain —
 single Index GenServer batching into SQLite. Raising it (larger insert
-batches, parallel index partitions) and the queryable hot tail
-(serve `_time:5m`-style queries from an in-memory ring instead of
-re-decompressing the newest raw blocks) are the next levers if log
-volume demands them. Ingest bursts above the wall are absorbed at full
-cast speed up to the watermark (default 50K entries/shard).
+batches, parallel index partitions) is the next lever if log volume
+demands it. Ingest bursts above the wall are absorbed at full cast speed
+up to the watermark (default 50K entries/shard).
+
+## Downstream compatibility (breaking-change sweep)
+
+timeless_ui and timeless_canvas: no timeless_logs usage that the shape
+changes touch (canvas already normalizes timestamp units by magnitude).
+timeless_logs_dashboard: metadata access was already dual-shape-safe and
+its LogsQL filters already string-keyed; the one break was
+`DateTime.from_unix/1` (seconds assumption) in `format_timestamp` —
+fixed with magnitude detection (dashboard commit 541e5dd), compatible
+with both 1.4.x mixed-unit data and 1.5+ canonical µs.
