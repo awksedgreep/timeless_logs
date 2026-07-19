@@ -219,7 +219,7 @@ defmodule TimelessLogs.Index do
             0
         end
       end,
-      max_concurrency: System.schedulers_online(),
+      max_concurrency: TimelessLogs.Config.query_concurrency(),
       ordered: false
     )
     |> Enum.reduce(0, fn {:ok, n}, acc -> acc + n end)
@@ -1040,7 +1040,7 @@ defmodule TimelessLogs.Index do
   end
 
   defp collect_parallel_early_exit(block_ids, search_filters, need, count_total, order) do
-    batch_size = System.schedulers_online()
+    batch_size = TimelessLogs.Config.query_concurrency()
 
     block_ids
     |> Enum.chunk_every(batch_size)

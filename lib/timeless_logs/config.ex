@@ -105,6 +105,18 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :merge_compaction_min_blocks, 4)
   end
 
+  # Parallel block decompressions per query. Half the cores by default so
+  # scan-heavy queries, the flush pipeline, and the compactor can't
+  # mutually starve each other under sustained ingest.
+  @spec query_concurrency() :: pos_integer()
+  def query_concurrency do
+    Application.get_env(
+      :timeless_logs,
+      :query_concurrency,
+      max(div(System.schedulers_online(), 2), 1)
+    )
+  end
+
   # Compression level used when raw debt is past half the ingest limit:
   # trade a little ratio for much higher compaction throughput so the
   # backlog drains before backpressure has to engage.
