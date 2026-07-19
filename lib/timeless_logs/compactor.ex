@@ -140,11 +140,9 @@ defmodule TimelessLogs.Compactor do
     if all_entries == [] do
       :noop
     else
-      # Sum per-entry ETF sizes (logical size before compression)
-      raw_bytes =
-        Enum.reduce(all_entries, 0, fn entry, acc ->
-          acc + byte_size(:erlang.term_to_binary(entry))
-        end)
+      # Logical size before compression: the raw blocks' on-disk sizes
+      # (ETF of the entry lists) — no per-entry re-serialization.
+      raw_bytes = Enum.reduce(raw_blocks, 0, fn {_bid, _fp, bs, _ec}, acc -> acc + bs end)
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
       write_opts = compaction_write_opts(stats.total_bytes)
@@ -325,10 +323,9 @@ defmodule TimelessLogs.Compactor do
     if all_entries == [] do
       :noop
     else
-      raw_bytes =
-        Enum.reduce(all_entries, 0, fn entry, acc ->
-          acc + byte_size(:erlang.term_to_binary(entry))
-        end)
+      # Logical (uncompressed ETF) size for compression stats — one
+      # whole-list serialization, not one per entry.
+      raw_bytes = byte_size(:erlang.term_to_binary(all_entries))
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 

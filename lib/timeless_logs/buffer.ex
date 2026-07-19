@@ -192,7 +192,7 @@ defmodule TimelessLogs.Buffer do
   end
 
   defp accept_entries(state, entries, count) do
-    Enum.each(entries, &broadcast_to_subscribers/1)
+    broadcast_batch(entries)
     buffer = Enum.reverse(entries, state.buffer)
     size = state.buffer_size + count
 
@@ -332,22 +332,24 @@ defmodule TimelessLogs.Buffer do
     Process.send_after(self(), :flush_timer, interval)
   end
 
-  defp broadcast_to_subscribers(entry) do
+  # One subscriber-count check per accepted batch, not per entry.
+  defp broadcast_batch(entries) do
     case Registry.count_match(TimelessLogs.Registry, :log_entries, :_) do
-      0 ->
-        :ok
-
-      _n ->
-        entry_struct = TimelessLogs.Entry.from_map(entry)
-
-        Registry.dispatch(TimelessLogs.Registry, :log_entries, fn subscribers ->
-          for {pid, opts} <- subscribers do
-            if matches_subscription?(entry, opts) do
-              send(pid, {:timeless_logs, :entry, entry_struct})
-            end
-          end
-        end)
+      0 -> :ok
+      _n -> Enum.each(entries, &broadcast_to_subscribers/1)
     end
+  end
+
+  defp broadcast_to_subscribers(entry) do
+    entry_struct = TimelessLogs.Entry.from_map(entry)
+
+    Registry.dispatch(TimelessLogs.Registry, :log_entries, fn subscribers ->
+      for {pid, opts} <- subscribers do
+        if matches_subscription?(entry, opts) do
+          send(pid, {:timeless_logs, :entry, entry_struct})
+        end
+      end
+    end)
   end
 
   defp matches_subscription?(_entry, []), do: true

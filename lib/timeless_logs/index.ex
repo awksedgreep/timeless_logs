@@ -922,17 +922,47 @@ defmodule TimelessLogs.Index do
 
   @spec extract_terms([map()]) :: %{String.t() => pos_integer()}
   def extract_terms(entries) do
-    Enum.reduce(entries, %{}, fn entry, acc ->
-      acc = Map.update(acc, "level:#{entry.level}", 1, &(&1 + 1))
+    # Log batches are highly repetitive: the same {key, value} pairs recur
+    # thousands of times per block, and the indexability verdict for a
+    # pair is deterministic. Run the (comparatively expensive) heuristics
+    # once per distinct pair and only count occurrences per entry.
+    {terms, _memo} =
+      Enum.reduce(entries, {%{}, %{}}, fn entry, {terms, memo} ->
+        terms = Map.update(terms, level_term(entry.level), 1, &(&1 + 1))
 
-      Enum.reduce(entry.metadata, acc, fn {k, v}, inner_acc ->
-        case indexed_metadata_term(k, v) do
-          nil -> inner_acc
-          term -> Map.update(inner_acc, term, 1, &(&1 + 1))
-        end
+        Enum.reduce(entry.metadata, {terms, memo}, fn {k, v}, {t, m} ->
+          # Non-whitelisted keys (request_id and friends, often unique
+          # per entry) are rejected by a set lookup — memoizing them
+          # would just grow the memo by one entry per entry.
+          if indexed_key?(k) do
+            case Map.fetch(m, {k, v}) do
+              {:ok, nil} ->
+                {t, m}
+
+              {:ok, term} ->
+                {Map.update(t, term, 1, &(&1 + 1)), m}
+
+              :error ->
+                term = indexed_metadata_term(k, v)
+                t = if term, do: Map.update(t, term, 1, &(&1 + 1)), else: t
+                {t, Map.put(m, {k, v}, term)}
+            end
+          else
+            {t, m}
+          end
+        end)
       end)
-    end)
+
+    terms
   end
+
+  defp level_term(:debug), do: "level:debug"
+  defp level_term(:info), do: "level:info"
+  defp level_term(:notice), do: "level:notice"
+  defp level_term(:warning), do: "level:warning"
+  defp level_term(:error), do: "level:error"
+  defp level_term(:critical), do: "level:critical"
+  defp level_term(level), do: "level:#{level}"
 
   @indexed_metadata_keys MapSet.new([
                            "application",
@@ -947,6 +977,10 @@ defmodule TimelessLogs.Index do
                            "status",
                            "table"
                          ])
+
+  defp indexed_key?(key) when is_atom(key), do: indexed_key?(Atom.to_string(key))
+  defp indexed_key?(key) when is_binary(key), do: MapSet.member?(@indexed_metadata_keys, key)
+  defp indexed_key?(_key), do: false
 
   defp indexed_metadata_term(key, value)
        when (is_binary(value) or is_atom(value)) and is_atom(key) do
@@ -976,22 +1010,51 @@ defmodule TimelessLogs.Index do
     do: low_cardinality_value?(Atom.to_string(value))
 
   defp low_cardinality_value?(value) when is_binary(value) do
-    byte_size(value) <= 64 and
-      not likely_identifier?(value) and
-      not mostly_numeric?(value)
+    byte_size(value) <= 64 and not high_cardinality_shape?(value)
   end
 
   defp low_cardinality_value?(_value), do: false
 
-  defp likely_identifier?(value) do
-    (String.contains?(value, ["-", "_"]) and String.length(value) >= 12) or
-      String.match?(value, ~r/\A[0-9a-f]{12,}\z/i)
+  # Identifier-like (hyphen/underscore-separated of length >= 12, or a
+  # 12+ char hex string) or mostly-numeric values. A single byte walk
+  # replaces the original regexes — this runs on the flush hot path.
+  # Non-ASCII values fall back to the regex originals for exact
+  # equivalence (the same verdict guards query-side block narrowing).
+  defp high_cardinality_shape?(value) do
+    case ascii_scan(value, 0, 0, 0, true) do
+      {:ascii, len, digits, seps, all_hex} ->
+        (seps > 0 and len >= 12) or (all_hex and len >= 12) or
+          (digits > 0 and digits >= max(div(len * 3, 4), 6))
+
+      :non_ascii ->
+        (String.contains?(value, ["-", "_"]) and String.length(value) >= 12) or
+          String.match?(value, ~r/\A[0-9a-f]{12,}\z/i) or
+          mostly_numeric_regex?(value)
+    end
   end
 
-  defp mostly_numeric?(value) do
+  defp mostly_numeric_regex?(value) do
     digits = String.replace(value, ~r/\D/, "")
     digits != "" and String.length(digits) >= max(div(String.length(value) * 3, 4), 6)
   end
+
+  defp ascii_scan(<<>>, len, digits, seps, all_hex),
+    do: {:ascii, len, digits, seps, all_hex and len > 0}
+
+  defp ascii_scan(<<b, rest::binary>>, len, digits, seps, all_hex) when b < 128 do
+    digit? = b >= ?0 and b <= ?9
+
+    ascii_scan(
+      rest,
+      len + 1,
+      if(digit?, do: digits + 1, else: digits),
+      if(b == ?- or b == ?_, do: seps + 1, else: seps),
+      all_hex and
+        (digit? or (b >= ?a and b <= ?f) or (b >= ?A and b <= ?F))
+    )
+  end
+
+  defp ascii_scan(_value, _len, _digits, _seps, _all_hex), do: :non_ascii
 
   # --- Querying (with early-exit limit) ---
   #
