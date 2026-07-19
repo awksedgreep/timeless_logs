@@ -83,11 +83,42 @@ defmodule TimelessLogs.HotTail do
   end
 
   @doc false
-  # All tail entries with key timestamp in [since_us, until_us] (nil =
-  # unbounded) matching the given per-entry filters. Returns raw entry
-  # maps, unsorted.
-  @spec select(keyword(), integer() | nil, integer() | nil) :: [map()]
-  def select(search_filters, since_us, until_us) do
+  # Exact count of matching entries in the range, traversed in bounded
+  # chunks so no query ever materializes the whole tail.
+  @spec count_matching(keyword(), integer() | nil, integer() | nil) :: non_neg_integer()
+  def count_matching(search_filters, since_us, until_us) do
+    case meta() do
+      nil ->
+        0
+
+      {table, _floor} ->
+        safe(
+          fn ->
+            table
+            |> :ets.select(range_spec(since_us, until_us), 5_000)
+            |> count_chunks(search_filters, 0)
+          end,
+          0
+        )
+    end
+  end
+
+  defp count_chunks(:"$end_of_table", _filters, acc), do: acc
+
+  defp count_chunks({chunk, cont}, filters, acc) do
+    n = Enum.count(chunk, &TimelessLogs.Filter.matches?(&1, filters))
+    count_chunks(:ets.select(cont), filters, acc + n)
+  end
+
+  @doc false
+  # Bounded key walk: at most `max` matching entries from the range,
+  # newest-first for :desc / oldest-first for :asc. O(walked keys), never
+  # a full-table materialization — this is what queries use.
+  @spec take(keyword(), integer() | nil, integer() | nil, :asc | :desc, non_neg_integer()) ::
+          [map()]
+  def take(_search_filters, _since_us, _until_us, _order, 0), do: []
+
+  def take(search_filters, since_us, until_us, order, max) do
     case meta() do
       nil ->
         []
@@ -95,12 +126,56 @@ defmodule TimelessLogs.HotTail do
       {table, _floor} ->
         safe(
           fn ->
-            table
-            |> :ets.select(range_spec(since_us, until_us))
-            |> TimelessLogs.Filter.filter(search_filters)
+            start_key =
+              case order do
+                # :infinity compares greater than any integer uniq, so
+                # prev/next land on the edge key inside the range.
+                :desc ->
+                  case until_us do
+                    nil -> :ets.last(table)
+                    ts -> :ets.prev(table, {ts, :infinity})
+                  end
+
+                :asc ->
+                  case since_us do
+                    nil -> :ets.first(table)
+                    ts -> :ets.next(table, {ts - 1, :infinity})
+                  end
+              end
+
+            walk(table, start_key, since_us, until_us, order, search_filters, max, [])
           end,
           []
         )
+    end
+  end
+
+  defp walk(_table, :"$end_of_table", _since, _until, _order, _filters, _max, acc),
+    do: Enum.reverse(acc)
+
+  defp walk(_table, _key, _since, _until, _order, _filters, 0, acc), do: Enum.reverse(acc)
+
+  defp walk(table, {ts, _uniq} = key, since_us, until_us, order, filters, max, acc) do
+    out_of_range =
+      (order == :desc and since_us != nil and ts < since_us) or
+        (order == :asc and until_us != nil and ts > until_us)
+
+    if out_of_range do
+      Enum.reverse(acc)
+    else
+      {acc, max} =
+        case :ets.lookup(table, key) do
+          [{^key, entry}] ->
+            if TimelessLogs.Filter.matches?(entry, filters),
+              do: {[entry | acc], max - 1},
+              else: {acc, max}
+
+          _ ->
+            {acc, max}
+        end
+
+      next_key = if order == :desc, do: :ets.prev(table, key), else: :ets.next(table, key)
+      walk(table, next_key, since_us, until_us, order, filters, max, acc)
     end
   end
 
@@ -150,31 +225,49 @@ defmodule TimelessLogs.HotTail do
     prune_over_cap(table, TimelessLogs.Config.hot_tail_max_entries())
   end
 
+  # Bulk delete in one locked pass instead of key-at-a-time (at high
+  # ingest the sweep would otherwise fight writers for the table lock
+  # hundreds of thousands of times per second).
   defp prune_older_than(table, cutoff) do
-    case :ets.first(table) do
-      {ts, _uniq} = key when ts < cutoff ->
-        :ets.delete(table, key)
-        prune_older_than(table, cutoff)
-
-      _ ->
-        :ok
-    end
+    :ets.select_delete(table, [{{{:"$1", :_}, :_}, [{:<, :"$1", cutoff}], [true]}])
+    :ok
   end
 
   defp prune_over_cap(table, cap) do
-    if :ets.info(table, :size) > cap do
-      case :ets.first(table) do
+    over = :ets.info(table, :size) - cap
+
+    if over > 0 do
+      case nth_key(table, :ets.first(table), over) do
         :"$end_of_table" ->
           :ok
 
-        key ->
-          :ets.delete(table, key)
-          prune_over_cap(table, cap)
+        {ts, _uniq} ->
+          # Bulk-delete everything strictly older than the nth-oldest
+          # key, then finish the same-µs cluster individually.
+          prune_older_than(table, ts)
+          delete_oldest(table, :ets.info(table, :size) - cap)
       end
     else
       :ok
     end
   end
+
+  defp delete_oldest(_table, n) when n <= 0, do: :ok
+
+  defp delete_oldest(table, n) do
+    case :ets.first(table) do
+      :"$end_of_table" ->
+        :ok
+
+      key ->
+        :ets.delete(table, key)
+        delete_oldest(table, n - 1)
+    end
+  end
+
+  defp nth_key(_table, key, 0), do: key
+  defp nth_key(_table, :"$end_of_table", _n), do: :"$end_of_table"
+  defp nth_key(table, key, n), do: nth_key(table, :ets.next(table, key), n - 1)
 
   defp range_spec(since_us, until_us) do
     guards =

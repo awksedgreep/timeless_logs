@@ -44,22 +44,39 @@ defmodule TimelessLogs.Index do
     # Partition by the hot-tail boundary: memory serves ts >= boundary,
     # disk serves ts < boundary — exact union, no dedup.
     boundary = TimelessLogs.HotTail.boundary()
-    {tail_entries, disk_time_filters} = tail_partition(search_filters, time_filters, boundary)
+
+    {tail_entries, tail_total, disk_time_filters} =
+      tail_partition(search_filters, time_filters, boundary, pagination)
 
     do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, search_filters,
-      tail_entries: tail_entries
+      tail_entries: tail_entries,
+      tail_total: tail_total
     )
   end
 
-  defp tail_partition(search_filters, time_filters, boundary) do
+  # Page entries always come from a bounded walk (never a full-tail
+  # materialization); an exact total, when requested, is a chunked count.
+  defp tail_partition(search_filters, time_filters, boundary, pagination) do
     since_us = time_filter_us(time_filters, :since)
     until_us = time_filter_us(time_filters, :until)
+    tail_since = max(since_us || boundary, boundary)
+    out_of_range = until_us != nil and until_us < boundary
 
     tail_entries =
-      if until_us != nil and until_us < boundary do
+      if out_of_range do
         []
       else
-        TimelessLogs.HotTail.select(search_filters, max(since_us || boundary, boundary), until_us)
+        limit = Keyword.get(pagination, :limit, @default_limit)
+        offset = Keyword.get(pagination, :offset, @default_offset)
+        order = Keyword.get(pagination, :order, :desc)
+        TimelessLogs.HotTail.take(search_filters, tail_since, until_us, order, offset + limit + 1)
+      end
+
+    tail_total =
+      cond do
+        out_of_range -> 0
+        not Keyword.get(pagination, :count_total, true) -> length(tail_entries)
+        true -> TimelessLogs.HotTail.count_matching(search_filters, tail_since, until_us)
       end
 
     disk_time_filters =
@@ -67,7 +84,7 @@ defmodule TimelessLogs.Index do
       |> Keyword.delete(:until)
       |> Keyword.put(:until, min(until_us || boundary - 1, boundary - 1))
 
-    {tail_entries, disk_time_filters}
+    {tail_entries, tail_total, disk_time_filters}
   end
 
   defp time_filter_us(time_filters, key) do
@@ -154,7 +171,10 @@ defmodule TimelessLogs.Index do
     terms = build_query_terms(term_filters)
 
     boundary = TimelessLogs.HotTail.boundary()
-    {tail_entries, disk_time_filters} = tail_partition(search_filters, time_filters, boundary)
+
+    {_tail_entries, tail_total, disk_time_filters} =
+      tail_partition(search_filters, time_filters, boundary, count_total: true, limit: 0)
+
     disk_until = Keyword.fetch!(disk_time_filters, :until)
     disk_search_filters = [{:until, disk_until} | search_filters]
 
@@ -172,7 +192,7 @@ defmodule TimelessLogs.Index do
         {:ok, total}
       end
 
-    {:ok, disk_total + length(tail_entries)}
+    {:ok, disk_total + tail_total}
   end
 
   defp index_countable?(search_filters, terms) do
@@ -1005,6 +1025,8 @@ defmodule TimelessLogs.Index do
       |> Enum.map(&TimelessLogs.Entry.from_map/1)
       |> sort_entries(order)
 
+    tail_total = Keyword.get(opts, :tail_total, length(tail_sorted))
+
     # For :desc the tail (all newer than any disk entry) fills the page
     # first; only the remainder needs disk reads. When the tail alone
     # satisfies the page, skip block selection entirely.
@@ -1041,7 +1063,7 @@ defmodule TimelessLogs.Index do
         :desc -> Enum.sort_by(tail_sorted ++ collected, & &1.timestamp, :desc)
       end
 
-    total = disk_total + length(tail_sorted)
+    total = disk_total + tail_total
     has_more = length(sorted) > need
     page = sorted |> Enum.take(need) |> Enum.drop(offset) |> Enum.take(limit)
 
