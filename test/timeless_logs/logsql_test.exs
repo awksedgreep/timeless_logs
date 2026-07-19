@@ -47,13 +47,13 @@ defmodule TimelessLogs.LogsQLTest do
     test "parses metadata field filter" do
       {:query, filters} = LogsQL.parse("service:dhcp")
       meta = Keyword.get(filters, :metadata, %{})
-      assert meta[:service] == "dhcp"
+      assert meta["service"] == "dhcp"
     end
 
     test "parses quoted metadata value" do
       {:query, filters} = LogsQL.parse(~s(service:"my app"))
       meta = Keyword.get(filters, :metadata, %{})
-      assert meta[:service] == "my app"
+      assert meta["service"] == "my app"
     end
 
     test "parses quoted message search" do
@@ -97,7 +97,7 @@ defmodule TimelessLogs.LogsQLTest do
       assert Keyword.get(filters, :offset) == 0
       assert Keyword.get(filters, :order) == :desc
       meta = Keyword.get(filters, :metadata, %{})
-      assert meta[:service] == "dhcp"
+      assert meta["service"] == "dhcp"
       assert is_integer(Keyword.get(filters, :since))
     end
 

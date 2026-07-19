@@ -348,10 +348,10 @@ defmodule TimelessLogs.HTTP do
 
           timestamp = parse_ingest_time(time_val)
 
-          metadata =
-            map
-            |> Map.drop([msg_field, time_field, "level"])
-            |> Map.new(fn {k, v} -> {String.to_atom(k), v} end)
+          # Keys stay strings: atoms are never GC'd, and metadata keys are
+          # client-controlled — String.to_atom here is a VM-exhaustion
+          # vector. The handler path stores string keys too.
+          metadata = Map.drop(map, [msg_field, time_field, "level"])
 
           {:ok,
            %{timestamp: timestamp, level: level, message: to_string(message), metadata: metadata}}

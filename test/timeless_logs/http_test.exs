@@ -123,8 +123,8 @@ defmodule TimelessLogs.HTTPTest do
       TimelessLogs.flush()
 
       {:ok, %{entries: [entry]}} = TimelessLogs.query([])
-      assert entry.metadata[:service] == "api"
-      assert entry.metadata[:region] == "us-east"
+      assert entry.metadata["service"] == "api"
+      assert entry.metadata["region"] == "us-east"
     end
 
     test "parses ISO8601 timestamps" do

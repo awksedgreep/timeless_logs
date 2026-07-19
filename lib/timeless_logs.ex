@@ -179,11 +179,23 @@ defmodule TimelessLogs do
   defp extract_field(entry, "level"), do: entry.level
 
   defp extract_field(entry, field) do
-    key = String.to_atom(field)
-
     case entry.metadata do
-      meta when is_map(meta) -> Map.get(meta, key)
-      _ -> nil
+      meta when is_map(meta) ->
+        case Map.fetch(meta, field) do
+          {:ok, v} ->
+            v
+
+          :error ->
+            # Field names come from clients; never create atoms from them
+            try do
+              Map.get(meta, String.to_existing_atom(field))
+            rescue
+              ArgumentError -> nil
+            end
+        end
+
+      _ ->
+        nil
     end
   end
 

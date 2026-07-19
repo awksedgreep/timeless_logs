@@ -28,23 +28,37 @@ defmodule TimelessLogs.Filter do
 
       {:metadata, map} ->
         Enum.all?(map, fn {k, v} ->
-          str_key = to_string(k)
-          atom_key = if is_atom(k), do: k, else: String.to_atom(str_key)
-          val = Map.get(entry.metadata, atom_key) || Map.get(entry.metadata, str_key)
-          to_string(val) == to_string(v)
+          to_string(metadata_value(entry.metadata, k)) == to_string(v)
         end)
 
       {:metadata_any, pairs} ->
         Enum.any?(pairs, fn {k, v} ->
-          str_key = to_string(k)
-          atom_key = if is_atom(k), do: k, else: String.to_atom(str_key)
-          val = Map.get(entry.metadata, atom_key) || Map.get(entry.metadata, str_key)
-          to_string(val) == to_string(v)
+          to_string(metadata_value(entry.metadata, k)) == to_string(v)
         end)
 
       _ ->
         true
     end)
+  end
+
+  # Look up under both key shapes without creating atoms from
+  # client-controlled filter keys (atoms are never GC'd).
+  defp metadata_value(metadata, k) when is_atom(k) do
+    Map.get(metadata, k) || Map.get(metadata, Atom.to_string(k))
+  end
+
+  defp metadata_value(metadata, k) when is_binary(k) do
+    case Map.fetch(metadata, k) do
+      {:ok, v} ->
+        v
+
+      :error ->
+        try do
+          Map.get(metadata, String.to_existing_atom(k))
+        rescue
+          ArgumentError -> nil
+        end
+    end
   end
 
   defp to_unix(ts), do: TimelessLogs.Timestamp.to_microseconds(ts)

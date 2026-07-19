@@ -162,10 +162,11 @@ defmodule TimelessLogs.LogsQL do
   defp parse_token(token, acc) do
     case String.split(token, ":", parts: 2) do
       [field, value] ->
+        # String keys: filter and term lookup handle both shapes, and
+        # query fields are client-controlled (no atom creation).
         meta = Keyword.get(acc, :metadata, %{})
-        key = String.to_atom(field)
         val = unquote_value(value)
-        Keyword.put(acc, :metadata, Map.put(meta, key, val))
+        Keyword.put(acc, :metadata, Map.put(meta, field, val))
 
       _ ->
         acc
