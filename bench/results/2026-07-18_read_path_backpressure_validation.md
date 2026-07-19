@@ -91,13 +91,47 @@ Same lesson as the disk side, in memory: reads must be bounded
 (prev/next walks for pages, select-continuation chunks for counts,
 select_delete for pruning).
 
+## The 227K wall, decomposed and moved to 388K
+
+Per-stage microbench of the drain (50K realistic entries, budget at
+227K/s = 4.41µs/entry of serialized time):
+
+| Stage | µs/entry before | after |
+|-------|----------------:|------:|
+| extract_terms (regex heuristics, runs 2x/entry) | **14.52** | **1.93** |
+| Registry.count_match per entry | 2.63 | ~0 (per batch) |
+| :json.decode per NDJSON line | 2.01 | 2.01 (parallel acceptors) |
+| openzl L3 compress | 1.22 | 1.22 |
+| hot tail insert | 0.74 | 0.74 |
+| raw block write | 0.48 | 0.48 |
+| SQLite index insert (batched) | 0.25 | 0.25 |
+
+The wall was NOT the single Index GenServer or SQLite (0.25µs/entry —
+17x headroom); it was CPU in term extraction: regex-powered
+cardinality heuristics per metadata value per entry, twice (flush +
+compaction) ≈ 6.6 cores of regex at 227K/s.
+
+Fixes: verdicts memoized per distinct {key, value} pair per block (log
+batches are repetitive — heuristics now run once per distinct pair, and
+non-whitelisted keys skip the memo since their set-lookup rejection is
+already cheap), byte-walk implementations with exact regex-equivalent
+semantics, subscriber check per batch, no per-entry serialization in
+compactor accounting.
+
+**Result: durable wall 227K → 388K entries/s (+71%).** The former wall
+(247K step) now cruises at write p99 12.3ms. Query p50 3.4–17ms across
+the whole ramp; zero backlog at bench end (13.2M sent == 13.2M on
+disk); RSS 4.1GB at the wall (SQLite mmap of a 2.5GB dataset accounts
+for ~half).
+
 ## Known ceiling / next lever
 
-The durable wall (~212-227K entries/s here) is the write+index drain —
-single Index GenServer batching into SQLite. Raising it (larger insert
-batches, parallel index partitions) is the next lever if log volume
-demands it. Ingest bursts above the wall are absorbed at full cast speed
-up to the watermark (default 50K entries/shard).
+Remaining per-entry costs are :json.decode (~2µs, parallel across HTTP
+acceptors) and the general movement of entry maps through the pipeline.
+Next levers if volume demands: parallel index partitions, NDJSON
+decode in flush tasks, or binary-oriented entry representation. Ingest
+bursts above the wall are absorbed at full cast speed up to the
+watermark (default 50K entries/shard).
 
 ## Downstream compatibility (breaking-change sweep)
 
