@@ -38,7 +38,8 @@ defmodule TimelessLogs.Compactor do
 
   @impl true
   def handle_call(:compact_now, _from, state) do
-    result = maybe_compact(state)
+    result = drain_compact(state)
+    update_raw_debt_gauge()
     {:reply, result, %{state | idle_cycles: 0}}
   end
 
@@ -51,18 +52,40 @@ defmodule TimelessLogs.Compactor do
   def handle_info(:compaction_check, state) do
     compact_result = maybe_compact(state)
     merge_result = maybe_merge_compact(state)
+    update_raw_debt_gauge()
 
-    state =
-      if compact_result == :noop and merge_result == :noop do
-        %{state | idle_cycles: state.idle_cycles + 1}
-      else
-        %{state | idle_cycles: 0}
-      end
+    cond do
+      compact_result == :more ->
+        # Raw debt remains — keep compacting continuously, no idle wait.
+        schedule(0)
+        {:noreply, %{state | idle_cycles: 0}}
 
-    max_backoff = TimelessLogs.Config.compaction_max_backoff()
-    next_interval = min(state.base_interval * Bitwise.bsl(1, state.idle_cycles), max_backoff)
-    schedule(next_interval)
-    {:noreply, state}
+      compact_result == :noop and merge_result == :noop ->
+        state = %{state | idle_cycles: state.idle_cycles + 1}
+        max_backoff = TimelessLogs.Config.compaction_max_backoff()
+        next_interval = min(state.base_interval * Bitwise.bsl(1, state.idle_cycles), max_backoff)
+        schedule(next_interval)
+        {:noreply, state}
+
+      true ->
+        schedule(state.base_interval)
+        {:noreply, %{state | idle_cycles: 0}}
+    end
+  end
+
+  defp update_raw_debt_gauge do
+    stats = TimelessLogs.Index.raw_block_stats()
+    TimelessLogs.IngestPressure.set_raw_debt(stats.total_bytes)
+    stats
+  end
+
+  # Manual compaction keeps its "compact everything" semantics by looping
+  # bounded passes until the backlog is gone.
+  defp drain_compact(state) do
+    case maybe_compact(state) do
+      :more -> drain_compact(state)
+      other -> other
+    end
   end
 
   defp schedule(interval) do
@@ -81,19 +104,27 @@ defmodule TimelessLogs.Compactor do
         stats.block_count > 0
 
     if stats.entry_count >= threshold or age_exceeded do
-      do_compact(state)
+      do_compact(state, stats)
     else
       :noop
     end
   end
 
-  defp do_compact(state) do
+  defp do_compact(state, stats) do
     start_time = System.monotonic_time()
-    raw_blocks = TimelessLogs.Index.raw_block_ids()
+    concurrency = System.schedulers_online()
+    output_target = TimelessLogs.Config.merge_compaction_target_size()
 
-    # Read all entries from raw blocks
+    # Bounded pass: one output block per core. Reading the entire raw
+    # backlog into memory at once is an OOM hazard when the compactor is
+    # behind; the scheduler loops passes back-to-back (:more) instead.
+    entry_budget = concurrency * output_target
+
+    {raw_blocks, leftover} =
+      take_by_entry_budget(TimelessLogs.Index.raw_block_ids(), entry_budget)
+
     all_entries =
-      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs} ->
+      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs, _ec} ->
         read_result =
           case state.storage do
             :disk -> TimelessLogs.Writer.read_block(file_path, :raw)
@@ -116,9 +147,8 @@ defmodule TimelessLogs.Compactor do
         end)
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
-      concurrency = System.schedulers_online()
-
-      chunks = Enum.chunk_every(all_entries, max(div(length(all_entries), concurrency), 1))
+      write_opts = compaction_write_opts(stats.total_bytes)
+      chunks = Enum.chunk_every(all_entries, output_target)
 
       results =
         chunks
@@ -127,7 +157,8 @@ defmodule TimelessLogs.Compactor do
             case TimelessLogs.Writer.write_block(
                    chunk,
                    write_target,
-                   TimelessLogs.Config.compaction_format()
+                   TimelessLogs.Config.compaction_format(),
+                   write_opts
                  ) do
               {:ok, meta} -> {:ok, meta, chunk}
               error -> error
@@ -172,7 +203,7 @@ defmodule TimelessLogs.Compactor do
             %{}
           )
 
-          :ok
+          if leftover, do: :more, else: :ok
       end
     end
   rescue
@@ -188,6 +219,30 @@ defmodule TimelessLogs.Compactor do
       )
 
       :noop
+  end
+
+  defp take_by_entry_budget(blocks, budget) do
+    {taken_rev, _spent, leftover} =
+      Enum.reduce(blocks, {[], 0, false}, fn
+        {_bid, _fp, _bs, ec} = block, {taken, spent, false} when spent < budget ->
+          {[block | taken], spent + ec, false}
+
+        _block, {taken, spent, _} ->
+          {taken, spent, true}
+      end)
+
+    {Enum.reverse(taken_rev), leftover}
+  end
+
+  # Under heavy raw debt, trade compression ratio for throughput so the
+  # backlog drains before ingest backpressure has to engage. Recompaction
+  # to the idle level can happen later via merge passes.
+  defp compaction_write_opts(raw_debt_bytes) do
+    if raw_debt_bytes > div(TimelessLogs.Config.ingest_raw_debt_limit(), 2) do
+      [level: TimelessLogs.Config.compaction_pressure_level()]
+    else
+      []
+    end
   end
 
   # --- Merge compaction ---

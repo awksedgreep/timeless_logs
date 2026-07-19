@@ -18,6 +18,8 @@ defmodule TimelessLogs.CompactorTest do
     Application.put_env(:timeless_logs, :compaction_threshold, 500)
     Application.put_env(:timeless_logs, :compaction_max_raw_age, 3600)
     Application.delete_env(:timeless_logs, :compaction_format)
+    Application.delete_env(:timeless_logs, :merge_compaction_target_size)
+    Application.delete_env(:timeless_logs, :merge_compaction_min_blocks)
     Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
@@ -26,6 +28,8 @@ defmodule TimelessLogs.CompactorTest do
       Application.delete_env(:timeless_logs, :compaction_threshold)
       Application.delete_env(:timeless_logs, :compaction_max_raw_age)
       Application.delete_env(:timeless_logs, :compaction_format)
+      Application.delete_env(:timeless_logs, :merge_compaction_target_size)
+      Application.delete_env(:timeless_logs, :merge_compaction_min_blocks)
       File.rm_rf!(@data_dir)
     end)
 
@@ -243,8 +247,10 @@ defmodule TimelessLogs.CompactorTest do
         TimelessLogs.flush()
       end
 
-      # Compact them into 10 small compressed blocks
+      # Compact them into 10 small compressed blocks (compaction chunks
+      # by merge_compaction_target_size, so force tiny outputs)
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 1)
       assert :ok = TimelessLogs.Compactor.compact_now()
 
       {:ok, stats_before} = TimelessLogs.stats()
@@ -294,8 +300,9 @@ defmodule TimelessLogs.CompactorTest do
       Logger.info("delta", domain: [:app])
       TimelessLogs.flush()
 
-      # Compact raw → compressed
+      # Compact raw → compressed (tiny outputs so merge has work to do)
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 1)
       assert :ok = TimelessLogs.Compactor.compact_now()
 
       # Merge compressed blocks
@@ -322,8 +329,9 @@ defmodule TimelessLogs.CompactorTest do
         TimelessLogs.flush()
       end
 
-      # Compact raw → compressed
+      # Compact raw → compressed (tiny outputs so merge has work to do)
       Application.put_env(:timeless_logs, :compaction_threshold, 1)
+      Application.put_env(:timeless_logs, :merge_compaction_target_size, 1)
       assert :ok = TimelessLogs.Compactor.compact_now()
 
       {:ok, stats_before} = TimelessLogs.stats()

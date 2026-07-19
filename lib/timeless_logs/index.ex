@@ -244,16 +244,16 @@ defmodule TimelessLogs.Index do
 
     {:ok, rows} =
       TimelessLogs.DB.read(db, """
-      SELECT COUNT(*), COALESCE(SUM(entry_count), 0), MIN(created_at)
+      SELECT COUNT(*), COALESCE(SUM(entry_count), 0), COALESCE(SUM(byte_size), 0), MIN(created_at)
       FROM blocks WHERE format = 'raw'
       """)
 
     case rows do
-      [[count, entries, oldest]] ->
-        %{entry_count: entries, block_count: count, oldest_created_at: oldest}
+      [[count, entries, bytes, oldest]] ->
+        %{entry_count: entries, block_count: count, total_bytes: bytes, oldest_created_at: oldest}
 
       _ ->
-        %{entry_count: 0, block_count: 0, oldest_created_at: nil}
+        %{entry_count: 0, block_count: 0, total_bytes: 0, oldest_created_at: nil}
     end
   end
 
@@ -282,12 +282,12 @@ defmodule TimelessLogs.Index do
 
     {:ok, rows} =
       TimelessLogs.DB.read(db, """
-      SELECT block_id, file_path, byte_size
+      SELECT block_id, file_path, byte_size, entry_count
       FROM blocks WHERE format = 'raw'
       ORDER BY ts_min ASC
       """)
 
-    Enum.map(rows, fn [bid, fp, bs] -> {bid, fp, bs} end)
+    Enum.map(rows, fn [bid, fp, bs, ec] -> {bid, fp, bs, ec} end)
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}

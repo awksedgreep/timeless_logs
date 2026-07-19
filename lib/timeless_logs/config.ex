@@ -105,6 +105,14 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :merge_compaction_min_blocks, 4)
   end
 
+  # Compression level used when raw debt is past half the ingest limit:
+  # trade a little ratio for much higher compaction throughput so the
+  # backlog drains before backpressure has to engage.
+  @spec compaction_pressure_level() :: 1..22
+  def compaction_pressure_level do
+    Application.get_env(:timeless_logs, :compaction_pressure_level, 3)
+  end
+
   @spec compaction_max_backoff() :: pos_integer()
   def compaction_max_backoff do
     Application.get_env(:timeless_logs, :compaction_max_backoff, 300_000)
