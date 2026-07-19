@@ -1,8 +1,8 @@
 defmodule Mix.Tasks.TimelessLogs.IndexBenchmark do
-  @moduledoc "Benchmark pure ETS index operations in isolation (no disk I/O)"
+  @moduledoc "Benchmark index operations in isolation (in-memory block storage)"
   use Mix.Task
 
-  @shortdoc "Benchmark index ETS operations with in-memory storage"
+  @shortdoc "Benchmark index operations with in-memory storage"
 
   @block_count 2_000
   @entries_per_block 100
@@ -30,7 +30,7 @@ defmodule Mix.Tasks.TimelessLogs.IndexBenchmark do
     IO.puts("Setup: #{fmt_ms(setup_us)}\n")
 
     {:ok, stats} = TimelessLogs.Index.stats()
-    term_count = :ets.info(:timeless_logs_term_index, :size)
+    term_count = term_index_count()
 
     IO.puts("Total blocks: #{fmt_number(stats.total_blocks)}")
     IO.puts("Total entries: #{fmt_number(stats.total_entries)}")
@@ -101,7 +101,7 @@ defmodule Mix.Tasks.TimelessLogs.IndexBenchmark do
        end},
       {"delete_by_term_limit",
        fn ->
-         half_terms = div(:ets.info(:timeless_logs_term_index, :size), 2)
+         half_terms = div(term_index_count(), 2)
          TimelessLogs.Index.delete_oldest_blocks_until_term_limit(half_terms)
        end}
     ]
@@ -133,6 +133,12 @@ defmodule Mix.Tasks.TimelessLogs.IndexBenchmark do
     IO.puts("Total entries: #{fmt_number(stats.total_entries)}")
 
     Application.stop(:timeless_logs)
+  end
+
+  defp term_index_count do
+    db = :persistent_term.get({TimelessLogs.Index, :db})
+    {:ok, [[count]]} = TimelessLogs.DB.read(db, "SELECT COUNT(*) FROM term_index")
+    count
   end
 
   defp reseed do
