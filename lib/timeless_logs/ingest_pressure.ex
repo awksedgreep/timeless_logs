@@ -50,4 +50,10 @@ defmodule TimelessLogs.IngestPressure do
     queued(shard) >= TimelessLogs.Config.ingest_soft_watermark() or
       raw_debt() >= TimelessLogs.Config.ingest_raw_debt_limit()
   end
+
+  @spec any_overloaded?() :: boolean()
+  def any_overloaded? do
+    {_ref, count} = :persistent_term.get(@key)
+    Enum.any?(0..(count - 1), &overloaded?/1)
+  end
 end

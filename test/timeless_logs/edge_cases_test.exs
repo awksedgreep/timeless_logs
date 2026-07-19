@@ -97,6 +97,9 @@ defmodule TimelessLogs.EdgeCasesTest do
     test "buffer flushes automatically at max_buffer_size" do
       Application.stop(:timeless_logs)
       Application.put_env(:timeless_logs, :max_buffer_size, 5)
+      # One shard so 10 entries reliably cross the threshold
+      Application.put_env(:timeless_logs, :ingest_shard_count, 1)
+      on_exit(fn -> Application.delete_env(:timeless_logs, :ingest_shard_count) end)
       Application.ensure_all_started(:timeless_logs)
 
       for i <- 1..10 do

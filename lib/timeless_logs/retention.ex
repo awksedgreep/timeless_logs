@@ -45,9 +45,20 @@ defmodule TimelessLogs.Retention do
       :noop
     else
       start_time = System.monotonic_time()
+
+      # While ingest is backed up, deleting blocks by size is a treadmill:
+      # the flush backlog immediately rewrites the space. Age-based cleanup
+      # still runs — old data is old regardless of load.
+      overloaded = TimelessLogs.IngestPressure.any_overloaded?()
+
       deleted_age = if max_age, do: cleanup_by_age(max_age), else: 0
-      deleted_size = if max_size, do: cleanup_by_size(max_size), else: 0
-      deleted_terms = if max_term_entries, do: cleanup_by_term_pressure(max_term_entries), else: 0
+      deleted_size = if max_size && not overloaded, do: cleanup_by_size(max_size), else: 0
+
+      deleted_terms =
+        if max_term_entries && not overloaded,
+          do: cleanup_by_term_pressure(max_term_entries),
+          else: 0
+
       total_deleted = deleted_age + deleted_size + deleted_terms
       duration = System.monotonic_time() - start_time
 

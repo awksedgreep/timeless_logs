@@ -135,8 +135,12 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :max_term_index_entries, nil)
   end
 
+  # Scales with cores (i185 audit: 8 shards beat 4 by ~11% on 22
+  # schedulers), clamped so small hosts keep the old default and big
+  # hosts don't multiply idle GenServers.
   @spec ingest_shard_count() :: pos_integer()
   def ingest_shard_count do
-    Application.get_env(:timeless_logs, :ingest_shard_count, 4)
+    default = System.schedulers_online() |> div(2) |> max(4) |> min(8)
+    Application.get_env(:timeless_logs, :ingest_shard_count, default)
   end
 end
