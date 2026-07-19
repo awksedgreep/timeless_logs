@@ -21,10 +21,10 @@ defmodule TimelessLogs.Filter do
           end)
 
       {:since, ts} ->
-        entry.timestamp >= to_unix(ts)
+        TimelessLogs.Timestamp.to_microseconds(entry.timestamp) >= to_unix(ts)
 
       {:until, ts} ->
-        entry.timestamp <= to_unix(ts)
+        TimelessLogs.Timestamp.to_microseconds(entry.timestamp) <= to_unix(ts)
 
       {:metadata, map} ->
         Enum.all?(map, fn {k, v} ->

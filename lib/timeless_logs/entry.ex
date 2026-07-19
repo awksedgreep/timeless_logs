@@ -15,7 +15,10 @@ defmodule TimelessLogs.Entry do
   @spec from_map(map()) :: t()
   def from_map(%{timestamp: ts, level: level, message: message, metadata: metadata}) do
     %__MODULE__{
-      timestamp: ts,
+      # Blocks written before the canonical-µs change may carry
+      # seconds/ms/ns timestamps; normalize on read so consumers always
+      # see microseconds.
+      timestamp: TimelessLogs.Timestamp.to_microseconds(ts),
       level: level,
       message: message,
       metadata: metadata

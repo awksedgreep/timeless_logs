@@ -25,6 +25,7 @@ defmodule TimelessLogs.Buffer do
   @spec log(map()) :: :ok
   def log(entry) do
     shard = TimelessLogs.BufferShard.shard_for(entry)
+    TimelessLogs.HotTail.insert_many([entry])
     TimelessLogs.IngestPressure.add(shard, 1)
     GenServer.cast(TimelessLogs.BufferShard.name(shard), {:log, entry})
   end
@@ -33,6 +34,10 @@ defmodule TimelessLogs.Buffer do
 
   @spec log_many([map()]) :: :ok
   def log_many(entries) when is_list(entries) do
+    # Producer-side tail insert makes entries queryable the moment this
+    # function returns, independent of shard mailbox latency.
+    TimelessLogs.HotTail.insert_many(entries)
+
     entries
     |> Enum.group_by(&TimelessLogs.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_entries} ->

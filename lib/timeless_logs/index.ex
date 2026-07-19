@@ -40,10 +40,41 @@ defmodule TimelessLogs.Index do
 
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :desc)
-    block_ids = find_matching_blocks(db, term_filters, time_filters, order)
 
-    do_query_parallel(block_ids, db, storage, pagination, search_filters)
+    # Partition by the hot-tail boundary: memory serves ts >= boundary,
+    # disk serves ts < boundary — exact union, no dedup.
+    boundary = TimelessLogs.HotTail.boundary()
+    {tail_entries, disk_time_filters} = tail_partition(search_filters, time_filters, boundary)
+
+    do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, search_filters,
+      tail_entries: tail_entries
+    )
+  end
+
+  defp tail_partition(search_filters, time_filters, boundary) do
+    since_us = time_filter_us(time_filters, :since)
+    until_us = time_filter_us(time_filters, :until)
+
+    tail_entries =
+      if until_us != nil and until_us < boundary do
+        []
+      else
+        TimelessLogs.HotTail.select(search_filters, max(since_us || boundary, boundary), until_us)
+      end
+
+    disk_time_filters =
+      time_filters
+      |> Keyword.delete(:until)
+      |> Keyword.put(:until, min(until_us || boundary - 1, boundary - 1))
+
+    {tail_entries, disk_time_filters}
+  end
+
+  defp time_filter_us(time_filters, key) do
+    case Keyword.get(time_filters, key) do
+      nil -> nil
+      ts -> to_unix(ts)
+    end
   end
 
   @spec stats() :: {:ok, TimelessLogs.Stats.t()}
@@ -122,16 +153,26 @@ defmodule TimelessLogs.Index do
     {term_filters, time_filters} = split_filters(search_filters)
     terms = build_query_terms(term_filters)
 
-    if index_countable?(search_filters, terms) do
-      count_via_index(db, storage, terms, time_filters, search_filters)
-    else
-      {:ok, %{total: total}} =
-        search_filters
-        |> Keyword.merge(limit: 1, count_total: true)
-        |> query()
+    boundary = TimelessLogs.HotTail.boundary()
+    {tail_entries, disk_time_filters} = tail_partition(search_filters, time_filters, boundary)
+    disk_until = Keyword.fetch!(disk_time_filters, :until)
+    disk_search_filters = [{:until, disk_until} | search_filters]
 
-      {:ok, total}
-    end
+    {:ok, disk_total} =
+      if index_countable?(search_filters, terms) do
+        count_via_index(db, storage, terms, disk_time_filters, disk_search_filters)
+      else
+        # query/1 sees until < boundary, so its own tail partition is
+        # empty — no double count.
+        {:ok, %{total: total}} =
+          search_filters
+          |> Keyword.merge(until: disk_until, limit: 1, count_total: true)
+          |> query()
+
+        {:ok, total}
+      end
+
+    {:ok, disk_total + length(tail_entries)}
   end
 
   defp index_countable?(search_filters, terms) do
@@ -593,6 +634,8 @@ defmodule TimelessLogs.Index do
         cutoff
       ])
 
+    TimelessLogs.HotTail.prune_before(cutoff)
+
     if rows == [] do
       0
     else
@@ -618,13 +661,13 @@ defmodule TimelessLogs.Index do
       {:ok, rows} =
         TimelessLogs.DB.read(
           db,
-          "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC"
+          "SELECT block_id, file_path, byte_size, ts_max FROM blocks ORDER BY ts_min ASC"
         )
 
       {to_delete, _} =
-        Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs], {acc, remaining} ->
+        Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs, ts_max], {acc, remaining} ->
           if remaining > max_bytes do
-            {:cont, {[{bid, fp} | acc], remaining - bs}}
+            {:cont, {[{bid, fp, ts_max} | acc], remaining - bs}}
           else
             {:halt, {acc, remaining}}
           end
@@ -633,9 +676,11 @@ defmodule TimelessLogs.Index do
       if to_delete == [] do
         0
       else
-        block_ids = Enum.map(to_delete, fn {bid, _fp} -> bid end)
-        file_paths = for {_bid, fp} <- to_delete, is_binary(fp), do: fp
+        block_ids = Enum.map(to_delete, fn {bid, _fp, _ts} -> bid end)
+        file_paths = for {_bid, fp, _ts} <- to_delete, is_binary(fp), do: fp
+        max_ts = to_delete |> Enum.map(fn {_bid, _fp, ts} -> ts end) |> Enum.max()
         delete_block_set(db, block_ids)
+        TimelessLogs.HotTail.prune_before(max_ts + 1)
 
         if storage == :disk do
           Enum.each(file_paths, &File.rm/1)
@@ -654,7 +699,7 @@ defmodule TimelessLogs.Index do
     else
       {:ok, rows} =
         TimelessLogs.DB.read(db, """
-        SELECT b.block_id, b.file_path, COALESCE(t.tc, 0) as term_count
+        SELECT b.block_id, b.file_path, COALESCE(t.tc, 0) as term_count, b.ts_max
         FROM blocks b
         LEFT JOIN (SELECT block_id, COUNT(*) as tc FROM term_index GROUP BY block_id) t
           ON b.block_id = t.block_id
@@ -662,9 +707,9 @@ defmodule TimelessLogs.Index do
         """)
 
       {to_delete, _} =
-        Enum.reduce_while(rows, {[], current_size}, fn [bid, fp, tc], {acc, remaining} ->
+        Enum.reduce_while(rows, {[], current_size}, fn [bid, fp, tc, ts_max], {acc, remaining} ->
           if remaining > max_entries do
-            {:cont, {[{bid, fp} | acc], remaining - tc}}
+            {:cont, {[{bid, fp, ts_max} | acc], remaining - tc}}
           else
             {:halt, {acc, remaining}}
           end
@@ -673,9 +718,11 @@ defmodule TimelessLogs.Index do
       if to_delete == [] do
         0
       else
-        block_ids = Enum.map(to_delete, fn {bid, _fp} -> bid end)
-        file_paths = for {_bid, fp} <- to_delete, is_binary(fp), do: fp
+        block_ids = Enum.map(to_delete, fn {bid, _fp, _ts} -> bid end)
+        file_paths = for {_bid, fp, _ts} <- to_delete, is_binary(fp), do: fp
+        max_ts = to_delete |> Enum.map(fn {_bid, _fp, ts} -> ts end) |> Enum.max()
         delete_block_set(db, block_ids)
+        TimelessLogs.HotTail.prune_before(max_ts + 1)
 
         if storage == :disk do
           Enum.each(file_paths, &File.rm/1)
@@ -934,7 +981,15 @@ defmodule TimelessLogs.Index do
   # as soon as we've accumulated enough filtered entries (offset + limit).
   # This turns an O(all_entries) scan into O(limit) for the common case.
 
-  defp do_query_parallel(block_ids, db, storage, pagination, search_filters) do
+  defp do_query_parallel(
+         db,
+         storage,
+         term_filters,
+         disk_time_filters,
+         pagination,
+         search_filters,
+         opts
+       ) do
     start_time = System.monotonic_time()
 
     limit = Keyword.get(pagination, :limit, @default_limit)
@@ -944,23 +999,49 @@ defmodule TimelessLogs.Index do
     need = offset + limit
     collect_need = if count_total, do: need, else: need + 1
 
-    {collected, total, blocks_read} =
-      collect_with_early_exit(
-        block_ids,
-        db,
-        storage,
-        search_filters,
-        collect_need,
-        count_total,
-        order
-      )
+    tail_sorted =
+      opts
+      |> Keyword.get(:tail_entries, [])
+      |> Enum.map(&TimelessLogs.Entry.from_map/1)
+      |> sort_entries(order)
+
+    # For :desc the tail (all newer than any disk entry) fills the page
+    # first; only the remainder needs disk reads. When the tail alone
+    # satisfies the page, skip block selection entirely.
+    disk_need =
+      if count_total or order == :asc do
+        collect_need
+      else
+        max(collect_need - length(tail_sorted), 0)
+      end
+
+    boundary_until = Keyword.fetch!(disk_time_filters, :until)
+    disk_search_filters = [{:until, boundary_until} | search_filters]
+
+    {collected, disk_total, blocks_read} =
+      if disk_need == 0 and not count_total do
+        {[], 0, 0}
+      else
+        block_ids = find_matching_blocks(db, term_filters, disk_time_filters, order)
+
+        collect_with_early_exit(
+          block_ids,
+          db,
+          storage,
+          disk_search_filters,
+          disk_need,
+          count_total,
+          order
+        )
+      end
 
     sorted =
       case order do
-        :asc -> Enum.sort_by(collected, & &1.timestamp, :asc)
-        :desc -> Enum.sort_by(collected, & &1.timestamp, :desc)
+        :asc -> Enum.sort_by(collected ++ tail_sorted, & &1.timestamp, :asc)
+        :desc -> Enum.sort_by(tail_sorted ++ collected, & &1.timestamp, :desc)
       end
 
+    total = disk_total + length(tail_sorted)
     has_more = length(sorted) > need
     page = sorted |> Enum.take(need) |> Enum.drop(offset) |> Enum.take(limit)
 

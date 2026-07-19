@@ -168,7 +168,9 @@ defmodule TimelessLogs.EdgeCasesTest do
         })
 
       assert %TimelessLogs.Entry{} = entry
-      assert entry.timestamp == 12345
+      # from_map normalizes to canonical microseconds (12345 reads as
+      # legacy unix seconds)
+      assert entry.timestamp == 12_345_000_000
       assert entry.level == :warning
       assert entry.message == "test msg"
       assert entry.metadata == %{"key" => "val"}

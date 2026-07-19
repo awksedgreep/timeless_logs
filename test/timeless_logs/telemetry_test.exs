@@ -13,10 +13,14 @@ defmodule TimelessLogs.TelemetryTest do
     Application.put_env(:timeless_logs, :max_buffer_size, 10_000)
     Application.put_env(:timeless_logs, :retention_max_age, nil)
     Application.put_env(:timeless_logs, :retention_max_size, nil)
+    # These tests assert disk-read telemetry; the hot tail would serve
+    # fresh entries from memory and skip the block reads under test.
+    Application.put_env(:timeless_logs, :hot_tail, false)
     Application.ensure_all_started(:timeless_logs)
 
     on_exit(fn ->
       Application.stop(:timeless_logs)
+      Application.delete_env(:timeless_logs, :hot_tail)
       File.rm_rf!(@data_dir)
     end)
 

@@ -23,10 +23,14 @@ defmodule TimelessLogs.Application do
         {Task.Supervisor, name: TimelessLogs.FlushSupervisor},
         {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
         {TimelessLogs.Retention, []}
-      ] ++ buffer_shards(data_dir) ++ http_child()
+      ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
 
     opts = [strategy: :one_for_one, name: TimelessLogs.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  defp hot_tail_child do
+    if TimelessLogs.Config.hot_tail?(), do: [{TimelessLogs.HotTail, []}], else: []
   end
 
   defp http_child do
