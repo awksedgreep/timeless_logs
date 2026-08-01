@@ -168,3 +168,67 @@ intentional fairness tradeoff: writers now advance instead of allowing an
 unbounded sequence of new reads. Sessions 3 and 4 address the underlying
 query critical-section size and over-materialization rather than weakening
 fairness.
+
+## Session 3 — protected snapshot and streamed materialization
+
+Session 3 splits a query into two phases. Under the engine transition guard
+and extension read permit it resolves posting lists, captures stable block
+locations, and clones matching buffered entries. It then releases both guards
+before reading/decoding one block at a time, filtering, sorting, and rendering
+metadata JSON.
+
+The first prototype copied every candidate payload before releasing the
+guards. It reached 424.8K completed entries/s with one query worker, but its
+widest query retained 304,952,873 payload bytes (290.83MiB). That design was
+rejected. The final extension path relies on the host SQLite SELECT snapshot,
+which keeps deleted/replaced row versions readable on the same reader while a
+writer publishes. It retains locations and streams payloads individually;
+stores without snapshot isolation keep the conservative owned-payload path.
+
+### Final throughput
+
+| query workers | API | completed entries/s | write p99 | query p99 | queued | final drain |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | Elixir baseline | 489.5K | 5.92ms | 1.20s | 2.4K | 24.25ms |
+| 1 | Rust Session 2 | 225.5K | 2.20ms | 1.41s | 0 | 267.67ms |
+| 1 | Rust Session 3 | 479.7K | 1.61ms | 2.40s | 0 | 72.36ms |
+| 2 | Elixir baseline | 465.5K | 7.31ms | 1.79s | 5.1K | 26.02ms |
+| 2 | Rust Session 2 | 152.0K | 1.39ms | 713.54ms | 0 | 2.36ms |
+| 2 | Rust Session 3 | 463.3K | 2.55ms | 2.09s | 0 | 8.64ms |
+
+Session 3 reaches 98.0% of Elixir's one-worker completion rate and 99.5% of
+its two-worker rate. Relative to Session 2's highest clean step, completed
+ingestion improves 2.13x with one query worker and 3.05x with two.
+
+### Boundary attribution
+
+| measurement | Session 2, 1 worker | Session 3, 1 worker | Session 2, 2 workers | Session 3, 2 workers |
+|---|---:|---:|---:|---:|
+| read-permit hold | 7.35s | 85.51ms | 8.32s | 191.67ms |
+| writer wait | 6.90s | 5.01ms | 7.56s | 40.16ms |
+| payload bytes accumulated in snapshots | not measured | 0 | not measured | 0 |
+| payload bytes streamed | not measured | 1.99GB | not measured | 4.01GB |
+| decoded entries | 15.47M | 13.16M | 18.79M | 26.55M |
+| materialized entries | 13.03M | 11.15M | 16.06M | 21.96M |
+| HTTP errors / writer timeouts | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+The protected portion fell by 98.8% with one worker and 97.7% with two;
+writer wait fell by 99.9% and 99.5%. This is why ingestion now stays near its
+no-query ceiling under concurrent reads.
+
+### Memory verdict
+
+Linux `/proc/<pid>/status` reported these process high-water marks:
+
+- rejected all-payload prototype, one worker and 2.97M stored entries:
+  3.86GiB HWM;
+- final streamed path, one worker and 3.13M stored entries: 4.51GiB HWM;
+- final streamed path, two workers and 3.08M stored entries: 7.50GiB HWM.
+
+The final telemetry proves the streamed path accumulated zero payload bytes,
+so Session 3 itself did not add a database-sized payload copy. Overall memory
+is still unacceptable because each broad query decodes and materializes
+millions of owned `LogEntry` and output rows before SQLite applies `LIMIT 50`
+or `LIMIT 100`. Two readers duplicate that work. This is now the explicit
+Session 4 acceptance gate: bounded query pushdown must reduce materialized
+rows and process HWM, not merely preserve ingest throughput.
