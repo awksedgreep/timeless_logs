@@ -137,3 +137,34 @@ queue growth and completion-rate collapse.
 - The next justified change is Session 2 writer fairness and shorter read
   permit lifetime. Query-limit pushdown remains Session 4; this checkpoint
   does not conflate the two effects.
+
+## Session 2 — writer fairness result
+
+Session 2 added one scheduling rule to the shared extension gate: once a
+writer is waiting, later readers retry instead of barging ahead. It also
+releases the logs virtual-table read permit after engine materialization and
+before metadata JSON rendering. Storage, the 8,192-entry buffer, query
+semantics, and block formats are unchanged.
+
+| query workers | measurement | Session 1 | Session 2 | change |
+|---:|---|---:|---:|---:|
+| 1 | completed ingest at 320K/s offered | 162.3K/s | 225.5K/s | +38.9% |
+| 1 | write p99 at that step | 2.75ms | 2.20ms | -20.0% |
+| 1 | query p99 at that step | 1.07s | 1.41s | +31.8% |
+| 2 | completed ingest at 160K/s offered | 85.5K/s | 152.0K/s | +77.8% |
+| 2 | write p99 at that step | 381.93ms | 1.39ms | -99.6% |
+| 2 | query p99 at that step | 524.75ms | 713.54ms | +36.0% |
+
+The comparisons use equal offered-load steps. In the two-worker case, the
+160K step saturated Session 1 but drained completely with low write latency in
+Session 2. The next Session 2 step offered 320K/s, completed 145K/s, and
+crossed the write-p99 ceiling; it is not used as the clean boundary above.
+
+Both Session 2 runs had zero HTTP errors and zero writer timeouts, then drained
+to zero. The one-worker run rejected 316 reader barges and the two-worker run
+rejected 2,401. Those counters demonstrate that the gain came from removing
+reader starvation. The query-p99 increase at maximum write pressure is the
+intentional fairness tradeoff: writers now advance instead of allowing an
+unbounded sequence of new reads. Sessions 3 and 4 address the underlying
+query critical-section size and over-materialization rather than weakening
+fairness.
