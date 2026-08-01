@@ -486,3 +486,132 @@ Session 6's exit criterion is met: entry and byte rewrite amplification and
 maintenance pauses are lower, the budgeted public surface bounds API work,
 compression remains effectively unchanged, and the query trade is small with
 a large win for the latency-sensitive latest-tail shape.
+
+## Session 7 — API scheduling and final boundary verdict
+
+Session 7 uses the same deterministic seed-42 workload, four HTTP writers,
+500 entries/request, one-second warm-up, three-second steps, and
+100→50→25→12.5→6.25→3.125ms interval ramp as Sessions 1–5. Automatic
+compaction was deferred during the raw ingest/query matrix. Every row below is
+extension-completed throughput at the final step, not request admission.
+
+### SQLite reader sweep
+
+Each sweep run used two concurrent query workers over all five pinned LogsQL
+shapes. Every run had zero HTTP errors, zero writer timeouts, and zero queued
+entries at every measurement boundary and after final drain.
+
+| SQLite readers | completed entries/s | write p99 | query p99 | query/s | final drain | process HWM |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 470.3K | **1.61ms** | 383.18ms | 11.0 | 8.49ms | 71,200KiB |
+| **2** | 470.2K | 1.66ms | **260.51ms** | 15.3 | 15.88ms | **62,340KiB** |
+| 4 | 468.2K | 1.77ms | 250.53ms | 16.3 | **5.12ms** | 97,088KiB |
+| 8 | **477.7K** | 2.58ms | 286.96ms | 15.7 | 8.29ms | 127,888KiB |
+
+Two readers are the embedded balance. One leaves useful query parallelism on
+the table. Four buys only 10ms of p99 at 34,748KiB more HWM, while eight is
+slower at the tail and consumes twice the two-reader HWM. The API now defaults
+to two and exposes `TIMELESS_LOGS_READER_CONNECTIONS` for deployments with a
+different measured workload.
+
+The sweep rejects two proposed changes on evidence:
+
+- API query admission is unnecessary: the extension's writer fairness kept
+  the queue empty and completed throughput flat even with eight readers.
+- Grouping already admitted inserts into host transactions has no measured
+  writer bottleneck to solve. It would also make the POC exercise transaction
+  behavior different from direct SQLite/libSQL users.
+
+### Final Rust versus Elixir raw matrix
+
+Both servers used their established storage path and asynchronous HTTP
+admission semantics. Rust used the selected two-reader pool. Counts vary
+slightly because each concurrent three-second step ends on a wall-clock
+boundary; the generated content and query sequence remain deterministic.
+
+| API | query workers | completed entries/s | write p99 | query p99 | query/s | final queue | final drain | process HWM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Rust/libSQL | 0 | 465.8K | 7.27ms | — | — | 0 | 13.12ms | 85,716KiB |
+| Elixir | 0 | **492.7K** | **5.74ms** | — | — | 0 | 16.34ms | 1,311,760KiB |
+| Rust/libSQL | 1 | 471.5K | **1.67ms** | **234.32ms** | **9.0** | 0 | 6.06ms | **73,436KiB** |
+| Elixir | 1 | **489.0K** | 6.52ms | 1.25s | 4.0 | 0 | **1.66ms** | 1,479,264KiB |
+| Rust/libSQL | 2 | **470.2K** | **1.66ms** | **260.51ms** | **15.3** | 0 | 15.88ms | **62,340KiB** |
+| Elixir | 2 | 466.9K | 7.13ms | 1.61s | 8.0 | 0 | **1.91ms** | 1,663,480KiB |
+
+The no-query Rust write p99 is a run-level outlier relative to its own earlier
+steps (1.20–1.49ms) and to the mixed runs, but it is reported unchanged. The
+completed-throughput verdict does not depend on it: Rust is within 5.5% of
+Elixir with no queries, within 3.6% with one, and 0.7% faster with two. Under
+query load, Rust's query tail is 5.3–6.2x faster and process HWM is 20–27x
+smaller.
+
+Raw final storage for the two-query runs:
+
+| measurement | Rust/libSQL | Elixir |
+|---|---:|---:|
+| entries | 3,104,500 | 3,103,501 |
+| raw blocks | 1,496 | 3,091 |
+| logical raw payload | 472,182,063 bytes | 697,797,634 bytes |
+| total physical footprint | 475,918,336-byte SQLite file | 860,630,490 bytes (blocks + index) |
+
+SQLite pages and shadow indexes share one file, while Elixir reports its block
+files and persistent index separately; the physical row accounts for that
+difference. Logical block payload remains the codec measurement. Rust uses
+32.3% less raw payload, 51.6% fewer blocks, and 44.7% less physical space in
+this raw run.
+
+The audit also found that the Rust compatibility endpoint had called a term
+posting-row count `index_size`, whereas Elixir's field is bytes. The endpoint
+now obtains real SQLite page bytes from `dbstat` and reports the row count as
+`term_postings`; unit and extension-backed tests pin the units. The already
+compacted two-reader file could not be re-sampled in its raw state, but the
+same-size zero/one-query raw databases allocate 2,129,920 and 2,125,824 index
+bytes respectively. Physical footprint above was always measured from the
+whole SQLite file and is unaffected by this reporting correction.
+
+### Retained-dataset maintenance drain
+
+The final two-query datasets were restarted without writers and drained
+through each implementation's existing compactor. Rust used the Session 6
+public 32MiB source-byte budget. Elixir used `Compactor.compact_now/0`, whose
+established bounded per-core passes loop until raw debt is zero.
+
+| measurement | Rust/libSQL | Elixir |
+|---|---:|---:|
+| entries | 3,104,500 | 3,103,502 |
+| initial raw blocks / bytes | 1,496 / 472,182,063 | 3,091 / 697,797,634 |
+| bounded optimize turns | 9 | internal bounded passes |
+| aggregate optimize / drain time | **5.55s** | 13.90s |
+| final compressed blocks / bytes | **430 / 27,576,327** | 1,608 / 46,776,363 |
+| compressed bytes/entry | **8.88** | 15.07 |
+| maintenance process HWM | **32,404KiB** | 863,576KiB |
+| final physical footprint | 477,851,648-byte SQLite file | **223,930,971 bytes** (blocks + index) |
+
+Rust's measured extension work is 2.5x shorter, its logical compressed payload
+is 41.0% smaller, and its maintenance HWM is 26.7x smaller. Elixir, however,
+returns obsolete block files immediately and its post-drain physical footprint
+is 2.1x smaller. SQLite reuses freed pages but does not return them to the
+filesystem without a vacuum policy. Session 7 does not add one: long-lived
+ingest can reuse that space, and embedded callers should choose their own
+vacuum/checkpoint policy.
+
+### Final boundary decision
+
+- The POC succeeds as a Rust data-plane boundary. Its HTTP layer feeds the
+  public extension unchanged; it does not reproduce buffering, blocks,
+  partitioning, querying, or compaction.
+- Two SQLite readers are the default. More remain an explicit knob, not a
+  CPU-count heuristic.
+- No API admission controller or host transaction grouper is justified by the
+  final evidence.
+- Direct SQLite/libSQL users receive the query and maintenance improvements
+  from Sessions 2–6 without running this API.
+- The complete workspace suite, strict POC clippy, release builds,
+  extension-backed 8,192-entry HTTP contract, 150K-op oracle, and five
+  kill/reopen rounds all pass in the final 43-section CLI suite.
+- Cluster administration, membership, and Phoenix UI ownership stay outside
+  this data-plane POC.
+
+Session 7's exit criterion is met: the boundary decision is based on completed
+work, exact final drains, measured query tails, logical and physical storage,
+and Linux process high-water memory.
