@@ -62,6 +62,8 @@ defmodule TimelessLogs.HTTPTest do
       assert is_integer(body["blocks"])
       assert is_integer(body["entries"])
       assert is_integer(body["disk_size"])
+      assert is_integer(body["queued_entries"])
+      assert is_integer(body["raw_debt_bytes"])
     end
   end
 

@@ -62,7 +62,8 @@ defmodule LogsHttpWorkload do
           step_seconds: :integer,
           start_interval: :float,
           query_workers: :integer,
-          warmup: :integer
+          warmup: :integer,
+          seed: :integer
         ]
       )
 
@@ -73,6 +74,7 @@ defmodule LogsHttpWorkload do
     start_interval = opts[:start_interval] || 1000.0
     query_workers = opts[:query_workers] || 10
     warmup_s = opts[:warmup] || 5
+    seed = opts[:seed] || 42
 
     IO.puts("")
     IO.puts("  " <> String.duplicate("=", 64))
@@ -82,6 +84,7 @@ defmodule LogsHttpWorkload do
     IO.puts("  Writers:     #{writers} x #{batch} entries/POST (NDJSON /insert/jsonline)")
     IO.puts("  Ramp:        interval ÷2 from #{trunc(start_interval)}ms until saturation")
     IO.puts("  Step dur:    #{step_dur}s (#{warmup_s}s warmup)")
+    IO.puts("  Dataset:     deterministic seed #{seed}")
 
     IO.puts(
       "  Queries:     #{query_workers} workers, LogsQL mix: " <>
@@ -96,23 +99,56 @@ defmodule LogsHttpWorkload do
     )
 
     verify(url)
-    tails = pregenerate_tails(20_000)
+    tails = pregenerate_tails(20_000, seed)
+    body_sequence = :atomics.new(1, [])
+    query_sequence = :atomics.new(1, [])
 
     # Warmup
-    warm_body = build_body(tails, batch)
-
     Enum.each(1..warmup_s, fn _ ->
-      Enum.each(1..writers, fn _ -> post_lines(url, warm_body) end)
+      Enum.each(1..writers, fn _ -> post_lines(url, next_body(tails, batch, body_sequence)) end)
       Process.sleep(1000)
     end)
 
-    steps = ramp(url, tails, writers, batch, step_dur, start_interval, query_workers, [])
+    warmup_drain = drain_and_flush(url)
+    IO.puts("  Warmup drained in #{fmt_us(warmup_drain.elapsed_us)}")
+
+    {steps, admitted} =
+      ramp(
+        url,
+        tails,
+        writers,
+        batch,
+        step_dur,
+        start_interval,
+        query_workers,
+        body_sequence,
+        query_sequence,
+        0,
+        0,
+        []
+      )
 
     print_results(steps)
+    final_drain = drain_and_flush(url)
+    print_drain(admitted, final_drain)
     print_health(url)
+    print_stats(url)
   end
 
-  defp ramp(url, tails, writers, batch, step_dur, interval_ms, query_workers, acc) do
+  defp ramp(
+         url,
+         tails,
+         writers,
+         batch,
+         step_dur,
+         interval_ms,
+         query_workers,
+         body_sequence,
+         query_sequence,
+         admitted_before,
+         completed_before,
+         acc
+       ) do
     target_eps = writers * batch * 1000 / interval_ms
 
     IO.write(
@@ -130,17 +166,31 @@ defmodule LogsHttpWorkload do
       Enum.map(1..writers, fn i ->
         spawn_link(fn ->
           Process.sleep(trunc(interval_ms * (i - 1) / writers))
-          writer_loop(url, tails, batch, interval_ms, write_ets, ctr, stop)
+
+          writer_loop(
+            url,
+            tails,
+            batch,
+            interval_ms,
+            write_ets,
+            ctr,
+            stop,
+            body_sequence
+          )
         end)
       end)
 
     query_pids =
-      Enum.map(1..query_workers, fn i ->
-        spawn_link(fn ->
-          Process.sleep(i * 50)
-          query_loop(url, query_ets, ctr, stop)
+      if query_workers > 0 do
+        Enum.map(1..query_workers, fn i ->
+          spawn_link(fn ->
+            Process.sleep(i * 50)
+            query_loop(url, query_ets, ctr, stop, query_sequence)
+          end)
         end)
-      end)
+      else
+        []
+      end
 
     Process.sleep(step_dur * 1000)
     :atomics.put(stop, 1, 1)
@@ -158,6 +208,11 @@ defmodule LogsHttpWorkload do
     qerrs = :counters.get(ctr, 4)
 
     actual_eps = reqs * batch / step_dur
+    admitted_total = admitted_before + reqs * batch
+    health = health_snapshot(url)
+    queued_entries = health_value(health, "queued_entries")
+    completed_total = max(admitted_total - queued_entries, 0)
+    completed_eps = max(completed_total - completed_before, 0) / step_dur
     err_rate = if reqs + werrs > 0, do: werrs / (reqs + werrs), else: 0.0
     p99 = pct(w_lat, 0.99)
 
@@ -165,6 +220,9 @@ defmodule LogsHttpWorkload do
       interval: interval_ms,
       target_eps: target_eps,
       actual_eps: actual_eps,
+      completed_eps: completed_eps,
+      queued_entries: queued_entries,
+      oldest_queued_ms: health_value(health, "oldest_queued_ms"),
       reqs_s: reqs / step_dur,
       werrs: werrs,
       qps: queries / step_dur,
@@ -200,17 +258,30 @@ defmodule LogsHttpWorkload do
         end
 
       IO.puts("  >> Saturated: #{reason}")
-      Enum.reverse([step | acc])
+      {Enum.reverse([step | acc]), admitted_total}
     else
-      ramp(url, tails, writers, batch, step_dur, interval_ms / 2, query_workers, [step | acc])
+      ramp(
+        url,
+        tails,
+        writers,
+        batch,
+        step_dur,
+        interval_ms / 2,
+        query_workers,
+        body_sequence,
+        query_sequence,
+        admitted_total,
+        completed_total,
+        [step | acc]
+      )
     end
   end
 
-  defp writer_loop(url, tails, batch, interval_ms, ets, ctr, stop) do
+  defp writer_loop(url, tails, batch, interval_ms, ets, ctr, stop, body_sequence) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
-      body = build_body(tails, batch)
+      body = next_body(tails, batch, body_sequence)
       t0 = System.monotonic_time(:microsecond)
       ok = post_lines(url, body)
       elapsed = System.monotonic_time(:microsecond) - t0
@@ -224,15 +295,16 @@ defmodule LogsHttpWorkload do
 
       sleep = max(trunc(interval_ms) - div(elapsed, 1000), 0)
       if sleep > 0, do: Process.sleep(sleep)
-      writer_loop(url, tails, batch, interval_ms, ets, ctr, stop)
+      writer_loop(url, tails, batch, interval_ms, ets, ctr, stop, body_sequence)
     end
   end
 
-  defp query_loop(url, ets, ctr, stop) do
+  defp query_loop(url, ets, ctr, stop, query_sequence) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
-      {_name, q} = Enum.random(@query_templates)
+      query_number = :atomics.add_get(query_sequence, 1, 1) - 1
+      {_name, q} = Enum.at(@query_templates, rem(query_number, length(@query_templates)))
       t0 = System.monotonic_time(:microsecond)
 
       req =
@@ -253,7 +325,7 @@ defmodule LogsHttpWorkload do
       end
 
       Process.sleep(50)
-      query_loop(url, ets, ctr, stop)
+      query_loop(url, ets, ctr, stop, query_sequence)
     end
   end
 
@@ -274,12 +346,18 @@ defmodule LogsHttpWorkload do
 
   # Pre-generate JSON line tails (everything after the timestamp) to keep
   # client CPU out of the measurement. Each POST stamps fresh _time values.
-  defp pregenerate_tails(n) do
+  defp pregenerate_tails(n, seed) do
+    :rand.seed(:exsss, {seed, seed + 1, seed + 2})
+
     tails =
-      Enum.map(1..n, fn _ ->
+      Enum.map(1..n, fn i ->
         svc = Enum.random(@services)
         host = Enum.random(@hosts)
-        req_id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+        req_id =
+          (seed * 1_000_000 + i)
+          |> Integer.to_string(16)
+          |> String.pad_leading(16, "0")
 
         {level, msg, extra} =
           case :rand.uniform(100) do
@@ -307,31 +385,86 @@ defmodule LogsHttpWorkload do
     List.to_tuple(tails)
   end
 
-  defp build_body(tails, batch) do
+  defp next_body(tails, batch, sequence) do
+    request_number = :atomics.add_get(sequence, 1, 1) - 1
+    build_body(tails, batch, request_number)
+  end
+
+  defp build_body(tails, batch, request_number) do
     ts = System.system_time(:second)
     n = tuple_size(tails)
+    start = request_number * batch
 
-    Enum.map(1..batch, fn _ ->
-      [~s({"_time":), Integer.to_string(ts), elem(tails, :rand.uniform(n) - 1), "\n"]
+    Enum.map(0..(batch - 1), fn offset ->
+      [~s({"_time":), Integer.to_string(ts), elem(tails, rem(start + offset, n)), "\n"]
     end)
   end
 
   defp verify(url) do
+    health = health_snapshot(url)
+    IO.puts("  Target OK: #{:json.encode(health)}")
+  end
+
+  defp health_snapshot(url) do
     req = Finch.build(:get, url <> "/health")
 
-    case Finch.request(req, BenchFinch, receive_timeout: 5_000) do
-      {:ok, %{status: 200, body: body}} -> IO.puts("  Target OK: #{body}")
+    case Finch.request(req, BenchFinch, receive_timeout: 60_000) do
+      {:ok, %{status: 200, body: body}} -> :json.decode(body)
       other -> raise "target #{url} not healthy: #{inspect(other)}"
     end
   end
 
-  defp print_health(url) do
-    req = Finch.build(:get, url <> "/health")
+  defp health_value(health, key), do: Map.get(health, key, 0)
 
-    case Finch.request(req, BenchFinch, receive_timeout: 60_000) do
-      {:ok, %{status: 200, body: body}} -> IO.puts("\n  Final /health: #{body}")
-      other -> IO.puts("\n  Final /health failed: #{inspect(other)}")
+  defp drain_and_flush(url) do
+    started = System.monotonic_time(:microsecond)
+    req = Finch.build(:get, url <> "/api/v1/flush")
+
+    case Finch.request(req, BenchFinch, receive_timeout: 120_000) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      other -> raise "target #{url} flush failed: #{inspect(other)}"
     end
+
+    health = await_empty_queue(url, System.monotonic_time(:millisecond) + 120_000)
+    %{elapsed_us: System.monotonic_time(:microsecond) - started, health: health}
+  end
+
+  defp await_empty_queue(url, deadline) do
+    health = health_snapshot(url)
+
+    cond do
+      health_value(health, "queued_entries") == 0 ->
+        health
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        raise "target #{url} did not drain: #{inspect(health)}"
+
+      true ->
+        Process.sleep(20)
+        await_empty_queue(url, deadline)
+    end
+  end
+
+  defp print_health(url) do
+    IO.puts("\n  Final /health: #{:json.encode(health_snapshot(url))}")
+  end
+
+  defp print_stats(url) do
+    req = Finch.build(:get, url <> "/select/logsql/stats")
+
+    case Finch.request(req, BenchFinch, receive_timeout: 120_000) do
+      {:ok, %{status: 200, body: body}} -> IO.puts("  Final /select/logsql/stats: #{body}")
+      other -> raise "target #{url} stats failed: #{inspect(other)}"
+    end
+  end
+
+  defp print_drain(admitted, drain) do
+    queued = health_value(drain.health, "queued_entries")
+
+    IO.puts(
+      "\n  Final drain: admitted=#{admitted}, queued=#{queued}, " <>
+        "flush+drain=#{fmt_us(drain.elapsed_us)}"
+    )
   end
 
   defp print_results(steps) do
@@ -342,7 +475,10 @@ defmodule LogsHttpWorkload do
       "  " <>
         pad("Interval", 10) <>
         pad("Req/s", 8) <>
-        pad("Entries/s", 12) <>
+        pad("Admit/s", 12) <>
+        pad("Done/s", 12) <>
+        pad("Queued", 10) <>
+        pad("Oldest", 10) <>
         pad("p50", 10) <> pad("p99", 10) <> pad("p999", 10) <> pad("errs", 6)
     )
 
@@ -352,6 +488,9 @@ defmodule LogsHttpWorkload do
           pad(fmt_ms(s.interval), 10) <>
           pad("#{trunc(s.reqs_s)}", 8) <>
           pad(fmt_num(s.actual_eps), 12) <>
+          pad(fmt_num(s.completed_eps), 12) <>
+          pad(fmt_num(s.queued_entries), 10) <>
+          pad("#{s.oldest_queued_ms}ms", 10) <>
           pad(fmt_us(s.w_p50), 10) <>
           pad(fmt_us(s.w_p99), 10) <> pad(fmt_us(s.w_p999), 10) <> pad("#{s.werrs}", 6)
       )

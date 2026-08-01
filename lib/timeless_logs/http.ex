@@ -128,7 +128,9 @@ defmodule TimelessLogs.HTTP do
       status: "ok",
       blocks: stats.total_blocks,
       entries: stats.total_entries,
-      disk_size: stats.disk_size
+      disk_size: stats.disk_size,
+      queued_entries: TimelessLogs.IngestPressure.total_queued(),
+      raw_debt_bytes: TimelessLogs.IngestPressure.raw_debt()
     })
   end
 

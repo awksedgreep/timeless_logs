@@ -50,6 +50,12 @@ defmodule TimelessLogs.IngestPressure do
     :atomics.get(ref, shard + 1)
   end
 
+  @spec total_queued() :: non_neg_integer()
+  def total_queued do
+    {_ref, count} = :persistent_term.get(@key)
+    Enum.reduce(0..(count - 1), 0, fn shard, total -> total + queued(shard) end)
+  end
+
   @spec set_raw_debt(non_neg_integer()) :: :ok
   def set_raw_debt(bytes) do
     {ref, count} = :persistent_term.get(@key)
