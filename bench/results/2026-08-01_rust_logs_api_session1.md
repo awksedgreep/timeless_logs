@@ -232,3 +232,84 @@ millions of owned `LogEntry` and output rows before SQLite applies `LIMIT 50`
 or `LIMIT 100`. Two readers duplicate that work. This is now the explicit
 Session 4 acceptance gate: bounded query pushdown must reduce materialized
 rows and process HWM, not merely preserve ingest throughput.
+
+## Session 4 — bounded timestamp windows
+
+Session 4 teaches the `timeless_logs` virtual table to consume exact
+`ORDER BY ts ASC|DESC LIMIT/OFFSET` plans. The engine retains at most
+`LIMIT + OFFSET` rows in a bounded heap, traverses blocks in timestamp-bound
+order, and stops when no remaining block can displace the current window.
+SQLite continues to recheck predicates and apply LIMIT/OFFSET. The extension
+declines the bounded plan for message LIKE, strict timestamp inequalities,
+duplicate predicates, and unsupported filters so a SQLite-side rejection can
+never make the selected prefix incomplete.
+
+### Pinned mixed-workload result
+
+| query workers | Session | completed entries/s | write p99 | query p99 | queued | final drain | process HWM |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | Session 3 | 479.7K | 1.61ms | 2.40s | 0 | 72.36ms | 4.51GiB |
+| 1 | Session 4 | 458.8K | 8.11ms | 1.83s | 0 | 9.32ms | 5.66GiB |
+| 2 | Session 3 | 463.3K | 2.55ms | 2.09s | 0 | 8.64ms | 7.50GiB |
+| 2 | Session 4 | 467.3K | 3.96ms | 1.95s | 0 | 5.04ms | 6.84GiB |
+
+Both Session 4 runs completed every admitted write, reported zero HTTP errors
+and writer timeouts, and held zero queued entries at every step boundary. The
+one-reader throughput difference is within the noise created by a small
+number of multi-second unbounded queries and allocator pressure; the
+two-reader run slightly exceeds Session 3. Query p99 improved 23.8% and 6.7%.
+
+| engine measurement | one reader | two readers |
+|---|---:|---:|
+| queries | 152 | 298 |
+| bounded queries | 92 | 179 |
+| bounded capacity requested | 9,200 | 17,900 |
+| maximum bounded capacity | 100 | 100 |
+| blocks skipped by timestamp bound | 8,087 | 13,415 |
+| total candidate blocks | 15,142 | 27,047 |
+| total decoded entries | 11,248,046 | 22,636,974 |
+| total matched entries visited | 10,969,079 | 22,176,467 |
+| total engine rows returned | 9,820,506 | 19,487,994 |
+| streamed payload bytes | 1.70GB | 3.43GB |
+
+The apparently contradictory result—bounded calls request only 50 or 100
+rows while aggregate returned-row counts remain in the millions—is expected.
+Three of every five workload templates are now bounded (`errors_5m`,
+`service_1h`, `tail_5m`). The substring template still requires SQLite's exact
+LIKE recheck, and the count template still asks SQLite to aggregate a full
+virtual-table rowset. Those two Session 5 shapes dominate query work and peak
+memory.
+
+### Isolated latest-100 proof
+
+After the two-reader run, a single unfiltered latest-100 request was measured
+by stable extension-counter deltas on the 3,109,000-entry raw database:
+
+| measurement | result |
+|---|---:|
+| HTTP elapsed | 78.99ms |
+| engine elapsed | 77.91ms |
+| snapshot / materialize | 1.60ms / 76.31ms |
+| engine rows returned | 100 |
+| candidate blocks | 1,492 |
+| blocks skipped by bound | 1,424 |
+| blocks decoded | 68 |
+| entries decoded | 141,000 |
+| payload bytes read | 20.45MiB |
+
+The dense benchmark packs 3.1M entries into only a 21-second timestamp span,
+so 68 blocks share an overlapping newest bound and cannot be skipped safely.
+Even in that adversarial layout, Session 4 cuts decoded entries by 95.5% and
+bounds owned result rows at exactly 100. On ordinary continuously advancing
+log time ranges, block-bound pruning should be more selective.
+
+### Session 4 verdict
+
+- Exact ASC/DESC, OFFSET, overlapping-block, duplicate-timestamp, buffered,
+  sparse-filter, and fallback regressions are pinned.
+- The complete Rust workspace, all CLI/oracle/crash sections, and the ignored
+  extension-backed 8,192-entry API contract test pass.
+- Limited row queries now satisfy the embedded-memory shape: bounded results
+  plus the decoded blocks whose metadata can overlap the requested edge.
+- Whole mixed-workload memory is not yet acceptable. Native exact message
+  filtering and count are the remaining Session 5 memory gate.
