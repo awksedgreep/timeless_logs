@@ -313,3 +313,84 @@ log time ranges, block-bound pruning should be more selective.
   plus the decoded blocks whose metadata can overlap the requested edge.
 - Whole mixed-workload memory is not yet acceptable. Native exact message
   filtering and count are the remaining Session 5 memory gate.
+
+## Session 5 — native exact filtering and scalar count
+
+Session 5 closes the two remaining database-sized rowsets without changing
+storage policy. The extension now exposes exact case-insensitive substring
+search through the hidden `message_contains` column; unlike compatibility
+`message LIKE`, it filters inside the engine and is safe for bounded ordered
+execution. The one-row `timeless_log_count` TVF counts exact matches without
+materializing rows. Fully covered unfiltered and level-pure blocks use their
+persisted entry counts, while boundary, metadata, legacy-mixed, and message
+filters decode one block at a time.
+
+The Rust API uses those public extension surfaces. They are not API-only
+shortcuts and do not replace the 8,192-entry buffer, raw-first flush, level
+partitioning, block codec, compaction, or transaction model.
+
+### Pinned mixed-workload result
+
+| query workers | Session | completed entries/s | write p99 | query p99 | queued | final drain | process HWM |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | Session 4 | 458.8K | 8.11ms | 1.83s | 0 | 9.32ms | 5.66GiB |
+| 1 | Session 5 | **477.7K** | **1.48ms** | **237.02ms** | 0 | 12.61ms | **124,504KiB** |
+| 2 | Session 4 | 467.3K | 3.96ms | 1.95s | 0 | 5.04ms | 6.84GiB |
+| 2 | Session 5 | **471.7K** | **1.59ms** | **242.36ms** | 0 | **4.55ms** | **105,060KiB** |
+
+Both Session 5 runs completed every admitted write with zero HTTP errors,
+zero writer timeouts, and zero queued entries at every boundary. Query p99
+fell about 87% in both modes. Peak RSS fell roughly 48x with one reader and
+67x with two; the two-reader process finished at 98,396KiB RSS.
+
+| engine measurement | one reader | two readers |
+|---|---:|---:|
+| API calls (row + count) | 255 | 509 |
+| bounded row queries | 204 | 407 |
+| native scalar counts | 51 | 102 |
+| row-query decoded entries | 7,409,593 | 14,393,576 |
+| row-query returned entries | 17,850 | 35,600 |
+| blocks skipped by timestamp bound | 33,558 | 67,450 |
+| native-count metadata blocks | 3,764 | 7,637 |
+| native-count metadata entries | 1,444,311 | 2,910,678 |
+| native-count decoded blocks / entries | 0 / 0 | 0 / 0 |
+| native-count payload bytes | 0 | 0 |
+| read-permit aggregate hold | 181.70ms | 340.43ms |
+| writer aggregate wait | 33.46ms | 91.82ms |
+
+All four row-returning templates, including substring, are now bounded. The
+fifth template is a native scalar count, which explains why row-query count
+plus native-count count equals the API call count.
+
+### Independent query-shape probes
+
+These cold probes used the final two-reader raw database: 3,107,000 entries,
+1,500 blocks, and a deliberately dense 21-second timestamp span.
+
+| query | HTTP | engine | exact work |
+|---|---:|---:|---|
+| `_time:1h level:error \| stats count(*)` | 2.80ms | 1.91ms | 147,885 entries from 375 block headers; zero payload reads |
+| `_time:15m "timeout" \| limit 50` | 150.42ms | 149.00ms | returned 50; skipped 1,388/1,500 blocks; decoded 228,000 entries / 34,677,722 bytes |
+| `_time:1h level:info service:api \| stats count(*)` | 965.69ms | 964.39ms | returned 134,996; decoded 375 blocks / 1,406,253 entries / 208,962,674 bytes |
+| latest 100 | 124.39ms | 123.19ms | returned 100; skipped 1,388/1,500 blocks; decoded 228,000 entries |
+
+The service-plus-level count is the honest hard case. A `service:api` posting
+proves only that a block contains at least one matching row, not that every
+row matches, so exactness requires decoding the selected info blocks. It is
+still block-streamed and scalar: CPU/I/O remains linear, but peak memory no
+longer grows with the 134,996 matching rows.
+
+### Session 5 verdict
+
+- Direct SQLite/libSQL and the API share the same exact filtering and count
+  primitives.
+- Core tests prove metadata-only count performs zero payload reads and every
+  decoded fallback equals the ordinary row-query oracle, including ASCII and
+  Unicode case folding, boundary ranges, metadata filters, and buffered rows.
+- CLI section 42 pins SQL planning, exact results, counters, zero matches, and
+  the reserved hidden-column contract. The extension-backed HTTP test pins
+  the scalar count boundary over the established 8,192-entry flush.
+- The complete workspace suite and final 42-section CLI/oracle/crash suite
+  pass, including the new native-count and exact-substring section.
+- Session 5 meets the whole-workload embedded-memory gate. Session 6 can now
+  focus independently on compaction rewrite amplification.
