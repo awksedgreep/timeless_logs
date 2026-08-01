@@ -394,3 +394,95 @@ longer grows with the 134,996 matching rows.
   pass, including the new native-count and exact-substring section.
 - Session 5 meets the whole-workload embedded-memory gate. Session 6 can now
   focus independently on compaction rewrite amplification.
+
+## Session 6 — bounded size-tiered compaction
+
+Session 6 removes the append-to-compressed-tail behavior measured after
+Session 5. Raw blocks are compressed independently on their first optimize
+turn. Existing compressed cohorts are planned separately and merge only when
+their output is at least half of the 8,192-entry target and at least twice the
+largest source. Compressed merges may reach 125% of the target; that narrow
+overshoot lets two equal ~4,300-entry tiers consolidate instead of remaining
+permanent half-full blocks. The one-hour time-span cap, level partitions,
+atomic SQLite swap, retention behavior, codec, and recovery format are
+unchanged.
+
+The public extension surface now accepts:
+
+```sql
+INSERT INTO logs(logs) VALUES ('optimize:65536');
+```
+
+The value caps source entries selected for one maintenance turn. One complete
+cohort can exceed a smaller budget so work cannot stall. `timeless_stats`
+reports raw compression and compressed merging independently (groups, blocks,
+entries, input/output bytes, and duration), budget counts, exact actionable
+raw/merge backlog, and deferred tails. The Rust API's 30-second timer is only
+a wake-up: it reads those public stats, samples candidate bytes, targets at
+most 32 MiB of source data, and skips the turn when no cohort is actionable.
+
+### Parent versus Session 6
+
+`tools/bench/session6_log_compaction.py` generated 262,144 deterministic
+realistic entries as 128 arrivals of 2,048. Every arrival was explicitly
+flushed and optimized, which is intentionally more aggressive than the API's
+normal timer and repeatedly exercises small tails. Source entries and bytes
+were measured from the exact block IDs removed by each atomic optimize. The
+parent extension was built from `bfd2619`; both runs used the same machine,
+dataset, script, and release profile.
+
+| measurement | parent `bfd2619` | Session 6 | change |
+|---|---:|---:|---:|
+| ingested entries | 262,144 | 262,144 | exact parity |
+| source entries rewritten | 2,032,948 | **632,837** | **68.9% lower** |
+| entry rewrite amplification | 7.755x | **2.414x** | **3.21x lower** |
+| raw bytes initially written | 33,196,198 | 33,196,198 | identical |
+| source bytes rewritten | 39,176,201 | **34,931,284** | **10.8% less amplification** |
+| byte rewrite amplification | 1.180x | **1.052x** | — |
+| optimize aggregate | 1,901.30ms | **737.06ms** | **61.2% lower** |
+| optimize p50 | 15.13ms | **3.15ms** | **79.2% lower** |
+| optimize p95 | 22.19ms | **13.18ms** | **40.6% lower** |
+| optimize p99 | 24.05ms | **19.31ms** | **19.7% lower** |
+| optimize max | 25.05ms | **21.36ms** | **14.7% lower** |
+| final blocks | 37 | 62 | more time-local generations |
+| compressed payload | 827,870 bytes | 845,463 bytes | 2.1% larger |
+| compressed bytes/entry | 3.158 | 3.225 | 2.1% larger |
+
+### Query regression gate
+
+Each p95 is 50 measured calls after one warm-up over the final optimized
+database. Every result was checked for repeatability and total count parity.
+
+| query | parent p95 | Session 6 p95 | result |
+|---|---:|---:|---:|
+| metadata-only error count | 0.035ms | 0.038ms | +0.003ms |
+| decoded info + service count | 44.14ms | 49.05ms | 11.1% slower |
+| bounded latest 100 | 4.88ms | **0.73ms** | **85.1% faster** |
+
+The extra block generations impose a small cost on the decoded full-range
+shape, while their tighter time bounds materially improve newest-first
+pruning. The compressed payload penalty is 2.1%, not the 10.8% seen before
+adding the bounded 125% consolidation ceiling. The existing one-shot
+1M-entry realistic benchmark remains 8.9 bytes/entry and 13.5x smaller than
+the plain table because its raw grouping path is unchanged.
+
+### Regression coverage and verdict
+
+- Core fixtures pin the original 40 × 256 tiny-tail workload: the parent
+  rewrote 144,384 source entries (14.1x), while Session 6 rewrites 22,528
+  (2.2x), returns all 10,240 entries exactly, and reports eight deferred
+  256-entry tails.
+- A second fixture pins 125% consolidation of two uneven 4,298-entry tiers,
+  and the budget fixture proves oldest-first progress, per-turn limits, exact
+  results, and rejection of a zero budget.
+- CLI section 43 exercises the public bounded command, phase/backlog stats,
+  direct count parity, and the 2.2x amplification fixture through SQLite.
+- The extension-backed API test proves its scheduler uses the established
+  8,192-entry level-partitioned flush and then the public bounded optimize
+  command; no host buffer, block writer, or compactor was introduced.
+- The complete workspace tests and 43-section CLI/oracle/crash suite pass.
+
+Session 6's exit criterion is met: entry and byte rewrite amplification and
+maintenance pauses are lower, the budgeted public surface bounds API work,
+compression remains effectively unchanged, and the query trade is small with
+a large win for the latency-sensitive latest-tail shape.
