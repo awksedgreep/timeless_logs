@@ -410,13 +410,17 @@ defmodule TimelessLogs.Index do
     db = Keyword.get(opts, :db, TimelessLogs.DB)
     data_dir = Keyword.get(opts, :data_dir)
 
-    :persistent_term.put({__MODULE__, :storage}, storage)
-    :persistent_term.put({__MODULE__, :db}, db)
+    with :ok <- rebase_block_paths(db, storage, data_dir) do
+      :persistent_term.put({__MODULE__, :storage}, storage)
+      :persistent_term.put({__MODULE__, :db}, db)
 
-    # One-time migration from old ETS snapshot
-    if data_dir, do: maybe_migrate_from_ets(db, data_dir)
+      # One-time migration from old ETS snapshot
+      if data_dir, do: maybe_migrate_from_ets(db, data_dir)
 
-    {:ok, %{storage: storage, db: db, data_dir: data_dir, pending: [], flush_timer: nil}}
+      {:ok, %{storage: storage, db: db, data_dir: data_dir, pending: [], flush_timer: nil}}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
   end
 
   @impl true
@@ -569,6 +573,74 @@ defmodule TimelessLogs.Index do
   end
 
   # --- SQL write helpers ---
+
+  defp rebase_block_paths(_db, storage, _data_dir) when storage != :disk, do: :ok
+  defp rebase_block_paths(_db, :disk, nil), do: {:error, :missing_block_data_dir}
+
+  defp rebase_block_paths(db, :disk, data_dir) do
+    blocks_dir = data_dir |> Path.join("blocks") |> Path.expand()
+
+    with {:ok, rows} <- TimelessLogs.DB.read(db, "SELECT block_id, file_path FROM blocks"),
+         {:ok, updates} <- relocation_updates(rows, blocks_dir) do
+      case updates do
+        [] ->
+          :ok
+
+        updates ->
+          case TimelessLogs.DB.write_transaction(db, fn conn ->
+                 Enum.each(updates, fn {block_id, target} ->
+                   case TimelessLogs.DB.execute(
+                          conn,
+                          "UPDATE blocks SET file_path = ?1 WHERE block_id = ?2",
+                          [target, block_id]
+                        ) do
+                     {:ok, _} -> :ok
+                     {:error, reason} -> raise "rebase block #{block_id}: #{inspect(reason)}"
+                   end
+                 end)
+               end) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, {:block_path_rebase_failed, reason}}
+          end
+      end
+    else
+      {:error, reason} -> {:error, {:block_path_preflight_failed, reason}}
+    end
+  end
+
+  defp relocation_updates(rows, blocks_dir) do
+    Enum.reduce_while(rows, {:ok, []}, fn
+      [_block_id, nil], {:ok, updates} ->
+        {:cont, {:ok, updates}}
+
+      [block_id, file_path], {:ok, updates} when is_binary(file_path) ->
+        current = Path.expand(file_path)
+        target = Path.join(blocks_dir, Path.basename(file_path))
+
+        case File.lstat(target) do
+          {:ok, %File.Stat{type: :regular}} when current == target ->
+            {:cont, {:ok, updates}}
+
+          {:ok, %File.Stat{type: :regular}} ->
+            {:cont, {:ok, [{block_id, target} | updates]}}
+
+          {:error, :enoent} when current == target ->
+            # Preserve the existing missing-block reconciliation behavior for
+            # an in-place store; never follow a path outside this data root.
+            {:cont, {:ok, updates}}
+
+          other ->
+            {:halt,
+             {:error, {:unsafe_block_path, block_id, file_path, target, block_path_reason(other)}}}
+        end
+
+      row, _acc ->
+        {:halt, {:error, {:invalid_block_path_row, row}}}
+    end)
+  end
+
+  defp block_path_reason({:ok, %File.Stat{type: type}}), do: {:unsupported_type, type}
+  defp block_path_reason({:error, reason}), do: reason
 
   defp do_index_block(db, storage, meta, terms) do
     {:ok, _} =

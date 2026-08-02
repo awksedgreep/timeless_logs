@@ -5,6 +5,16 @@ defmodule TimelessLogs.Application do
 
   @impl true
   def start(_type, _args) do
+    opts = [strategy: :one_for_one, name: TimelessLogs.Supervisor]
+    Supervisor.start_link(configured_children(), opts)
+  end
+
+  @doc false
+  def configured_children(owner \\ Application.get_env(:timeless_logs, :owner, :embedded))
+
+  def configured_children(:external), do: []
+
+  def configured_children(:embedded) do
     storage = TimelessLogs.Config.storage()
     data_dir = TimelessLogs.Config.data_dir()
 
@@ -15,18 +25,19 @@ defmodule TimelessLogs.Application do
 
     TimelessLogs.IngestPressure.install(TimelessLogs.BufferShard.count())
 
-    children =
-      [
-        {Registry, keys: :duplicate, name: TimelessLogs.Registry},
-        {TimelessLogs.DB, name: TimelessLogs.DB, data_dir: data_dir, clean: storage == :memory},
-        {TimelessLogs.Index, data_dir: data_dir, storage: storage, db: TimelessLogs.DB},
-        {Task.Supervisor, name: TimelessLogs.FlushSupervisor},
-        {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
-        {TimelessLogs.Retention, []}
-      ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
+    [
+      {Registry, keys: :duplicate, name: TimelessLogs.Registry},
+      {TimelessLogs.DB, name: TimelessLogs.DB, data_dir: data_dir, clean: storage == :memory},
+      {TimelessLogs.Index, data_dir: data_dir, storage: storage, db: TimelessLogs.DB},
+      {Task.Supervisor, name: TimelessLogs.FlushSupervisor},
+      {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
+      {TimelessLogs.Retention, []}
+    ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
+  end
 
-    opts = [strategy: :one_for_one, name: TimelessLogs.Supervisor]
-    Supervisor.start_link(children, opts)
+  def configured_children(owner) do
+    raise ArgumentError,
+          "invalid :timeless_logs :owner #{inspect(owner)}; expected :embedded or :external"
   end
 
   defp hot_tail_child do
