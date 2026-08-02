@@ -175,7 +175,9 @@ defmodule TimelessLogs.ReleaseStartup do
   defp create_fresh_target(target, opts) do
     case LibsqlCandidate.start_link(
            path: target,
-           extension_path: Keyword.get(opts, :extension_path)
+           extension_path: Keyword.get(opts, :extension_path),
+           retention_seconds:
+             Keyword.get(opts, :retention_seconds, TimelessLogs.Config.retention_max_age())
          ) do
       {:ok, writer} -> GenServer.stop(writer)
       {:error, reason} -> {:error, reason}
@@ -303,6 +305,7 @@ defmodule TimelessLogs.ReleaseStartup do
                  {:ok, [["ok"]]} <- execute(conn, "PRAGMA integrity_check"),
                  :ok <- require_signal_vtable(conn),
                  :ok <- require_schema_version(conn),
+                 :ok <- require_retention(conn, opts),
                  result <- inspect_role(conn, role) do
               result
             else
@@ -330,6 +333,37 @@ defmodule TimelessLogs.ReleaseStartup do
         end
     end
   end
+
+  defp require_retention(conn, opts) do
+    seconds = Keyword.get(opts, :retention_seconds, TimelessLogs.Config.retention_max_age())
+    expected = if is_integer(seconds), do: seconds * 1_000_000, else: nil
+
+    with :ok <- validate_retention_seconds(seconds),
+         {:ok, rows} <-
+           execute(conn, "SELECT CAST(v AS INTEGER) FROM logs_meta WHERE k='retention'") do
+      actual =
+        case rows do
+          [[value]] -> value
+          [] -> nil
+        end
+
+      if actual == expected do
+        :ok
+      else
+        {:state, :incompatible_version,
+         %{
+           error:
+             "logs retention mismatch: startup requires #{inspect(expected)} native units, database stores #{inspect(actual)}"
+         }}
+      end
+    end
+  end
+
+  defp validate_retention_seconds(nil), do: :ok
+  defp validate_retention_seconds(seconds) when is_integer(seconds) and seconds > 0, do: :ok
+
+  defp validate_retention_seconds(value),
+    do: {:error, "invalid logs retention seconds #{inspect(value)}"}
 
   defp inspect_role(conn, :target) do
     with {:ok, exists} <- table_exists?(conn, "_timeless_cutover") do

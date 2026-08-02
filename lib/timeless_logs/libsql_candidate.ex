@@ -61,10 +61,15 @@ defmodule TimelessLogs.LibsqlCandidate do
   def init(opts) do
     path = Keyword.fetch!(opts, :path)
     extension = Keyword.get(opts, :extension_path) || extension_path!()
+
+    retention_seconds =
+      Keyword.get(opts, :retention_seconds, TimelessLogs.Config.retention_max_age())
+
     File.mkdir_p!(Path.dirname(path))
 
-    with {:ok, conn, capabilities} <- open_connection(path, extension),
-         :ok <- initialize_database(conn, capabilities) do
+    with :ok <- validate_retention(retention_seconds),
+         {:ok, conn, capabilities} <- open_connection(path, extension),
+         :ok <- initialize_database(conn, capabilities, retention_seconds) do
       {:ok, %{conn: conn, path: path}}
     else
       {:error, reason} -> {:stop, reason}
@@ -256,14 +261,14 @@ defmodule TimelessLogs.LibsqlCandidate do
 
   defp json_value(value), do: raise(ArgumentError, "unsupported JSON term #{inspect(value)}")
 
-  defp initialize_database(conn, capabilities) do
+  defp initialize_database(conn, capabilities, retention_seconds) do
     statements = [
       "PRAGMA page_size = 16384",
       "PRAGMA journal_mode = WAL",
       "PRAGMA synchronous = NORMAL",
       "PRAGMA auto_vacuum = INCREMENTAL",
       "PRAGMA busy_timeout = 5000",
-      "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='service,path,status,host',timestamp_unit='us')",
+      logs_create(retention_seconds),
       """
       CREATE TABLE IF NOT EXISTS _timeless_schema_migrations(
         signal TEXT NOT NULL,
@@ -290,6 +295,18 @@ defmodule TimelessLogs.LibsqlCandidate do
       end
     end
   end
+
+  defp logs_create(nil) do
+    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='service,path,status,host',timestamp_unit='us')"
+  end
+
+  defp logs_create(seconds) do
+    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='service,path,status,host',timestamp_unit='us',retention='#{seconds}s')"
+  end
+
+  defp validate_retention(nil), do: :ok
+  defp validate_retention(seconds) when is_integer(seconds) and seconds > 0, do: :ok
+  defp validate_retention(value), do: {:error, "invalid logs retention seconds #{inspect(value)}"}
 
   defp execute_all(conn, statements) do
     Enum.reduce_while(statements, :ok, fn sql, :ok ->

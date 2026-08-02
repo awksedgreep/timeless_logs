@@ -25,7 +25,9 @@ defmodule TimelessLogs.ReleaseMigration do
          {:ok, candidate} <-
            LibsqlCandidate.start_link(
              path: candidate_db,
-             extension_path: Keyword.get(opts, :extension_path)
+             extension_path: Keyword.get(opts, :extension_path),
+             retention_seconds:
+               Keyword.get(opts, :retention_seconds, TimelessLogs.Config.retention_max_age())
            ) do
       try do
         with {:ok, journal} <- initialize_or_resume(candidate, manifest, inventory),

@@ -22,6 +22,7 @@ defmodule TimelessLogs.ReleaseStartupTest do
              ReleaseStartup.prepare(root, opts())
 
     assert File.regular?(target)
+    assert_retention(target, 7 * 86_400 * 1_000_000)
 
     assert {:ok, %{state: :valid_libsql, ready: true}} =
              ReleaseStartup.prepare(root, opts())
@@ -34,6 +35,21 @@ defmodule TimelessLogs.ReleaseStartupTest do
 
     assert error =~ "capability handshake failed"
     refute File.exists?(Path.join(incompatible, "logs.db"))
+  end
+
+  test "fresh startup persists the configured retention in the public virtual table" do
+    root = temp_dir("logs_startup_retention")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, %{target_path: target}} =
+             ReleaseStartup.prepare(root, Keyword.put(opts(), :retention_seconds, 90))
+
+    assert_retention(target, 90 * 1_000_000)
+
+    assert {:ok, %{state: :incompatible_version, error: error}} =
+             ReleaseStartup.detect(root, opts())
+
+    assert error =~ "retention mismatch"
   end
 
   test "legacy, resumable, cutover, and post-rename crash states are exact" do
@@ -412,7 +428,14 @@ defmodule TimelessLogs.ReleaseStartupTest do
 
   defp create_target(path) do
     File.mkdir_p!(Path.dirname(path))
-    {:ok, writer} = LibsqlCandidate.start_link(path: path, extension_path: extension_path())
+
+    {:ok, writer} =
+      LibsqlCandidate.start_link(
+        path: path,
+        extension_path: extension_path(),
+        retention_seconds: 7 * 86_400
+      )
+
     GenServer.stop(writer)
   end
 
@@ -476,7 +499,22 @@ defmodule TimelessLogs.ReleaseStartupTest do
     end
   end
 
-  defp opts, do: [extension_path: extension_path()]
+  defp assert_retention(path, expected) do
+    assert {:ok, conn, _} = LibsqlCandidate.open_readonly_connection(path, extension_path())
+
+    try do
+      assert {:ok, [[^expected]]} =
+               DB.execute(
+                 conn,
+                 "SELECT CAST(v AS INTEGER) FROM logs_meta WHERE k='retention'",
+                 []
+               )
+    after
+      Exqlite.Sqlite3.close(conn)
+    end
+  end
+
+  defp opts, do: [extension_path: extension_path(), retention_seconds: 7 * 86_400]
 
   defp extension_path do
     System.get_env("TIMELESS_EXT_PATH") ||
