@@ -69,6 +69,41 @@ defmodule TimelessLogs.ReleaseMigration do
     Path.join([Path.expand(data_dir), ".timeless-migration", @signal, "logs.db"])
   end
 
+  @doc false
+  def legacy_manifest(data_dir, opts \\ []) do
+    data_dir = Path.expand(data_dir)
+
+    with {:ok, reader} <- LegacyReader.open(data_dir, opts) do
+      try do
+        source_manifest(data_dir, LegacyReader.manifest_paths(reader))
+      after
+        LegacyReader.close(reader)
+      end
+    end
+  end
+
+  @doc false
+  def validate_checkpoint(path, opts \\ []) do
+    with {:ok, conn} <- Exqlite.Sqlite3.open(path, mode: :readonly) do
+      result =
+        case DB.execute(
+               conn,
+               "SELECT records_completed,identity_digest FROM _timeless_migration WHERE singleton=1",
+               []
+             ) do
+          {:ok, [[completed, digest]]} -> {:ok, completed, digest}
+          other -> {:error, "invalid logs checkpoint journal: #{inspect(other)}"}
+        end
+
+      Exqlite.Sqlite3.close(conn)
+
+      with {:ok, completed, digest} <- result,
+           {:ok, _} <- cold_validate(path, completed, digest, opts) do
+        :ok
+      end
+    end
+  end
+
   defp initialize_or_resume(candidate, manifest, inventory) do
     for sql <- [
           """
@@ -312,7 +347,7 @@ defmodule TimelessLogs.ReleaseMigration do
 
   defp cold_validate(path, expected_count, expected_digest, opts) do
     with {:ok, conn, _capabilities} <-
-           LibsqlCandidate.open_connection(path, Keyword.get(opts, :extension_path)) do
+           LibsqlCandidate.open_readonly_connection(path, Keyword.get(opts, :extension_path)) do
       try do
         with {:ok, [["ok"]]} <- DB.execute(conn, "PRAGMA integrity_check", []),
              {:ok, [[native_count]]} <- DB.execute(conn, "SELECT COUNT(*) FROM logs", []),

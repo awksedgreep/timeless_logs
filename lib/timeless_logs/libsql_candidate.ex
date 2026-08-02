@@ -22,9 +22,18 @@ defmodule TimelessLogs.LibsqlCandidate do
 
   @doc false
   def open_connection(path, extension_path \\ nil) do
+    open_connection(path, extension_path, [])
+  end
+
+  @doc false
+  def open_readonly_connection(path, extension_path \\ nil) do
+    open_connection(path, extension_path, mode: :readonly)
+  end
+
+  defp open_connection(path, extension_path, open_options) do
     extension = extension_path || extension_path!()
 
-    case Exqlite.Sqlite3.open(path) do
+    case Exqlite.Sqlite3.open(path, open_options) do
       {:ok, conn} ->
         case load_and_verify(conn, extension) do
           {:ok, capabilities} ->
