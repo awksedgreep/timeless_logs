@@ -30,7 +30,10 @@ jobs:
 
       - name: Build timeless-libsql extension
         working-directory: timeless-libsql
-        run: cargo build --locked --release -p timeless-ext
+        run: |
+          cargo build --locked --release -p timeless-ext
+          mkdir -p ../../timeless-libsql/target/release
+          cp target/release/libtimeless_ext.so ../../timeless-libsql/target/release/libtimeless_ext.so
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y cmake
