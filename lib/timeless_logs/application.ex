@@ -21,18 +21,6 @@ defmodule TimelessLogs.Application do
     end
   end
 
-  # Opt-in libSQL engine (port plan Session 1): one in-process writer over
-  # the timeless-libsql vtab. Subscriptions keep their Registry; the
-  # legacy buffer/index/compactor/hot-tail pipeline does not start.
-  defp libsql_children do
-    TimelessLogs.StorageEngine.put_engine(:libsql)
-
-    [
-      {Registry, keys: :duplicate, name: TimelessLogs.Registry},
-      {TimelessLogs.LibsqlEngine, []}
-    ]
-  end
-
   defp elixir_children do
     TimelessLogs.StorageEngine.put_engine(:elixir)
     storage = TimelessLogs.Config.storage()
@@ -58,6 +46,18 @@ defmodule TimelessLogs.Application do
   def configured_children(owner) do
     raise ArgumentError,
           "invalid :timeless_logs :owner #{inspect(owner)}; expected :embedded or :external"
+  end
+
+  # Opt-in libSQL engine (port plan Session 1): one in-process writer over
+  # the timeless-libsql vtab. Subscriptions keep their Registry; the
+  # legacy buffer/index/compactor/hot-tail pipeline does not start.
+  defp libsql_children do
+    TimelessLogs.StorageEngine.put_engine(:libsql)
+
+    [
+      {Registry, keys: :duplicate, name: TimelessLogs.Registry},
+      {TimelessLogs.LibsqlEngine, []}
+    ]
   end
 
   defp hot_tail_child do
