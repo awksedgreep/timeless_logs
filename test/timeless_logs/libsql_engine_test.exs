@@ -28,7 +28,7 @@ defmodule TimelessLogs.LibsqlEngineTest do
     ]
 
     assert :ok = TimelessLogs.LibsqlEngine.ingest(entries)
-    assert {:ok, _} = TimelessLogs.LibsqlEngine.flush()
+    assert :ok = TimelessLogs.LibsqlEngine.flush()
 
     assert {:ok, [[2]]} = TimelessLogs.LibsqlEngine.sql("SELECT COUNT(*) FROM logs")
 
@@ -80,7 +80,7 @@ defmodule TimelessLogs.LibsqlEngineTest do
     # Buffered entries must be query-visible before any flush.
     assert {:ok, %TimelessLogs.Result{total: 10}} = TimelessLogs.LibsqlEngine.query([])
 
-    assert {:ok, _} = TimelessLogs.LibsqlEngine.flush()
+    assert :ok = TimelessLogs.LibsqlEngine.flush()
 
     # Level pushdown + Entry struct round-trip.
     assert {:ok, %TimelessLogs.Result{entries: errors, total: 5}} =

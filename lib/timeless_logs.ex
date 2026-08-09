@@ -222,7 +222,15 @@ defmodule TimelessLogs do
   """
   @spec stream(keyword()) :: Enumerable.t()
   def stream(filters \\ []) do
-    filters = normalize_filters(filters)
+    filters
+    |> normalize_filters()
+    |> TimelessLogs.StorageEngine.stream()
+  end
+
+  @doc false
+  # The Elixir block engine's stream (filters already normalized) — the
+  # StorageEngine seam routes here for engine: :elixir.
+  def legacy_stream(filters) do
     block_ids = TimelessLogs.Index.matching_block_ids(filters)
     search_filters = Keyword.drop(filters, [:limit, :offset, :order])
     storage = TimelessLogs.Config.storage()
@@ -260,7 +268,7 @@ defmodule TimelessLogs do
   """
   @spec stats() :: {:ok, TimelessLogs.Stats.t()}
   def stats do
-    TimelessLogs.Index.stats()
+    TimelessLogs.StorageEngine.stats()
   end
 
   @doc """
@@ -345,7 +353,7 @@ defmodule TimelessLogs do
   Returns `:ok` if blocks were merged, `:noop` if no merge was needed.
   """
   @spec merge_now() :: :ok | :noop
-  defdelegate merge_now(), to: TimelessLogs.Compactor
+  def merge_now, do: TimelessLogs.StorageEngine.merge_now()
 
   @doc """
   Create a consistent online backup of the log store.
@@ -367,6 +375,13 @@ defmodule TimelessLogs do
   """
   @spec backup(String.t()) :: {:ok, map()} | {:error, term()}
   def backup(target_dir) do
+    case TimelessLogs.StorageEngine.engine() do
+      :libsql -> TimelessLogs.LibsqlEngine.backup(target_dir)
+      _ -> legacy_backup(target_dir)
+    end
+  end
+
+  defp legacy_backup(target_dir) do
     flush()
 
     File.mkdir_p!(target_dir)

@@ -29,7 +29,12 @@ defmodule TimelessLogs.LibsqlEngine do
   def ingest(entries), do: GenServer.call(__MODULE__, {:ingest, entries}, :infinity)
 
   @doc "Persist buffered entries into blocks now."
-  def flush, do: command("flush")
+  def flush do
+    case command("flush") do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
 
   @doc "Run a bounded background optimize pass."
   def optimize, do: command("optimize")
@@ -48,6 +53,12 @@ defmodule TimelessLogs.LibsqlEngine do
 
   @doc "Exact count of entries matching the filters."
   def count(filters), do: GenServer.call(__MODULE__, {:count, filters}, :infinity)
+
+  @doc "Single-snapshot backup: flush, then VACUUM INTO <target>/logs.db."
+  def backup(target_dir), do: GenServer.call(__MODULE__, {:backup, target_dir}, :infinity)
+
+  @doc "Aggregate statistics from timeless_stats('logs') — no block reads."
+  def stats, do: GenServer.call(__MODULE__, :stats, :infinity)
 
   defp command(cmd),
     do:
@@ -108,6 +119,47 @@ defmodule TimelessLogs.LibsqlEngine do
 
   def handle_call({:query, filters}, _from, state) do
     {:reply, run_query(state.conn, filters), state}
+  end
+
+  def handle_call({:backup, target_dir}, _from, state) do
+    result =
+      with {:ok, _} <-
+             LibsqlCandidate.execute(
+               state.conn,
+               "INSERT INTO #{@table}(#{@table}) VALUES ('flush')"
+             ),
+           :ok <- File.mkdir_p(target_dir),
+           target = Path.join(target_dir, "logs.db"),
+           {:ok, _} <- LibsqlCandidate.execute(state.conn, "VACUUM INTO ?1", [target]),
+           {:ok, %{size: size}} <- File.stat(target) do
+        {:ok, %{path: target_dir, files: ["logs.db"], total_bytes: size}}
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call(:stats, _from, state) do
+    result =
+      with {:ok, rows} <-
+             LibsqlCandidate.execute(state.conn, "SELECT * FROM timeless_stats('logs')") do
+        kv = Map.new(rows, fn [k, v] -> {k, v} end)
+        int = fn key -> stat_int(Map.get(kv, key)) end
+
+        {:ok,
+         %TimelessLogs.Stats{
+           total_blocks: int.("blocks") || 0,
+           total_entries: int.("total_entries") || 0,
+           total_bytes: int.("bytes_on_disk") || 0,
+           disk_size: int.("bytes_on_disk") || 0,
+           index_size: int.("index_bytes") || 0,
+           raw_blocks: int.("raw_blocks") || 0,
+           raw_bytes: int.("raw_bytes") || 0,
+           oldest_timestamp: int.("ts_min"),
+           newest_timestamp: int.("ts_max")
+         }}
+      end
+
+    {:reply, result, state}
   end
 
   def handle_call({:count, filters}, _from, state) do
@@ -218,6 +270,19 @@ defmodule TimelessLogs.LibsqlEngine do
       metadata: decode_metadata(metadata_json)
     }
   end
+
+  defp stat_int(nil), do: nil
+  defp stat_int(""), do: nil
+  defp stat_int(v) when is_integer(v), do: v
+
+  defp stat_int(v) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, _} -> n
+      :error -> nil
+    end
+  end
+
+  defp stat_int(_), do: nil
 
   defp decode_metadata(nil), do: %{}
   defp decode_metadata(""), do: %{}
