@@ -38,7 +38,7 @@ defmodule TimelessLogs.Handler do
       metadata: extract_metadata(meta)
     }
 
-    TimelessLogs.Buffer.log(entry)
+    TimelessLogs.StorageEngine.ingest_one(entry)
   end
 
   defp format_msg({:string, msg}), do: IO.chardata_to_string(msg)

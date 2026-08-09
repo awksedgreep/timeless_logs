@@ -30,6 +30,55 @@ defmodule TimelessLogs.StorageEngine do
     end
   end
 
+  @doc false
+  # Single-entry ingest for the Logger handler.
+  #
+  # The handler used to call Buffer.log/1 directly, which meant that under
+  # engine: :libsql it cast to shard processes libsql_children/0 never starts.
+  # GenServer.cast to an unregistered name returns :ok, so every log line was
+  # silently discarded and no subscriber was ever notified.
+  #
+  # The elixir branch stays on Buffer.log/1 rather than ingest/1's log_many/1:
+  # log_many/1 can block the caller on backpressure, and a Logger handler runs
+  # in the calling process. Preserving log/1 here keeps that path unchanged.
+  def ingest_one(entry) do
+    case engine() do
+      :libsql -> libsql_ingest_one(entry)
+      _ -> TimelessLogs.Buffer.log(entry)
+    end
+  rescue
+    _ -> :ok
+  catch
+    # `:logger` removes a handler that raises or exits, permanently. The engine
+    # is a GenServer, so it can be starting, restarting or already stopped when
+    # an event arrives — a shutdown notice reaching a dead engine exits with
+    # :noproc and would take log capture down with it.
+    #
+    # Dropping the odd line while the engine is unavailable is bad. Losing the
+    # handler is unrecoverable, so this stays total on purpose.
+    :exit, _ -> :ok
+    _, _ -> :ok
+  end
+
+  # The engine logs from inside its own process (startup banner, retention,
+  # recovery). Those events reach this handler while running *as* the engine,
+  # so persisting them would be a GenServer.call to self: it exits with
+  # :calling_self, and `:logger` responds by removing the handler altogether.
+  # One lost line is survivable; a removed handler means no logs at all.
+  #
+  # Subscribers still see the entry, so live tail stays complete.
+  defp libsql_ingest_one(entry) do
+    if self() == Process.whereis(TimelessLogs.LibsqlEngine) do
+      broadcast_to_subscribers(entry)
+      :ok
+    else
+      with :ok <- TimelessLogs.LibsqlEngine.ingest([entry]) do
+        broadcast_to_subscribers(entry)
+        :ok
+      end
+    end
+  end
+
   defp broadcast_to_subscribers(entry) do
     entry_struct = TimelessLogs.Entry.from_map(entry)
 
