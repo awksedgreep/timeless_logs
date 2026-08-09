@@ -117,13 +117,52 @@ defmodule TimelessLogs.LibsqlEngineTest do
     assert {:ok, 5} = TimelessLogs.LibsqlEngine.count(level: :error)
   end
 
-  test "refuses an unmigrated legacy block store", %{dir: dir} do
+  test "refuses an unmigrated legacy block store when auto_migrate is off", %{dir: dir} do
     File.mkdir_p!(dir)
     File.touch!(Path.join(dir, "logs_index.db"))
 
     assert {:error, _} =
              start_supervised(
-               {TimelessLogs.LibsqlEngine, data_dir: dir, extension_path: @extension}
+               {TimelessLogs.LibsqlEngine,
+                data_dir: dir, extension_path: @extension, auto_migrate: false}
              )
+  end
+
+  test "auto-converts a legacy block store at startup", %{dir: dir} do
+    # Build a real legacy store through the running app.
+    Application.stop(:timeless_logs)
+
+    previous = Application.get_env(:timeless_logs, :data_dir)
+    Application.put_env(:timeless_logs, :data_dir, dir)
+    {:ok, _} = Application.ensure_all_started(:timeless_logs)
+
+    :ok =
+      TimelessLogs.ingest([
+        %{timestamp: 1_700_000_000_000_000, level: :info, message: "legacy one", metadata: %{}},
+        %{timestamp: 1_700_000_000_000_001, level: :error, message: "legacy two", metadata: %{}}
+      ])
+
+    :ok = TimelessLogs.flush()
+    Application.stop(:timeless_logs)
+
+    case previous do
+      nil -> Application.delete_env(:timeless_logs, :data_dir)
+      _ -> Application.put_env(:timeless_logs, :data_dir, previous)
+    end
+
+    on_exit(fn -> {:ok, _} = Application.ensure_all_started(:timeless_logs) end)
+
+    assert File.exists?(Path.join(dir, "logs_index.db"))
+
+    # Default startup on :libsql converts automatically, then serves it.
+    start_engine!(dir)
+
+    assert {:ok, %TimelessLogs.Result{total: 2}} = TimelessLogs.LibsqlEngine.query([])
+
+    assert {:ok, %TimelessLogs.Result{entries: [%TimelessLogs.Entry{message: "legacy two"}]}} =
+             TimelessLogs.LibsqlEngine.query(level: :error)
+
+    # The source is retained for rollback.
+    assert File.exists?(Path.join(dir, "logs_index.db"))
   end
 end

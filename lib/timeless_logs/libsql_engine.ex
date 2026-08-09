@@ -75,7 +75,7 @@ defmodule TimelessLogs.LibsqlEngine do
     # lesson, applied from day one.
     Process.flag(:trap_exit, true)
     data_dir = Keyword.get(opts, :data_dir, TimelessLogs.Config.data_dir())
-    reject_unmigrated_legacy_store!(data_dir)
+    maybe_auto_migrate_legacy_store!(data_dir, opts)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "logs.db")
 
@@ -296,23 +296,53 @@ defmodule TimelessLogs.LibsqlEngine do
     _ -> %{}
   end
 
-  # A data_dir carrying the legacy block-store layout must be converted
-  # with TimelessLogs.ReleaseMigration before the libSQL engine will
-  # touch it — never silently ignore existing data (the metrics
-  # reject_unmigrated_rust_store! precedent).
-  defp reject_unmigrated_legacy_store!(data_dir) do
+  # A data_dir carrying the legacy block-store layout is AUTO-CONVERTED
+  # at startup (the legacy engine is on a ~3-month deprecation clock):
+  # ReleaseStartup.prepare/2 runs the journaled, resumable, digest-
+  # verified conversion under an exclusive owner lock, retaining the
+  # source for rollback. Set auto_migrate: false to restore the strict
+  # refusal instead. Never silently ignore existing data.
+  defp maybe_auto_migrate_legacy_store!(data_dir, opts) do
     legacy? =
       File.exists?(Path.join(data_dir, "logs_index.db")) or
         File.dir?(Path.join(data_dir, "blocks"))
 
     migrated? = File.exists?(Path.join(data_dir, "logs.db"))
 
-    if legacy? and not migrated? do
-      raise "timeless_logs engine: :libsql refuses to start against the unmigrated " <>
-              "legacy block store in #{data_dir} — run the TimelessLogs.ReleaseMigration " <>
-              "conversion first, or configure engine: :elixir"
-    end
+    auto? =
+      Keyword.get(opts, :auto_migrate, Application.get_env(:timeless_logs, :auto_migrate, true))
 
-    :ok
+    cond do
+      not legacy? or migrated? ->
+        :ok
+
+      not auto? ->
+        raise "timeless_logs engine: :libsql refuses to start against the unmigrated " <>
+                "legacy block store in #{data_dir} — run the TimelessLogs.ReleaseMigration " <>
+                "conversion, enable auto_migrate, or configure engine: :elixir"
+
+      true ->
+        Logger.warning(
+          "timeless_logs: auto-converting the legacy block store in #{data_dir} to the " <>
+            "libSQL engine (journaled, verified, source retained for rollback). " <>
+            "Set auto_migrate: false to disable."
+        )
+
+        case TimelessLogs.ReleaseStartup.prepare(data_dir,
+               extension_path: Keyword.get(opts, :extension_path)
+             ) do
+          {:ok, result} ->
+            Logger.info(
+              "timeless_logs: legacy conversion ready (state: #{inspect(result[:state])})"
+            )
+
+            :ok
+
+          {:error, result} ->
+            raise "timeless_logs: automatic legacy conversion failed: #{inspect(result)}. " <>
+                    "The journaled migration is resumable — restart to resume, or set " <>
+                    "engine: :elixir to keep the legacy engine."
+        end
+    end
   end
 end
