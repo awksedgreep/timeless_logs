@@ -59,6 +59,10 @@ defmodule TimelessLogs.LibsqlCandidate do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 closes the connection (and its WAL) even
+    # when the linked caller dies mid-migration, not only on the clean
+    # GenServer.stop path.
+    Process.flag(:trap_exit, true)
     path = Keyword.fetch!(opts, :path)
     extension = Keyword.get(opts, :extension_path) || extension_path!()
 
