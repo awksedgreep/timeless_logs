@@ -28,4 +28,18 @@ defmodule TimelessLogs.StorageEngine do
       _ -> TimelessLogs.Buffer.flush()
     end
   end
+
+  def query(filters) do
+    case engine() do
+      :libsql -> TimelessLogs.LibsqlEngine.query(filters)
+      _ -> TimelessLogs.Index.query(filters)
+    end
+  end
+
+  def count(filters) do
+    case engine() do
+      :libsql -> TimelessLogs.LibsqlEngine.count(filters)
+      _ -> TimelessLogs.Index.count(filters)
+    end
+  end
 end

@@ -54,7 +54,7 @@ defmodule TimelessLogs do
   def query(filters \\ []) do
     filters
     |> normalize_filters()
-    |> TimelessLogs.Index.query()
+    |> TimelessLogs.StorageEngine.query()
   end
 
   @doc """
@@ -93,7 +93,7 @@ defmodule TimelessLogs do
   def count(filters \\ []) do
     filters
     |> normalize_filters()
-    |> TimelessLogs.Index.count()
+    |> TimelessLogs.StorageEngine.count()
   end
 
   @doc """

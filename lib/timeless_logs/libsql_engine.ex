@@ -37,6 +37,18 @@ defmodule TimelessLogs.LibsqlEngine do
   @doc false
   def sql(sql, params \\ []), do: GenServer.call(__MODULE__, {:sql, sql, params}, :infinity)
 
+  @doc """
+  Query entries with the facade's filter vocabulary. Time range and a
+  single level equality push down into the vtab scan; everything else
+  (metadata, metadata_any, message-contains) applies the SHARED
+  `TimelessLogs.Filter` residual — semantics identical to the Elixir
+  engine by construction.
+  """
+  def query(filters), do: GenServer.call(__MODULE__, {:query, filters}, :infinity)
+
+  @doc "Exact count of entries matching the filters."
+  def count(filters), do: GenServer.call(__MODULE__, {:count, filters}, :infinity)
+
   defp command(cmd),
     do:
       GenServer.call(
@@ -94,6 +106,20 @@ defmodule TimelessLogs.LibsqlEngine do
     {:reply, LibsqlCandidate.execute(state.conn, sql, params), state}
   end
 
+  def handle_call({:query, filters}, _from, state) do
+    {:reply, run_query(state.conn, filters), state}
+  end
+
+  def handle_call({:count, filters}, _from, state) do
+    result =
+      case run_query(state.conn, Keyword.merge(filters, limit: 0, offset: 0)) do
+        {:ok, %TimelessLogs.Result{total: total}} -> {:ok, total}
+        {:error, _} = error -> error
+      end
+
+    {:reply, result, state}
+  end
+
   @impl true
   def handle_info(:flush, state) do
     _ = LibsqlCandidate.execute(state.conn, "INSERT INTO #{@table}(#{@table}) VALUES ('flush')")
@@ -110,6 +136,99 @@ defmodule TimelessLogs.LibsqlEngine do
 
   defp schedule_flush do
     Process.send_after(self(), :flush, TimelessLogs.Config.flush_interval())
+  end
+
+  # -- Query path -----------------------------------------------------------
+
+  @pagination_keys [:limit, :offset, :order, :count_total]
+
+  # The extension only ever stores these severities (batch decode rejects
+  # anything else), so the read-side atom mapping is a closed set — no
+  # dynamic atom creation from stored data.
+  @severities Map.new(
+                ~w(debug info notice warning warn error critical alert emergency),
+                &{&1, String.to_atom(&1)}
+              )
+
+  defp run_query(conn, filters) do
+    {pagination, search} = Enum.split_with(filters, fn {k, _} -> k in @pagination_keys end)
+    order = Keyword.get(pagination, :order, :asc)
+
+    with {:ok, rows} <- select_entries(conn, search, order) do
+      matched =
+        rows
+        |> Enum.map(&decode_row/1)
+        |> TimelessLogs.Filter.filter(search)
+
+      total = length(matched)
+      limit = Keyword.get(pagination, :limit, 100)
+      offset = Keyword.get(pagination, :offset, 0)
+
+      entries =
+        matched
+        |> Enum.drop(offset)
+        |> Enum.take(limit)
+        |> Enum.map(&TimelessLogs.Entry.from_map/1)
+
+      {:ok,
+       %TimelessLogs.Result{
+         entries: entries,
+         total: total,
+         limit: limit,
+         offset: offset,
+         has_more: offset + limit < total
+       }}
+    end
+  end
+
+  # ts range and single-level equality prune inside the extension (block
+  # ts_min/ts_max + the level partition term index); the shared Filter
+  # re-checks everything, so pushdown is purely an optimization.
+  defp select_entries(conn, search, order) do
+    {where, params} =
+      Enum.reduce(search, {[], []}, fn
+        {:since, ts}, {w, p} ->
+          {["ts >= ?#{length(p) + 1}" | w], p ++ [TimelessLogs.Timestamp.to_microseconds(ts)]}
+
+        {:until, ts}, {w, p} ->
+          {["ts <= ?#{length(p) + 1}" | w], p ++ [TimelessLogs.Timestamp.to_microseconds(ts)]}
+
+        {:level, level}, {w, p} when is_atom(level) ->
+          {["level = ?#{length(p) + 1}" | w], p ++ [Atom.to_string(level)]}
+
+        _other, acc ->
+          acc
+      end)
+
+    where_sql = if where == [], do: "", else: " WHERE " <> Enum.join(Enum.reverse(where), " AND ")
+    order_sql = if order == :desc, do: " ORDER BY ts DESC", else: " ORDER BY ts ASC"
+
+    LibsqlCandidate.execute(
+      conn,
+      "SELECT ts, level, message, metadata FROM #{@table}#{where_sql}#{order_sql}",
+      params
+    )
+  end
+
+  defp decode_row([ts, level, message, metadata_json]) do
+    %{
+      timestamp: ts,
+      level: Map.get(@severities, level, :info),
+      message: message,
+      metadata: decode_metadata(metadata_json)
+    }
+  end
+
+  defp decode_metadata(nil), do: %{}
+  defp decode_metadata(""), do: %{}
+
+  defp decode_metadata(json) when is_binary(json) do
+    case :json.decode(json) do
+      metadata when is_map(metadata) -> metadata
+      _ -> %{}
+    end
+  rescue
+    _ -> %{}
   end
 
   # A data_dir carrying the legacy block-store layout must be converted
