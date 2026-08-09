@@ -21,6 +21,11 @@ defmodule TimelessLogs.Application do
     end
   end
 
+  def configured_children(owner) do
+    raise ArgumentError,
+          "invalid :timeless_logs :owner #{inspect(owner)}; expected :embedded or :external"
+  end
+
   defp elixir_children do
     TimelessLogs.StorageEngine.put_engine(:elixir)
     storage = TimelessLogs.Config.storage()
@@ -41,11 +46,6 @@ defmodule TimelessLogs.Application do
       {TimelessLogs.Compactor, data_dir: data_dir, storage: storage},
       {TimelessLogs.Retention, []}
     ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
-  end
-
-  def configured_children(owner) do
-    raise ArgumentError,
-          "invalid :timeless_logs :owner #{inspect(owner)}; expected :embedded or :external"
   end
 
   # Opt-in libSQL engine (port plan Session 1): one in-process writer over
