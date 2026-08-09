@@ -265,7 +265,7 @@ defmodule TimelessLogs.LibsqlCandidate do
 
   defp json_value(value), do: raise(ArgumentError, "unsupported JSON term #{inspect(value)}")
 
-  defp initialize_database(conn, capabilities, retention_seconds) do
+  def initialize_database(conn, capabilities, retention_seconds) do
     statements = [
       "PRAGMA page_size = 16384",
       "PRAGMA journal_mode = WAL",
@@ -347,7 +347,7 @@ defmodule TimelessLogs.LibsqlCandidate do
     end
   end
 
-  defp execute(conn, sql, params \\ []) do
+  def execute(conn, sql, params \\ []) do
     TimelessLogs.DB.execute(conn, sql, params)
   end
 

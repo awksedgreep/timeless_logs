@@ -6,6 +6,14 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :storage, :disk)
   end
 
+  # Storage engine selection: the deprecated Elixir block engine (default,
+  # unchanged) or the opt-in libSQL engine over the timeless-libsql vtab.
+  # The default flips in a later release per the port plan.
+  @spec engine() :: :elixir | :libsql
+  def engine do
+    Application.get_env(:timeless_logs, :engine, :elixir)
+  end
+
   @spec data_dir() :: String.t()
   def data_dir do
     Application.get_env(:timeless_logs, :data_dir, "priv/log_stream")

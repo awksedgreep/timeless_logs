@@ -62,7 +62,7 @@ defmodule TimelessLogs do
   """
   @spec flush() :: :ok
   def flush do
-    TimelessLogs.Buffer.flush()
+    TimelessLogs.StorageEngine.flush()
   end
 
   @doc """
@@ -74,7 +74,7 @@ defmodule TimelessLogs do
   def ingest(entries) when is_list(entries) do
     entries
     |> Enum.map(&normalize_entry_timestamp/1)
-    |> TimelessLogs.Buffer.log_many()
+    |> TimelessLogs.StorageEngine.ingest()
   end
 
   defp normalize_entry_timestamp(%{timestamp: ts} = entry),
