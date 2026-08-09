@@ -3,6 +3,28 @@
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.6.0 (2026-08-09)
+
+**Opt-in libSQL storage engine** (`config :timeless_logs, engine: :libsql`)
+— the port of the runtime to the timeless-libsql v0.5.0 logs virtual
+table, replacing the deprecated Elixir block engine for hosts that opt
+in. One `logs.db` holds everything; rich log messages get CLP codec-8
+template compression at optimize; embedded and external (Rust
+`timeless-logs-api`) modes share one on-disk format, so a host graduates
+to the Rust owner by switching owners, not migrating data.
+
+- Full facade coverage: ingest (rich-v1 batches), flush/optimize,
+  query/count (ts+level pushdown + the shared Filter residuals — parity
+  with the Elixir engine by construction), stream and the field
+  aggregations, stats, VACUUM INTO backup, subscriptions.
+- Startup refuses an unmigrated legacy block store loudly (run
+  `TimelessLogs.ReleaseMigration` first); cold-reopen durability via a
+  final flush on shutdown.
+- Default engine remains `:elixir`, completely unchanged; the flip ships
+  as its own release. No Elixir HTTP child under `:libsql` — HTTP serving
+  belongs to the Rust services.
+- Port plan: `notes/libsql_engine_port_plan_2026-08-09.md`.
+
 ## 1.5.5 (2026-08-08)
 
 Validated against the released **timeless-libsql v0.5.0** and re-pinned
