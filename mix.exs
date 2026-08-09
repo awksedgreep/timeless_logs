@@ -4,7 +4,7 @@ defmodule TimelessLogs.MixProject do
   def project do
     [
       app: :timeless_logs,
-      version: "1.5.4",
+      version: "1.5.5",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
       test_ignore_filters: [~r"test/support/"],
@@ -40,7 +40,7 @@ defmodule TimelessLogs.MixProject do
       maintainers: ["Mark Cotner"],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_logs"},
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
