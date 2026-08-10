@@ -2,6 +2,26 @@
 
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
+## 1.7.1 (2026-08-09)
+
+**The Logger handler no longer drops every entry on `engine: :libsql`.** It
+called `Buffer.log/1` directly, which casts to shard processes
+`libsql_children/0` never starts. `GenServer.cast` to an unregistered name
+returns `:ok`, so log lines were discarded silently and no subscriber was
+notified — live tail could not work, because nothing was ingesting. A
+production store took no writes for three and a half hours after switching
+engines.
+
+The handler now goes through `StorageEngine.ingest_one/1`. The Elixir branch
+stays on `Buffer.log/1` rather than `log_many/1`, which can block the caller
+on backpressure — a handler runs in the calling process.
+
+`ingest_one/1` is total on purpose. `:logger` removes a handler that raises or
+exits, permanently, and two cases hit that immediately: the engine logs from
+inside its own process, so persisting those events was a `GenServer.call` to
+self, and the handler outlives the engine, so a shutdown notice reaching a
+dead engine exited with `:noproc`. Events emitted by the engine itself still
+reach subscribers.
 
 ## 1.7.0 (2026-08-09)
 
