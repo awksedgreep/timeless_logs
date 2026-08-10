@@ -1,7 +1,43 @@
 # Changelog
 
 This changelog starts at 1.5.5; earlier releases are recorded by git
-tags and `bench/results/*.md` session documents.
+tags and `bench/results/*.md` session documents.## 1.8.0 (2026-08-10)
+
+**Message search is message-only and pushes into the storage engine.**
+`{:message, term}` used to also match any metadata value. The engine matches
+the message, so that predicate could not be pushed down: the store returned
+rows and the shared filter applied the term in Elixir, decoding the whole store
+on every search. Metadata is searched with `:metadata` / `:metadata_any`, which
+push down through the indexed key columns.
+
+Minor rather than patch: a search that relied on matching metadata values needs
+the metadata filters instead.
+
+Over all history on 200k entries — message 769ms to 8ms, `service` 22,218ms to
+133ms, `path`/`status` 5ms.
+
+**`count_total: false` bounds the fetch.** It was accepted and ignored. An exact
+total costs a full materialisation: every match crosses into Elixir to be
+counted, linear in matches rather than store size. The bound is applied only
+when the engine can evaluate every predicate itself, since an unindexed
+metadata key is re-checked in Elixir and a SQL `LIMIT` would cut the page short.
+
+**Indexed keys now cover the alias spellings** `normalize_filters/1` expands
+`service` and `host` into. Postings are written at insert time, so widening the
+list is not retroactive: startup reindexes an existing store and reconnects.
+Against an extension older than the `reindex` command it logs a warning and
+continues on the narrower list rather than refusing to start. Requires the
+timeless-libsql v0.6.0 extension to migrate.
+
+**Freed pages are returned to the filesystem.** Retention deletes blocks
+continuously inside the extension, but SQLite's default `auto_vacuum` leaves
+those pages on the freelist forever — one production store held 813 KB of
+blocks in a 1.86 GB file. Startup converts the store to incremental auto-vacuum
+and reclaims the backlog; a worker returns pages every minute after that,
+tunable with `:vacuum_interval` and `:vacuum_pages_per_turn`. Both paths
+checkpoint, because in WAL mode a VACUUM leaves the file at its old size until
+the log is checked back in.
+
 ## 1.7.1 (2026-08-09)
 
 **The Logger handler no longer drops every entry on `engine: :libsql`.** It
