@@ -12,13 +12,13 @@ defmodule TimelessLogs.Filter do
       {:level, level} ->
         entry.level == level
 
+      # Message only. It used to also match any metadata value, which meant the
+      # predicate could not be pushed into the storage engine — the engine
+      # matches the message — so every search decoded the whole store. Metadata
+      # is searched with :metadata / :metadata_any, which push down through the
+      # indexed key columns.
       {:message, pattern} ->
-        downcased = String.downcase(pattern)
-
-        String.contains?(String.downcase(entry.message), downcased) or
-          Enum.any?(entry.metadata, fn {_k, v} ->
-            is_binary(v) and String.contains?(String.downcase(v), downcased)
-          end)
+        String.contains?(String.downcase(entry.message), String.downcase(pattern))
 
       {:since, ts} ->
         TimelessLogs.Timestamp.to_microseconds(entry.timestamp) >= to_unix(ts)

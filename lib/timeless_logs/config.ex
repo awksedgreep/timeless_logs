@@ -24,6 +24,25 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :flush_interval, 1_000)
   end
 
+  @doc """
+  How often the libSQL engine returns freed pages to the filesystem.
+
+  Retention runs inside the extension, so blocks are deleted continuously. With
+  the default auto_vacuum those pages only go on the freelist: the file never
+  shrinks and grows to its high-water mark forever. One production store held
+  813 KB of blocks in a 1.86 GB file — 99.8% freelist.
+  """
+  @spec vacuum_interval() :: pos_integer()
+  def vacuum_interval do
+    Application.get_env(:timeless_logs, :vacuum_interval, 60_000)
+  end
+
+  @doc "Pages reclaimed per vacuum turn. Bounded so the work never stalls writes."
+  @spec vacuum_pages_per_turn() :: pos_integer()
+  def vacuum_pages_per_turn do
+    Application.get_env(:timeless_logs, :vacuum_pages_per_turn, 2_048)
+  end
+
   @spec max_buffer_size() :: pos_integer()
   def max_buffer_size do
     Application.get_env(:timeless_logs, :max_buffer_size, 1_000)

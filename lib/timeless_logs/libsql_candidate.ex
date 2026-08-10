@@ -1,6 +1,8 @@
 defmodule TimelessLogs.LibsqlCandidate do
   @moduledoc false
 
+  require Logger
+
   use GenServer
 
   @table "logs"
@@ -300,12 +302,140 @@ defmodule TimelessLogs.LibsqlCandidate do
     end
   end
 
+  @doc """
+  Metadata keys the engine indexes, in the order they are declared.
+
+  Every key a filter can be pruned on has to be here, including the alias
+  spellings `TimelessLogs.normalize_filters/1` expands `service` and `host`
+  into. Those aliases predate the indexed engine by four months: under the
+  Elixir engine all filters scanned alike, so expanding one key into several
+  was free. Once keys became index columns, the expansion produced keys the
+  engine had no postings for, and a `service` search fell back to decoding the
+  whole store.
+
+  Postings are written at insert time from this list, so changing it is not
+  retroactive on its own — see `ensure_index_keys/3`.
+  """
+  @index_keys ~w(
+    service service.name application
+    host host.name hostname node
+    path status
+  )
+
+  def index_keys, do: @index_keys
+
   defp logs_create(nil) do
-    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='service,path,status,host',timestamp_unit='us')"
+    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='#{Enum.join(@index_keys, ",")}',timestamp_unit='us')"
   end
 
   defp logs_create(seconds) do
-    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='service,path,status,host',timestamp_unit='us',retention='#{seconds}s')"
+    "CREATE VIRTUAL TABLE IF NOT EXISTS logs USING timeless_logs(index_keys='#{Enum.join(@index_keys, ",")}',timestamp_unit='us',retention='#{seconds}s')"
+  end
+
+  @doc """
+  Bring an existing store's indexed keys up to date with `index_keys/0`.
+
+  `index_keys` is fixed when the virtual table is created and persisted in
+  `logs_meta`, so a store created by an older release keeps the narrower set
+  and `CREATE VIRTUAL TABLE IF NOT EXISTS` will not change it. Postings are
+  written at insert time from that persisted set, so pruning on a newly listed
+  key would skip every block written before the change — the entries are still
+  there, but a search stops finding them.
+
+  `reindex:` rewrites each block's postings (one block decoded at a time) and
+  persists the new set. The connection keeps the list it loaded at connect, so
+  the caller reconnects afterwards to pick it up.
+
+  Returns `{:ok, :current}` when nothing was needed, or `{:ok, :reindexed}`
+  when the store was rewritten and the connection should be reopened.
+  """
+  def ensure_index_keys(conn, table \\ "logs") do
+    desired = Enum.join(@index_keys, ",")
+
+    case persisted_index_keys(conn, table) do
+      {:ok, ^desired} ->
+        {:ok, :current}
+
+      {:ok, current} ->
+        Logger.info(
+          "timeless_logs: reindexing #{table} for indexed keys #{inspect(desired)} " <>
+            "(was #{inspect(current)}); postings are rewritten one block at a time"
+        )
+
+        case TimelessLogs.DB.execute(
+               conn,
+               "INSERT INTO #{table}(#{table}) VALUES (?1)",
+               ["reindex:" <> desired]
+             ) do
+          {:ok, _} ->
+            {:ok, :reindexed}
+
+          {:error, reason} ->
+            # The extension ships on its own release train, so a store can be
+            # opened by a build that predates the reindex command. Refusing to
+            # start would turn a performance limitation into an outage: the
+            # narrower key list is still correct, just less selective, so carry
+            # on and say so.
+            Logger.warning(
+              "timeless_logs: could not reindex #{table} for keys #{inspect(desired)} " <>
+                "(#{inspect(reason)}). Continuing on the existing keys #{inspect(current)}; " <>
+                "searches on the unindexed spellings will scan rather than prune. " <>
+                "Upgrading the timeless-libsql extension and restarting applies it."
+            )
+
+            {:ok, :unsupported}
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc """
+  Put the store on incremental auto-vacuum, reclaiming any existing freelist.
+
+  Retention deletes blocks continuously, but with `auto_vacuum=NONE` SQLite
+  keeps freed pages on the freelist forever: the file only ever grows to its
+  high-water mark. `auto_vacuum` cannot be changed on a populated database by
+  pragma alone — it takes effect through a VACUUM, which also rewrites the file
+  at its true size.
+
+  Cheap when there is nothing to reclaim, and a no-op once already incremental.
+  """
+  def ensure_auto_vacuum(conn) do
+    case TimelessLogs.DB.execute(conn, "PRAGMA auto_vacuum", []) do
+      {:ok, [[mode]]} when mode in [2, "2"] ->
+        {:ok, :current}
+
+      {:ok, _} ->
+        Logger.info("timeless_logs: enabling incremental auto-vacuum and reclaiming free pages")
+
+        # The checkpoint is not optional. In WAL mode VACUUM rewrites the
+        # database through the log, so the main file keeps its old size until
+        # the log is checked back in — freelist zero, file unchanged. TRUNCATE
+        # is safe here because nothing is serving from this connection yet.
+        with {:ok, _} <- TimelessLogs.DB.execute(conn, "PRAGMA auto_vacuum = INCREMENTAL", []),
+             {:ok, _} <- TimelessLogs.DB.execute(conn, "VACUUM", []),
+             {:ok, _} <- TimelessLogs.DB.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
+          {:ok, :vacuumed}
+        else
+          {:error, reason} -> {:error, "logs vacuum failed: #{inspect(reason)}"}
+        end
+
+      {:error, reason} ->
+        {:error, "cannot read logs auto_vacuum: #{inspect(reason)}"}
+    end
+  end
+
+  defp persisted_index_keys(conn, table) do
+    case TimelessLogs.DB.execute(conn, "SELECT v FROM #{table}_meta WHERE k = ?1", ["index_keys"]) do
+      {:ok, [[value]]} when is_binary(value) -> {:ok, value}
+      {:ok, [[value]]} when is_list(value) -> {:ok, IO.iodata_to_binary(value)}
+      # A store with no recorded list predates the meta row; treat it as empty
+      # so it is brought up to date rather than trusted.
+      {:ok, _} -> {:ok, ""}
+      {:error, reason} -> {:error, "cannot read #{table} index_keys: #{inspect(reason)}"}
+    end
   end
 
   defp validate_retention(nil), do: :ok
