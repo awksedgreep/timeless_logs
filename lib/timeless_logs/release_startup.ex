@@ -233,7 +233,9 @@ defmodule TimelessLogs.ReleaseStartup do
           candidate_path: candidate_path,
           records_total: legacy.inventory.records,
           source_manifest_digest: legacy.manifest.digest,
-          generation: legacy.generation
+          generation: legacy.generation,
+          unreadable_blocks: legacy.inventory.missing_blocks,
+          unreadable_records: legacy.inventory.missing_records
         })
 
       target == :absent and legacy == :absent ->
@@ -244,7 +246,9 @@ defmodule TimelessLogs.ReleaseStartup do
           target_path: target_path,
           records_total: legacy.inventory.records,
           source_manifest_digest: legacy.manifest.digest,
-          generation: legacy.generation
+          generation: legacy.generation,
+          unreadable_blocks: legacy.inventory.missing_blocks,
+          unreadable_records: legacy.inventory.missing_records
         })
 
       legacy == :absent and target.cutover == nil ->

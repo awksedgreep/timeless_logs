@@ -1,6 +1,8 @@
 defmodule TimelessLogs.LegacyReader do
   @moduledoc false
 
+  require Logger
+
   @page_limit 8_192
   @default_max_stored_bytes 64 * 1_024 * 1_024
   @default_max_decoded_bytes 256 * 1_024 * 1_024
@@ -43,15 +45,24 @@ defmodule TimelessLogs.LegacyReader do
     Exqlite.Sqlite3.close(conn)
   end
 
-  def inventory(%__MODULE__{generation: :sqlite, conn: conn}) do
-    with {:ok, [[blocks, records, bytes, ts_min, ts_max]]} <-
-           execute(
-             conn,
-             "SELECT COUNT(*),COALESCE(SUM(entry_count),0),COALESCE(SUM(byte_size),0),MIN(ts_min),MAX(ts_max) FROM blocks"
-           ) do
-      {:ok,
-       %{blocks: blocks, records: records, stored_bytes: bytes, ts_min: ts_min, ts_max: ts_max}}
+  # Counted by resolving every row the way `page/2` will, rather than by summing
+  # the table, so blocks the index still lists but no longer has on disk are
+  # excluded from both. If the two disagreed, the migration's count check would
+  # read a skipped block as store corruption. Stepped rather than read as one
+  # result set: this runs at startup over the whole blocks table, and a large
+  # store should not have to hold it in memory just to be counted.
+  def inventory(%__MODULE__{generation: :sqlite, conn: conn, root: root}) do
+    sql = "SELECT file_path,entry_count,byte_size,ts_min,ts_max FROM blocks"
+
+    with {:ok, statement} <- Exqlite.Sqlite3.prepare(conn, sql) do
+      try do
+        fold_blocks(conn, statement, root, empty_inventory())
+      after
+        Exqlite.Sqlite3.release(conn, statement)
+      end
     end
+  rescue
+    error -> {:error, Exception.message(error)}
   end
 
   def inventory(%__MODULE__{blocks: blocks}) do
@@ -63,9 +74,64 @@ defmodule TimelessLogs.LegacyReader do
        records: Enum.sum_by(values, & &1.entry_count),
        stored_bytes: Enum.sum_by(values, & &1.byte_size),
        ts_min: values |> Enum.map(& &1.ts_min) |> Enum.min(fn -> nil end),
-       ts_max: values |> Enum.map(& &1.ts_max) |> Enum.max(fn -> nil end)
+       ts_max: values |> Enum.map(& &1.ts_max) |> Enum.max(fn -> nil end),
+       # Blocks dropped at snapshot load are already absent from `blocks`, so
+       # there is nothing left here to count against them.
+       missing_blocks: 0,
+       missing_records: 0
      }}
   end
+
+  defp fold_blocks(conn, statement, root, acc) do
+    case Exqlite.Sqlite3.step(conn, statement) do
+      {:row, row} -> fold_blocks(conn, statement, root, tally_block(row, acc, root))
+      :done -> {:ok, acc}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, other}
+    end
+  end
+
+  defp empty_inventory,
+    do: %{
+      blocks: 0,
+      records: 0,
+      stored_bytes: 0,
+      ts_min: nil,
+      ts_max: nil,
+      missing_blocks: 0,
+      missing_records: 0
+    }
+
+  defp tally_block([path, count, bytes, ts_min, ts_max], acc, root) do
+    case safe_block_path(root, path) do
+      {:ok, _} ->
+        %{
+          acc
+          | blocks: acc.blocks + 1,
+            records: acc.records + (count || 0),
+            stored_bytes: acc.stored_bytes + (bytes || 0),
+            ts_min: min_present(acc.ts_min, ts_min),
+            ts_max: max_present(acc.ts_max, ts_max)
+        }
+
+      # Counted rather than discarded: skipping a block quietly would let the
+      # migration report success while converting less than the store claimed.
+      {:error, _} ->
+        %{
+          acc
+          | missing_blocks: acc.missing_blocks + 1,
+            missing_records: acc.missing_records + (count || 0)
+        }
+    end
+  end
+
+  defp min_present(nil, value), do: value
+  defp min_present(value, nil), do: value
+  defp min_present(a, b), do: min(a, b)
+
+  defp max_present(nil, value), do: value
+  defp max_present(value, nil), do: value
+  defp max_present(a, b), do: max(a, b)
 
   def manifest_paths(%__MODULE__{root: root, generation: :sqlite}) do
     [
@@ -253,8 +319,20 @@ defmodule TimelessLogs.LegacyReader do
   defp snapshot_blocks(snapshot, root) do
     Enum.reduce_while(snapshot.blocks, {:ok, %{}}, fn row, {:ok, blocks} ->
       case block_from_row(row, root) do
-        {:ok, block} -> {:cont, {:ok, Map.put(blocks, block.id, block)}}
-        {:error, _} = error -> {:halt, error}
+        {:ok, block} ->
+          {:cont, {:ok, Map.put(blocks, block.id, block)}}
+
+        # Same stale-row tolerance as the SQLite path above.
+        {:error, {:invalid_block_metadata, {:error, {:missing_block, path}}}} ->
+          Logger.warning(
+            "TimelessLogs: legacy migration skipping block #{inspect(path)} — " <>
+              "referenced by the snapshot but no longer on disk"
+          )
+
+          {:cont, {:ok, blocks}}
+
+        {:error, _} = error ->
+          {:halt, error}
       end
     end)
   end
@@ -393,8 +471,33 @@ defmodule TimelessLogs.LegacyReader do
   end
 
   defp fill_page(reader, [row | rest], block_id, ordinal, remaining, acc) do
-    with {:ok, block} <- normalize_block_row(row, reader.root),
-         {:ok, entries} <- decode_block(reader, block) do
+    case normalize_block_row(row, reader.root) do
+      {:error, {:invalid_block_metadata, {:error, {:missing_block, path}}}} ->
+        # The index outliving its block file is a condition the legacy engine
+        # already treats as recoverable — it prunes the row and carries on.
+        # Aborting here instead would classify a stale row as store corruption
+        # and leave the migration permanently unstartable, since restarting
+        # cannot make the file reappear.
+        Logger.warning(
+          "TimelessLogs: legacy migration skipping block #{inspect(path)} — " <>
+            "referenced by the index but no longer on disk"
+        )
+
+        fill_page(reader, rest, row_block_id(row, block_id) + 1, 0, remaining, acc)
+
+      {:error, _} = error ->
+        error
+
+      {:ok, block} ->
+        decode_and_fill(reader, block, rest, block_id, ordinal, remaining, acc)
+    end
+  end
+
+  defp row_block_id([id | _], _fallback) when is_integer(id), do: id
+  defp row_block_id(_row, fallback), do: fallback
+
+  defp decode_and_fill(reader, block, rest, block_id, ordinal, remaining, acc) do
+    with {:ok, entries} <- decode_block(reader, block) do
       start = if block.id == block_id, do: ordinal, else: 0
       available = Enum.drop(entries, start)
       taken = Enum.take(available, remaining)
@@ -501,22 +604,34 @@ defmodule TimelessLogs.LegacyReader do
   defp safe_block_path(root, path) when is_binary(path) do
     expanded = Path.expand(path, root)
 
-    cond do
-      not String.starts_with?(expanded <> "/", root <> "/") ->
-        {:error, {:path_escape, path}}
-
-      File.exists?(expanded) and File.lstat!(expanded).type == :symlink ->
-        {:error, {:symlink, path}}
-
-      not File.regular?(expanded) ->
-        {:error, {:missing_block, path}}
-
-      true ->
-        {:ok, expanded}
+    if String.starts_with?(expanded <> "/", root <> "/") do
+      check_block_file(expanded, path)
+    else
+      # `blocks.file_path` is recorded absolute, so a data directory that has
+      # moved — restored backup, remounted volume, renamed host path — leaves
+      # every row pointing at a location outside the current root. The legacy
+      # engine rehomes those by basename on startup (`Index.rebase_block_paths/3`);
+      # the migration has to agree, or a healthy store that merely changed
+      # address cannot be converted at all. Taking the basename also discards
+      # any traversal the row carried, so the result is still confined to root.
+      root |> Path.join("blocks") |> Path.join(Path.basename(path)) |> check_block_file(path)
     end
   end
 
   defp safe_block_path(_root, path), do: {:error, {:invalid_path, path}}
+
+  defp check_block_file(resolved, recorded) do
+    cond do
+      File.exists?(resolved) and File.lstat!(resolved).type == :symlink ->
+        {:error, {:symlink, recorded}}
+
+      not File.regular?(resolved) ->
+        {:error, {:missing_block, recorded}}
+
+      true ->
+        {:ok, resolved}
+    end
+  end
 
   defp more_blocks?(%__MODULE__{generation: :sqlite, conn: conn}, block_id) do
     match?(

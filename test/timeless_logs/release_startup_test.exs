@@ -277,16 +277,23 @@ defmodule TimelessLogs.ReleaseStartupTest do
     assert {:ok, _} = DB.execute(conn, "ROLLBACK", [])
     Exqlite.Sqlite3.close(conn)
 
+    # A block the index lists but disk no longer has is NOT corruption. The
+    # legacy engine already prunes such rows and keeps serving, so reporting
+    # corruption here would brick the upgrade for a store the previous release
+    # ran happily — and tell the operator to restart, which cannot bring the
+    # file back. It is skipped instead, and reported so the loss is visible
+    # rather than silently absorbed into a "successful" migration.
     missing = temp_dir("logs_startup_missing_block")
     on_exit(fn -> File.rm_rf!(missing) end)
     create_legacy(missing, entries(1))
     [payload] = Path.wildcard(Path.join([missing, "blocks", "*.*"]))
     File.rm!(payload)
 
-    assert {:ok, %{state: :corruption, error: missing_error}} =
+    assert {:ok, %{state: state, unreadable_blocks: 1, unreadable_records: records}} =
              ReleaseStartup.detect(missing, opts())
 
-    assert missing_error =~ "payload validation failed"
+    assert state in [:legacy, :resumable_migration]
+    assert records > 0
   end
 
   test "zero-byte canonical placeholders are ignored but recognized symlinks are refused" do
