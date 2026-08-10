@@ -10,8 +10,34 @@ defmodule TimelessLogs.Config do
   # unchanged) or the opt-in libSQL engine over the timeless-libsql vtab.
   # The default flips in a later release per the port plan.
   @spec engine() :: :elixir | :libsql
+  #
+  # An unrecognised value raises rather than falling back. This used to select
+  # the legacy engine silently, which meant a typo downgraded the store without
+  # a word — and because the sibling packages guessed in the opposite direction
+  # (timeless_metrics resolves anything unknown to libSQL), the same mistake
+  # produced opposite outcomes per signal. Refusing to guess is what makes the
+  # three packages agree.
   def engine do
-    Application.get_env(:timeless_logs, :engine, :elixir)
+    :timeless_logs
+    |> Application.get_env(:engine, :elixir)
+    |> validate_engine()
+  end
+
+  defp validate_engine(engine) when engine in [:libsql, :elixir], do: engine
+
+  # `:rust` is timeless_metrics' name for its previous-generation engine. Asking
+  # timeless_logs for it means the operator is carrying vocabulary across
+  # packages, so name the right value instead of failing generically.
+  defp validate_engine(:rust) do
+    raise ArgumentError,
+          "invalid :timeless_logs :engine :rust — that is timeless_metrics' " <>
+            "previous-generation engine. timeless_logs uses :elixir for its " <>
+            "legacy block engine, or :libsql."
+  end
+
+  defp validate_engine(other) do
+    raise ArgumentError,
+          "invalid :timeless_logs :engine #{inspect(other)}; expected :libsql or :elixir"
   end
 
   @spec data_dir() :: String.t()

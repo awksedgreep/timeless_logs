@@ -15,9 +15,11 @@ defmodule TimelessLogs.Application do
   def configured_children(:external), do: []
 
   def configured_children(:embedded) do
+    # Exhaustive on purpose: `Config.engine/0` validates, so an unrecognised
+    # value has already raised rather than quietly landing on the legacy engine.
     case TimelessLogs.Config.engine() do
       :libsql -> libsql_children()
-      _ -> elixir_children()
+      :elixir -> elixir_children()
     end
   end
 
