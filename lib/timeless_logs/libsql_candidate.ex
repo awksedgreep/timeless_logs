@@ -352,6 +352,24 @@ defmodule TimelessLogs.LibsqlCandidate do
   def ensure_index_keys(conn, table \\ "logs") do
     desired = Enum.join(@index_keys, ",")
 
+    do_ensure_index_keys(conn, table, desired)
+  rescue
+    # DB.execute/3 raises rather than returning {:error, _} on a failed step,
+    # so a store opened by an extension without the reindex command arrives
+    # here as an exception. Startup must survive it: the narrower key list is
+    # still correct, only less selective.
+    error ->
+      Logger.warning(
+        "timeless_logs: could not bring #{table} indexed keys up to date " <>
+          "(#{Exception.message(error)}). Continuing on the existing keys; searches on " <>
+          "the unindexed spellings will scan rather than prune. Upgrading the " <>
+          "timeless-libsql extension and restarting applies them."
+      )
+
+      {:ok, :unsupported}
+  end
+
+  defp do_ensure_index_keys(conn, table, desired) do
     case persisted_index_keys(conn, table) do
       {:ok, ^desired} ->
         {:ok, :current}
@@ -403,6 +421,20 @@ defmodule TimelessLogs.LibsqlCandidate do
   Cheap when there is nothing to reclaim, and a no-op once already incremental.
   """
   def ensure_auto_vacuum(conn) do
+    do_ensure_auto_vacuum(conn)
+  rescue
+    # Same reasoning as ensure_index_keys/2: reclaiming disk is maintenance, and
+    # failing it must never stop the store from serving.
+    error ->
+      Logger.warning(
+        "timeless_logs: could not enable incremental auto-vacuum " <>
+          "(#{Exception.message(error)}); freed pages will not be returned to the filesystem"
+      )
+
+      {:ok, :unsupported}
+  end
+
+  defp do_ensure_auto_vacuum(conn) do
     case TimelessLogs.DB.execute(conn, "PRAGMA auto_vacuum", []) do
       {:ok, [[mode]]} when mode in [2, "2"] ->
         {:ok, :current}
