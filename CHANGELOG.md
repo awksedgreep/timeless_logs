@@ -1,7 +1,25 @@
 # Changelog
 
 This changelog starts at 1.5.5; earlier releases are recorded by git
-tags and `bench/results/*.md` session documents.## 1.8.0 (2026-08-10)
+tags and `bench/results/*.md` session documents.
+
+## 1.10.0 (2026-08-11)
+
+**Compressed blocks are visible on the libSQL engine.** `%Stats{}` gains
+format-agnostic `compressed_blocks`/`compressed_bytes` as the authoritative
+totals; the libSQL engine maps them from `timeless_stats('logs')` along with
+compression ratio and compaction count, and the HTTP stats endpoint exposes
+them. `zstd_*`/`openzl_*` remain the legacy engine's per-format breakdown and
+stay 0 on libSQL (adaptive columnar blocks — zstd is only an internal
+per-column strategy there).
+
+Pairs with timeless-libsql v0.6.1, whose engines auto-optimize from the flush
+heartbeat: embedded stores now compress without any host scheduling. Before
+this pairing, a libSQL store embedded via this package accumulated raw blocks
+indefinitely — durable and queryable, never compressed — and the dashboard
+showed 0 compressed blocks regardless.
+
+Tests clean their `test/tmp` state in setup/on_exit and at suite start.## 1.8.0 (2026-08-10)
 
 **Message search is message-only and pushes into the storage engine.**
 `{:message, term}` used to also match any metadata value. The engine matches
