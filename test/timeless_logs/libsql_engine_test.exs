@@ -93,8 +93,20 @@ defmodule TimelessLogs.LibsqlEngineTest do
     assert stats.compressed_blocks > 0
     assert stats.compressed_bytes > 0
     assert stats.zstd_blocks == 0
+    assert stats.storage_mode == :libsql
     assert stats.compaction_count > 0
     assert stats.total_blocks == stats.compressed_blocks
+    assert stats.compression_raw_bytes_in > 0
+    assert stats.compression_compressed_bytes_out > 0
+
+    # The ratio pair is persisted in the store, not the process: a fresh
+    # engine over the same db must still report it (the tile once read
+    # process-local counters and showed "pending" after every restart).
+    stop_supervised!(TimelessLogs.LibsqlEngine)
+    start_engine!(dir)
+    assert {:ok, %TimelessLogs.Stats{} = reopened} = TimelessLogs.LibsqlEngine.stats()
+    assert reopened.compression_raw_bytes_in == stats.compression_raw_bytes_in
+    assert reopened.compression_compressed_bytes_out == stats.compression_compressed_bytes_out
   end
 
   test "query matches the facade contract: filters, residuals, pagination", %{dir: dir} do

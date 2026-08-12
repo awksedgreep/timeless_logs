@@ -131,6 +131,7 @@ defmodule TimelessLogs.Index do
 
     {:ok,
      %TimelessLogs.Stats{
+       storage_mode: TimelessLogs.Config.storage(),
        total_blocks: total_blocks,
        total_entries: total_entries,
        total_bytes: total_bytes,

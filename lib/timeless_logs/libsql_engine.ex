@@ -179,6 +179,7 @@ defmodule TimelessLogs.LibsqlEngine do
 
         {:ok,
          %TimelessLogs.Stats{
+           storage_mode: :libsql,
            total_blocks: int.("blocks") || 0,
            total_entries: int.("total_entries") || 0,
            total_bytes: int.("bytes_on_disk") || 0,
@@ -188,8 +189,11 @@ defmodule TimelessLogs.LibsqlEngine do
            raw_bytes: int.("raw_bytes") || 0,
            compressed_blocks: int.("compressed_blocks") || 0,
            compressed_bytes: int.("compressed_bytes") || 0,
-           compression_raw_bytes_in: int.("optimize_raw_input_bytes") || 0,
-           compression_compressed_bytes_out: int.("optimize_raw_output_bytes") || 0,
+           # The *_total keys are persisted in the store's _meta (extension
+           # 0.6.2) — unlike the optimize_raw_* profile counters, they
+           # survive restarts, which a compression-ratio display requires.
+           compression_raw_bytes_in: int.("compression_input_bytes_total") || 0,
+           compression_compressed_bytes_out: int.("compression_output_bytes_total") || 0,
            compaction_count: int.("optimize_count") || 0,
            oldest_timestamp: int.("ts_min"),
            newest_timestamp: int.("ts_max")

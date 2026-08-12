@@ -3,7 +3,8 @@ defmodule TimelessLogs.Stats do
   Aggregate statistics about stored log data.
   """
 
-  defstruct total_blocks: 0,
+  defstruct storage_mode: nil,
+            total_blocks: 0,
             total_entries: 0,
             total_bytes: 0,
             oldest_timestamp: nil,
@@ -31,6 +32,7 @@ defmodule TimelessLogs.Stats do
             compaction_count: 0
 
   @type t :: %__MODULE__{
+          storage_mode: :libsql | :disk | :memory | nil,
           total_blocks: non_neg_integer(),
           total_entries: non_neg_integer(),
           total_bytes: non_neg_integer(),
