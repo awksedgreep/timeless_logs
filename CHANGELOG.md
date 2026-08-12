@@ -3,6 +3,19 @@
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.0 (2026-08-11)
+
+**The compression ratio survives restarts.** `compression_raw_bytes_in`/`out`
+now come from the totals extension 0.6.2 persists in the store's `_meta`
+(written transactionally with each optimize), not the process-local profile
+counters — the dashboard tile they back showed "pending" over a fully
+compressed store after every restart. Pre-upgrade stores start counting from
+their next optimize.
+
+**`%Stats{}` gains `storage_mode`** — `:libsql` from the libSQL engine, the
+configured `:disk`/`:memory` from the legacy engine — so dashboards report
+the actual engine instead of falling back to legacy config.
+
 ## 1.10.0 (2026-08-11)
 
 **Compressed blocks are visible on the libSQL engine.** `%Stats{}` gains
