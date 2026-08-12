@@ -4,6 +4,11 @@ defmodule TimelessLogs.MemoryTest do
   require Logger
 
   setup do
+    # "no block files created on disk" refutes this dir's existence, so a
+    # leftover from any earlier run (or a crashed disk-mode test) fails the
+    # suite forever. Clean before AND after.
+    File.rm_rf!("test/tmp/memory_should_not_exist")
+
     Application.stop(:timeless_logs)
     Application.put_env(:timeless_logs, :storage, :memory)
     Application.put_env(:timeless_logs, :data_dir, "test/tmp/memory_should_not_exist")
@@ -16,6 +21,7 @@ defmodule TimelessLogs.MemoryTest do
     on_exit(fn ->
       Application.stop(:timeless_logs)
       Application.put_env(:timeless_logs, :storage, :disk)
+      File.rm_rf!("test/tmp/memory_should_not_exist")
     end)
 
     :ok
