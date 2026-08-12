@@ -259,6 +259,8 @@ defmodule TimelessLogs.HTTP do
           newest_timestamp: stats.newest_timestamp,
           raw_blocks: stats.raw_blocks,
           raw_bytes: stats.raw_bytes,
+          compressed_blocks: stats.compressed_blocks,
+          compressed_bytes: stats.compressed_bytes,
           zstd_blocks: stats.zstd_blocks,
           zstd_bytes: stats.zstd_bytes,
           openzl_blocks: stats.openzl_blocks,

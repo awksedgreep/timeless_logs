@@ -186,6 +186,11 @@ defmodule TimelessLogs.LibsqlEngine do
            index_size: int.("index_bytes") || 0,
            raw_blocks: int.("raw_blocks") || 0,
            raw_bytes: int.("raw_bytes") || 0,
+           compressed_blocks: int.("compressed_blocks") || 0,
+           compressed_bytes: int.("compressed_bytes") || 0,
+           compression_raw_bytes_in: int.("optimize_raw_input_bytes") || 0,
+           compression_compressed_bytes_out: int.("optimize_raw_output_bytes") || 0,
+           compaction_count: int.("optimize_count") || 0,
            oldest_timestamp: int.("ts_min"),
            newest_timestamp: int.("ts_max")
          }}

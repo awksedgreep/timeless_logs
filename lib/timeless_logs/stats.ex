@@ -13,6 +13,13 @@ defmodule TimelessLogs.Stats do
             raw_blocks: 0,
             raw_bytes: 0,
             raw_entries: 0,
+            # Authoritative compressed totals, format-agnostic. The libSQL
+            # engine writes adaptive columnar blocks (zstd only appears as an
+            # internal per-column strategy), so per-format zstd_*/openzl_*
+            # fields below stay 0 there — they are the LEGACY block engine's
+            # breakdown and remain populated for it.
+            compressed_blocks: 0,
+            compressed_bytes: 0,
             zstd_blocks: 0,
             zstd_bytes: 0,
             zstd_entries: 0,
@@ -34,6 +41,8 @@ defmodule TimelessLogs.Stats do
           raw_blocks: non_neg_integer(),
           raw_bytes: non_neg_integer(),
           raw_entries: non_neg_integer(),
+          compressed_blocks: non_neg_integer(),
+          compressed_bytes: non_neg_integer(),
           zstd_blocks: non_neg_integer(),
           zstd_bytes: non_neg_integer(),
           zstd_entries: non_neg_integer(),

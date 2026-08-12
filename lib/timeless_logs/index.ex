@@ -141,6 +141,12 @@ defmodule TimelessLogs.Index do
        raw_blocks: (format_stats["raw"] || %{})[:blocks] || 0,
        raw_bytes: (format_stats["raw"] || %{})[:bytes] || 0,
        raw_entries: (format_stats["raw"] || %{})[:entries] || 0,
+       compressed_blocks:
+         ((format_stats["zstd"] || %{})[:blocks] || 0) +
+           ((format_stats["openzl"] || %{})[:blocks] || 0),
+       compressed_bytes:
+         ((format_stats["zstd"] || %{})[:bytes] || 0) +
+           ((format_stats["openzl"] || %{})[:bytes] || 0),
        zstd_blocks: (format_stats["zstd"] || %{})[:blocks] || 0,
        zstd_bytes: (format_stats["zstd"] || %{})[:bytes] || 0,
        zstd_entries: (format_stats["zstd"] || %{})[:entries] || 0,

@@ -62,6 +62,41 @@ defmodule TimelessLogs.LibsqlEngineTest do
     assert {:ok, [[5]]} = TimelessLogs.LibsqlEngine.sql("SELECT COUNT(*) FROM logs")
   end
 
+  test "stats reports compressed blocks after optimize (dashboard tile contract)", %{dir: dir} do
+    start_engine!(dir)
+
+    entries =
+      for i <- 1..50 do
+        %{
+          timestamp: 1_700_000_000_000_000 + i * 1_000,
+          level: :info,
+          message: "entry #{i}",
+          metadata: %{"service" => "api"}
+        }
+      end
+
+    assert :ok = TimelessLogs.LibsqlEngine.ingest(entries)
+    assert :ok = TimelessLogs.LibsqlEngine.flush()
+
+    assert {:ok, %TimelessLogs.Stats{} = raw_stats} = TimelessLogs.LibsqlEngine.stats()
+    assert raw_stats.raw_blocks > 0
+    assert raw_stats.compressed_blocks == 0
+
+    assert {:ok, _} = TimelessLogs.LibsqlEngine.optimize()
+
+    assert {:ok, %TimelessLogs.Stats{} = stats} = TimelessLogs.LibsqlEngine.stats()
+    # The dashboard's compressed tile must see this work in the struct, not
+    # have it stay extension-only. Note compressed_*, not zstd_*: the libSQL
+    # engine writes adaptive columnar blocks, and the per-format zstd/openzl
+    # fields belong to the legacy engine.
+    assert stats.raw_blocks == 0
+    assert stats.compressed_blocks > 0
+    assert stats.compressed_bytes > 0
+    assert stats.zstd_blocks == 0
+    assert stats.compaction_count > 0
+    assert stats.total_blocks == stats.compressed_blocks
+  end
+
   test "query matches the facade contract: filters, residuals, pagination", %{dir: dir} do
     start_engine!(dir)
 
