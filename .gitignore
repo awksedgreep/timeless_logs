@@ -35,3 +35,4 @@ timeless_logs-*.tar
 # Environment files
 .env
 .env.*
+.codex
