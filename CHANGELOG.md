@@ -3,6 +3,23 @@
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.1 (2026-09-11)
+
+**The storage hot path is bounded and failure-aware.** libSQL reads fan out
+through a reader pool, pagination is applied in SQL when filters permit it,
+and prepared filters avoid repeating normalization work. SQLite transactions,
+compaction, backups, and block/index updates now propagate failures instead of
+silently returning partial results or leaving unindexed files behind.
+
+**Ingest and discovery stay bounded under load.** Backpressure applies to
+single-entry writes as well as batches, shard keys retain only a bounded
+message prefix, hot-tail eviction is incremental, and field discovery samples
+at most 100,000 entries by default (with explicit smaller or full-scan
+overrides). Subscriber and HTTP failures no longer take down storage work.
+
+The dependency baseline moves to ex_openzl 0.4.18 and exqlite 0.40.0. CI and
+release validation now build against timeless-libsql v0.8.3.
+
 ## 1.11.0 (2026-08-11)
 
 **The compression ratio survives restarts.** `compression_raw_bytes_in`/`out`
