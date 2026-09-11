@@ -8,7 +8,7 @@ defmodule TimelessLogs.DB do
 
   use GenServer
 
-  defstruct [:writer, :readers, :data_dir, :db_path, :name]
+  defstruct [:writer, :readers, :reader_counter, :data_dir, :db_path, :name]
 
   @max_retries 8
 
@@ -29,7 +29,16 @@ defmodule TimelessLogs.DB do
 
   @doc "Execute a read query using a reader connection from the pool."
   def read(db, sql, params \\ []) do
-    GenServer.call(db, {:read, sql, params}, :infinity)
+    case :persistent_term.get(reader_pool_key(db), nil) do
+      {readers, counter} when tuple_size(readers) > 0 ->
+        index = rem(:atomics.add_get(counter, 1, 1) - 1, tuple_size(readers))
+        readers |> elem(index) |> TimelessLogs.DB.Reader.read(sql, params)
+
+      _ ->
+        # Startup/restart fallback. In normal operation callers bypass the
+        # writer GenServer and fan out directly across reader workers.
+        GenServer.call(db, {:read, sql, params}, :infinity)
+    end
   end
 
   @doc "Get the database path."
@@ -70,12 +79,18 @@ defmodule TimelessLogs.DB do
 
     readers =
       for _ <- 1..reader_count do
-        open_and_configure_reader(db_path)
+        {:ok, reader} = TimelessLogs.DB.Reader.start_link(db_path)
+        reader
       end
+
+    reader_counter = :atomics.new(1, signed: false)
+    :atomics.put(reader_counter, 1, 0)
+    :persistent_term.put(reader_pool_key(name), {List.to_tuple(readers), reader_counter})
 
     state = %__MODULE__{
       writer: writer,
       readers: readers,
+      reader_counter: reader_counter,
       data_dir: data_dir,
       db_path: db_path,
       name: name
@@ -91,23 +106,26 @@ defmodule TimelessLogs.DB do
   end
 
   def handle_call({:write_transaction, fun}, _from, state) do
-    execute(state.writer, "BEGIN IMMEDIATE", [])
-
     try do
+      {:ok, _} = execute(state.writer, "BEGIN IMMEDIATE", [])
       result = fun.(state.writer)
-      execute(state.writer, "COMMIT", [])
+      {:ok, _} = execute(state.writer, "COMMIT", [])
       {:reply, {:ok, result}, state}
     rescue
       e ->
-        execute(state.writer, "ROLLBACK", [])
+        safe_rollback(state.writer)
         {:reply, {:error, e}, state}
+    catch
+      kind, reason ->
+        safe_rollback(state.writer)
+        {:reply, {:error, {kind, reason}}, state}
     end
   end
 
   def handle_call({:read, sql, params}, _from, state) do
-    # Simple round-robin reader selection
-    reader = Enum.random(state.readers)
-    result = execute(reader, sql, params)
+    index = rem(:atomics.add_get(state.reader_counter, 1, 1) - 1, length(state.readers))
+    reader = Enum.at(state.readers, index)
+    result = TimelessLogs.DB.Reader.read(reader, sql, params)
     {:reply, result, state}
   end
 
@@ -122,8 +140,12 @@ defmodule TimelessLogs.DB do
 
   @impl true
   def terminate(_reason, state) do
+    :persistent_term.erase(reader_pool_key(state.name))
     Exqlite.Sqlite3.close(state.writer)
-    Enum.each(state.readers, &Exqlite.Sqlite3.close/1)
+
+    Enum.each(state.readers, fn reader ->
+      if Process.alive?(reader), do: GenServer.stop(reader, :normal, :infinity)
+    end)
   end
 
   # --- Internals ---
@@ -158,7 +180,8 @@ defmodule TimelessLogs.DB do
     Enum.each(pragmas, &execute(conn, &1, []))
   end
 
-  defp open_and_configure_reader(db_path, attempts \\ 5) do
+  @doc false
+  def open_and_configure_reader(db_path, attempts \\ 5) do
     conn = open_with_retry(db_path, @max_retries)
 
     try do
@@ -215,14 +238,17 @@ defmodule TimelessLogs.DB do
   def execute_batch(conn, sql, params_list) when is_list(params_list) do
     case Exqlite.Sqlite3.prepare(conn, sql) do
       {:ok, stmt} ->
-        Enum.each(params_list, fn params ->
-          :ok = Exqlite.Sqlite3.bind(stmt, params)
-          :done = Exqlite.Sqlite3.step(conn, stmt)
-          :ok = Exqlite.Sqlite3.reset(stmt)
-        end)
+        try do
+          Enum.each(params_list, fn params ->
+            :ok = Exqlite.Sqlite3.bind(stmt, params)
+            :done = Exqlite.Sqlite3.step(conn, stmt)
+            :ok = Exqlite.Sqlite3.reset(stmt)
+          end)
 
-        Exqlite.Sqlite3.release(conn, stmt)
-        :ok
+          :ok
+        after
+          Exqlite.Sqlite3.release(conn, stmt)
+        end
 
       {:error, reason} ->
         raise "SQLite execute_batch failed: #{inspect(reason)} (sql: #{sql})"
@@ -232,13 +258,15 @@ defmodule TimelessLogs.DB do
   defp execute_with_retry(conn, sql, params, retries) do
     case Exqlite.Sqlite3.prepare(conn, sql) do
       {:ok, stmt} ->
-        if params != [] do
-          :ok = Exqlite.Sqlite3.bind(stmt, params)
-        end
+        try do
+          if params != [] do
+            :ok = Exqlite.Sqlite3.bind(stmt, params)
+          end
 
-        rows = fetch_all(conn, stmt, [])
-        Exqlite.Sqlite3.release(conn, stmt)
-        {:ok, rows}
+          {:ok, fetch_all(conn, stmt, [])}
+        after
+          Exqlite.Sqlite3.release(conn, stmt)
+        end
 
       {:error, _reason} when retries > 0 ->
         Process.sleep(retry_backoff(@max_retries - retries))
@@ -259,4 +287,39 @@ defmodule TimelessLogs.DB do
 
   # Exponential backoff: 100, 200, 400, 800, 1600, 3200, 6400, 12800ms
   defp retry_backoff(attempt), do: 100 * Integer.pow(2, attempt)
+
+  defp safe_rollback(conn) do
+    execute(conn, "ROLLBACK", [])
+  rescue
+    _ -> :ok
+  end
+
+  defp reader_pool_key(db), do: {__MODULE__, :reader_pool, db}
+end
+
+defmodule TimelessLogs.DB.Reader do
+  @moduledoc false
+
+  use GenServer
+
+  def start_link(db_path), do: GenServer.start_link(__MODULE__, db_path)
+
+  def read(reader, sql, params) do
+    GenServer.call(reader, {:read, sql, params}, :infinity)
+  end
+
+  @impl true
+  def init(db_path) do
+    {:ok, TimelessLogs.DB.open_and_configure_reader(db_path)}
+  end
+
+  @impl true
+  def handle_call({:read, sql, params}, _from, conn) do
+    {:reply, TimelessLogs.DB.execute(conn, sql, params), conn}
+  end
+
+  @impl true
+  def terminate(_reason, conn) do
+    Exqlite.Sqlite3.close(conn)
+  end
 end

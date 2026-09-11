@@ -33,7 +33,7 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 | Filter | Type | Description |
 |--------|------|-------------|
 | `:level` | atom | Exact match: `:debug`, `:info`, `:warning`, or `:error` |
-| `:message` | string | Case-insensitive substring match on message text and metadata values |
+| `:message` | string | Case-insensitive substring match on message text |
 | `:since` | DateTime or integer | Lower time bound (integers are unix timestamps in microseconds) |
 | `:until` | DateTime or integer | Upper time bound |
 | `:metadata` | map | Exact match on metadata key/value pairs (atom or string keys). `host` and `service` expand across common aliases. |
@@ -72,8 +72,8 @@ Returns `{:ok, %TimelessLogs.Result{}}` with:
 # Substring match (case-insensitive)
 {:ok, result} = TimelessLogs.query(message: "timeout")
 
-# Also searches metadata values
-{:ok, result} = TimelessLogs.query(message: "abc123")
+# Search metadata explicitly
+{:ok, result} = TimelessLogs.query(metadata: %{request_id: "abc123"})
 ```
 
 ### Metadata filtering
@@ -164,6 +164,19 @@ TimelessLogs.stream(level: :error)
 | Sorting | Fully sorted by timestamp | Block order (oldest blocks first) |
 | Pagination | `:limit`, `:offset`, `:order` supported | Use `Enum.take/2`, `Stream.drop/2` |
 | Use case | Dashboards, API responses | Export, aggregation, large scans |
+
+## Field discovery
+
+`field_values/2` and `field_names/1` sample at most the configured
+`field_scan_limit` (100,000 entries by default), so a dashboard discovery
+request cannot accidentally decompress an unbounded store. Override the
+sample per call with `scan_limit: n`, or explicitly opt into the old full-store
+behavior with `full_scan: true`:
+
+```elixir
+TimelessLogs.field_values("service", scan_limit: 10_000)
+TimelessLogs.field_names(full_scan: true)
+```
 
 ## How queries are optimized
 

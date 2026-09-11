@@ -5,7 +5,6 @@ defmodule TimelessLogs.Buffer do
 
   require Logger
 
-  @max_in_flight System.schedulers_online()
   @type buffer_state :: %{
           buffer: [map()],
           buffer_size: non_neg_integer(),
@@ -26,6 +25,7 @@ defmodule TimelessLogs.Buffer do
   def log(entry) do
     shard = TimelessLogs.BufferShard.shard_for(entry)
     TimelessLogs.HotTail.insert_many([entry])
+    maybe_wait_for_capacity(shard, 1)
     TimelessLogs.IngestPressure.add(shard, 1)
     GenServer.cast(TimelessLogs.BufferShard.name(shard), {:log, entry})
   end
@@ -41,19 +41,7 @@ defmodule TimelessLogs.Buffer do
     entries
     |> Enum.group_by(&TimelessLogs.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_entries} ->
-      if TimelessLogs.IngestPressure.overloaded?(shard) do
-        # Above the watermark the producer blocks here until the drain
-        # (write + index) frees capacity — waiting on the shard's mailbox
-        # is not enough, since the shard hands entries onward faster than
-        # the pipeline persists them. Nothing is dropped or refused.
-        TimelessLogs.Telemetry.event(
-          [:timeless_logs, :ingest, :backpressure],
-          %{entry_count: length(shard_entries)},
-          %{shard: shard}
-        )
-
-        wait_for_capacity(shard, TimelessLogs.Config.ingest_backpressure_timeout())
-      end
+      maybe_wait_for_capacity(shard, length(shard_entries))
 
       TimelessLogs.IngestPressure.add(shard, length(shard_entries))
       GenServer.cast(TimelessLogs.BufferShard.name(shard), {:log_many, shard_entries})
@@ -62,11 +50,28 @@ defmodule TimelessLogs.Buffer do
     :ok
   end
 
+  defp maybe_wait_for_capacity(shard, entry_count) do
+    if TimelessLogs.IngestPressure.overloaded?(shard) do
+      # Above the watermark the producer blocks here until the drain
+      # (write + index) frees capacity — waiting on the shard's mailbox
+      # is not enough, since the shard hands entries onward faster than
+      # the pipeline persists them. Nothing is dropped or refused.
+      TimelessLogs.Telemetry.event(
+        [:timeless_logs, :ingest, :backpressure],
+        %{entry_count: entry_count},
+        %{shard: shard}
+      )
+
+      wait_for_capacity(shard, TimelessLogs.Config.ingest_backpressure_timeout())
+    end
+  end
+
   defp wait_for_capacity(shard, timeout_left) when timeout_left <= 0 do
     # Drain has stalled outright (e.g. dead disk). Accept anyway — losing
     # logs during normal operation is not acceptable — but say so loudly.
     Logger.error(
-      "TimelessLogs: ingest backpressure wait timed out on shard #{shard}; accepting anyway"
+      "TimelessLogs: ingest backpressure wait timed out on shard #{shard}; accepting anyway",
+      timeless_logs_skip: true
     )
 
     :ok
@@ -206,7 +211,7 @@ defmodule TimelessLogs.Buffer do
   defp dispatch_or_queue_batch([], state), do: state
 
   defp dispatch_or_queue_batch(entries, state) do
-    if state.in_flight < @max_in_flight do
+    if state.in_flight < max_in_flight() do
       start_flush_task(state, entries)
     else
       %{state | pending_batches: :queue.in(entries, state.pending_batches)}
@@ -214,7 +219,7 @@ defmodule TimelessLogs.Buffer do
   end
 
   defp dispatch_queued_batches(state) do
-    if state.in_flight >= @max_in_flight do
+    if state.in_flight >= max_in_flight() do
       state
     else
       case :queue.out(state.pending_batches) do
@@ -331,6 +336,8 @@ defmodule TimelessLogs.Buffer do
   defp schedule_flush(interval) do
     Process.send_after(self(), :flush_timer, interval)
   end
+
+  defp max_in_flight, do: System.schedulers_online()
 
   # One subscriber-count check per accepted batch, not per entry.
   defp broadcast_batch(entries) do

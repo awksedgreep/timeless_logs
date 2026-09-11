@@ -89,7 +89,7 @@ defmodule TimelessLogs do
   Answered from per-term index counts when the filters allow (level,
   indexed metadata, time range); otherwise falls back to a scanning count.
   """
-  @spec count(keyword()) :: {:ok, non_neg_integer()}
+  @spec count(keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def count(filters \\ []) do
     filters
     |> normalize_filters()
@@ -100,6 +100,9 @@ defmodule TimelessLogs do
   Collect distinct values and hit counts for a given field.
 
   Handles built-in fields (`"_msg"`, `"_time"`, `"level"`) and metadata fields.
+  To keep discovery requests bounded, at most `:field_scan_limit` configured
+  entries (100,000 by default) are sampled. Pass `scan_limit: n` to choose a
+  smaller sample or `full_scan: true` to explicitly scan the whole result set.
 
   ## Examples
 
@@ -108,10 +111,12 @@ defmodule TimelessLogs do
   """
   @spec field_values(String.t(), keyword()) :: {:ok, list(map())}
   def field_values(field_name, filters \\ []) do
+    {filters, scan_limit} = field_scan_options(filters)
     filters = normalize_filters(filters)
 
     counts =
       stream(filters)
+      |> limit_field_stream(scan_limit)
       |> Enum.reduce(%{}, fn entry, acc ->
         value = extract_field(entry, field_name)
 
@@ -134,6 +139,8 @@ defmodule TimelessLogs do
   Collect all field names and hit counts from matching entries.
 
   Always includes `_msg`, `_time`, and `level`. Metadata keys are also included.
+  The same bounded sampling options as `field_values/2` apply: `scan_limit: n`
+  or the explicit `full_scan: true` opt-in.
 
   ## Examples
 
@@ -142,10 +149,12 @@ defmodule TimelessLogs do
   """
   @spec field_names(keyword()) :: {:ok, list(map())}
   def field_names(filters \\ []) do
+    {filters, scan_limit} = field_scan_options(filters)
     filters = normalize_filters(filters)
 
     counts =
       stream(filters)
+      |> limit_field_stream(scan_limit)
       |> Enum.reduce(%{}, fn entry, acc ->
         # Built-in fields always present
         acc =
@@ -199,6 +208,23 @@ defmodule TimelessLogs do
     end
   end
 
+  defp field_scan_options(filters) do
+    {full_scan?, filters} = Keyword.pop(filters, :full_scan, false)
+    {requested_limit, filters} = Keyword.pop(filters, :scan_limit)
+
+    limit =
+      cond do
+        full_scan? -> :infinity
+        is_integer(requested_limit) and requested_limit > 0 -> requested_limit
+        true -> TimelessLogs.Config.field_scan_limit()
+      end
+
+    {filters, limit}
+  end
+
+  defp limit_field_stream(stream, :infinity), do: stream
+  defp limit_field_stream(stream, limit), do: Stream.take(stream, limit)
+
   @doc """
   Lazily stream matching log entries without loading all results into memory.
 
@@ -232,11 +258,14 @@ defmodule TimelessLogs do
   # StorageEngine seam routes here for engine: :elixir.
   def legacy_stream(filters) do
     block_ids = TimelessLogs.Index.matching_block_ids(filters)
-    search_filters = Keyword.drop(filters, [:limit, :offset, :order])
+
+    search_filters =
+      filters |> Keyword.drop([:limit, :offset, :order]) |> TimelessLogs.Filter.prepare()
+
     storage = TimelessLogs.Config.storage()
 
     Stream.flat_map(block_ids, fn {block_id, file_path, format} ->
-      format_atom = if is_binary(format), do: String.to_existing_atom(format), else: format
+      format_atom = TimelessLogs.Writer.format_atom(format)
 
       read_result =
         case storage do
@@ -396,15 +425,20 @@ defmodule TimelessLogs do
         blocks_src = Path.join(data_dir, "blocks")
         blocks_dst = Path.join(target_dir, "blocks")
 
-        block_bytes = copy_block_files(blocks_src, blocks_dst)
-        index_bytes = File.stat!(index_target).size
+        case copy_block_files(blocks_src, blocks_dst) do
+          {:ok, block_bytes} ->
+            index_bytes = File.stat!(index_target).size
 
-        {:ok,
-         %{
-           path: target_dir,
-           files: ["index.snapshot", "blocks"],
-           total_bytes: index_bytes + block_bytes
-         }}
+            {:ok,
+             %{
+               path: target_dir,
+               files: ["index.snapshot", "blocks"],
+               total_bytes: index_bytes + block_bytes
+             }}
+
+          {:error, _} = error ->
+            error
+        end
 
       {:error, _} = err ->
         err
@@ -416,20 +450,38 @@ defmodule TimelessLogs do
       {:ok, files} ->
         File.mkdir_p!(dst_dir)
 
-        files
-        |> Task.async_stream(
+        Task.Supervisor.async_stream_nolink(
+          TimelessLogs.FlushSupervisor,
+          files,
           fn file ->
             src = Path.join(src_dir, file)
             dst = Path.join(dst_dir, file)
             File.cp!(src, dst)
             File.stat!(dst).size
           end,
-          max_concurrency: System.schedulers_online()
+          max_concurrency: System.schedulers_online(),
+          timeout: TimelessLogs.Config.query_timeout(),
+          on_timeout: :kill_task
         )
-        |> Enum.reduce(0, fn {:ok, size}, acc -> acc + size end)
+        |> Enum.reduce_while({:ok, 0}, fn
+          {:ok, size}, {:ok, acc} ->
+            {:cont, {:ok, acc + size}}
+
+          {:exit, reason}, _acc ->
+            TimelessLogs.Telemetry.event(
+              [:timeless_logs, :backup, :copy_error],
+              %{},
+              %{reason: reason}
+            )
+
+            {:halt, {:error, {:block_copy_failed, reason}}}
+        end)
 
       {:error, :enoent} ->
-        0
+        {:ok, 0}
+
+      {:error, reason} ->
+        {:error, {:list_blocks_failed, reason}}
     end
   end
 end

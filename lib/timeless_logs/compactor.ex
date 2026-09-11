@@ -149,8 +149,9 @@ defmodule TimelessLogs.Compactor do
       chunks = Enum.chunk_every(all_entries, output_target)
 
       results =
-        chunks
-        |> Task.async_stream(
+        Task.Supervisor.async_stream_nolink(
+          TimelessLogs.FlushSupervisor,
+          chunks,
           fn chunk ->
             case TimelessLogs.Writer.write_block(
                    chunk,
@@ -163,22 +164,42 @@ defmodule TimelessLogs.Compactor do
             end
           end,
           max_concurrency: concurrency,
-          ordered: false
+          ordered: false,
+          timeout: TimelessLogs.Config.query_timeout(),
+          on_timeout: :kill_task
         )
-        |> Enum.reduce({[], 0}, fn
-          {:ok, {:ok, meta, chunk}}, {pairs, bytes} ->
-            {[{meta, chunk} | pairs], bytes + meta.byte_size}
+        |> Enum.reduce({[], 0, []}, fn
+          {:ok, {:ok, meta, chunk}}, {pairs, bytes, errors} ->
+            {[{meta, chunk} | pairs], bytes + meta.byte_size, errors}
 
-          _, acc ->
-            acc
+          {:ok, {:error, reason}}, {pairs, bytes, errors} ->
+            {pairs, bytes, [reason | errors]}
+
+          {:exit, reason}, {pairs, bytes, errors} ->
+            {pairs, bytes, [reason | errors]}
         end)
 
       case results do
-        {[], _} ->
+        {meta_chunk_pairs, _total_bytes, [_ | _] = errors} ->
+          cleanup_unindexed_blocks(meta_chunk_pairs, state.storage)
+
+          Logger.warning(
+            "TimelessLogs: compaction failed before commit: #{inspect(Enum.reverse(errors))}"
+          )
+
+          TimelessLogs.Telemetry.event(
+            [:timeless_logs, :compaction, :error],
+            %{},
+            %{reason: {:chunk_failures, Enum.reverse(errors)}}
+          )
+
+          :noop
+
+        {[], _, []} ->
           Logger.warning("TimelessLogs: compaction failed: all chunks errored")
           :noop
 
-        {meta_chunk_pairs, total_bytes} ->
+        {meta_chunk_pairs, total_bytes, []} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
 
           new_terms_list =
@@ -186,22 +207,32 @@ defmodule TimelessLogs.Compactor do
               {meta, entries, TimelessLogs.Index.extract_terms(entries)}
             end)
 
-          TimelessLogs.Index.compact_blocks(old_ids, new_terms_list, {raw_bytes, total_bytes})
+          case TimelessLogs.Index.compact_blocks(
+                 old_ids,
+                 new_terms_list,
+                 {raw_bytes, total_bytes}
+               ) do
+            :ok ->
+              duration = System.monotonic_time() - start_time
 
-          duration = System.monotonic_time() - start_time
+              TimelessLogs.Telemetry.event(
+                [:timeless_logs, :compaction, :stop],
+                %{
+                  duration: duration,
+                  raw_blocks: length(raw_blocks),
+                  entry_count: length(all_entries),
+                  byte_size: total_bytes
+                },
+                %{}
+              )
 
-          TimelessLogs.Telemetry.event(
-            [:timeless_logs, :compaction, :stop],
-            %{
-              duration: duration,
-              raw_blocks: length(raw_blocks),
-              entry_count: length(all_entries),
-              byte_size: total_bytes
-            },
-            %{}
-          )
+              if leftover, do: :more, else: :ok
 
-          if leftover, do: :more, else: :ok
+            {:error, reason} ->
+              cleanup_unindexed_blocks(meta_chunk_pairs, state.storage)
+              Logger.warning("TimelessLogs: compaction index commit failed: #{inspect(reason)}")
+              :noop
+          end
       end
     end
   rescue
@@ -241,6 +272,14 @@ defmodule TimelessLogs.Compactor do
     else
       []
     end
+  end
+
+  defp cleanup_unindexed_blocks(_pairs, :memory), do: :ok
+
+  defp cleanup_unindexed_blocks(pairs, :disk) do
+    Enum.each(pairs, fn {meta, _entries} ->
+      if is_binary(meta.file_path), do: File.rm(meta.file_path)
+    end)
   end
 
   # --- Merge compaction ---
@@ -289,19 +328,18 @@ defmodule TimelessLogs.Compactor do
   end
 
   defp group_into_batches(blocks, target_size) do
-    {batches, current} =
-      Enum.reduce(blocks, {[], []}, fn {_bid, _fp, _bs, ec} = block, {batches, current} ->
-        current_count = Enum.reduce(current, 0, fn {_, _, _, e}, a -> a + e end)
-
+    {batches, current, _current_count} =
+      Enum.reduce(blocks, {[], [], 0}, fn {_bid, _fp, _bs, ec} = block,
+                                          {batches, current, current_count} ->
         if current_count + ec > target_size and current != [] do
-          {[current | batches], [block]}
+          {[Enum.reverse(current) | batches], [block], ec}
         else
-          {batches, current ++ [block]}
+          {batches, [block | current], current_count + ec}
         end
       end)
 
     # Only include the last batch if it has >= 2 blocks
-    all = if length(current) >= 2, do: [current | batches], else: batches
+    all = if length(current) >= 2, do: [Enum.reverse(current) | batches], else: batches
     Enum.reverse(all)
   end
 
@@ -338,13 +376,19 @@ defmodule TimelessLogs.Compactor do
           old_ids = Enum.map(batch, &elem(&1, 0))
           terms = TimelessLogs.Index.extract_terms(all_entries)
 
-          TimelessLogs.Index.compact_blocks(
-            old_ids,
-            [{new_meta, all_entries, terms}],
-            {raw_bytes, new_meta.byte_size}
-          )
+          case TimelessLogs.Index.compact_blocks(
+                 old_ids,
+                 [{new_meta, all_entries, terms}],
+                 {raw_bytes, new_meta.byte_size}
+               ) do
+            :ok ->
+              :ok
 
-          :ok
+            {:error, reason} ->
+              cleanup_unindexed_blocks([{new_meta, all_entries}], state.storage)
+              Logger.error("TimelessLogs: merge batch index commit failed: #{inspect(reason)}")
+              :noop
+          end
 
         {:error, reason} ->
           Logger.error("TimelessLogs: merge batch write failed: #{inspect(reason)}")

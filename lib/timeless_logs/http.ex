@@ -195,6 +195,14 @@ defmodule TimelessLogs.HTTP do
                 json_error(req, 500, inspect(reason))
             end
 
+          {:stats_group, filters, aggregate} ->
+            rows =
+              filters
+              |> grouped_query_stream()
+              |> TimelessLogs.LogsQL.aggregate_grouped(aggregate)
+
+            send_ndjson_maps(req, rows)
+
           {:query, filters} ->
             case TimelessLogs.query([{:count_total, false} | filters]) do
               {:ok, %{entries: entries}} ->
@@ -203,6 +211,9 @@ defmodule TimelessLogs.HTTP do
               {:error, reason} ->
                 json_error(req, 500, inspect(reason))
             end
+
+          {:error, {kind, message}} ->
+            json_resp(req, 400, %{error: to_string(kind), message: message})
         end
     end
   end
@@ -217,10 +228,18 @@ defmodule TimelessLogs.HTTP do
         field = Rocket.Request.get_query_param(req, "field")
         form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
-        {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
-        {:ok, values} = TimelessLogs.field_values(field, filters)
 
-        json_resp(req, 200, %{values: values})
+        case TimelessLogs.LogsQL.parse(query_str) do
+          {:query, filters} ->
+            {:ok, values} = TimelessLogs.field_values(field, filters)
+            json_resp(req, 200, %{values: values})
+
+          {:error, {kind, message}} ->
+            json_resp(req, 400, %{error: to_string(kind), message: message})
+
+          _aggregate ->
+            json_resp(req, 400, %{error: "invalid_query", message: "expected a log query"})
+        end
     end
   end
 
@@ -233,10 +252,18 @@ defmodule TimelessLogs.HTTP do
       :ok ->
         form = URI.decode_query(req.body || "")
         query_str = Map.get(form, "query", "*")
-        {:query, filters} = TimelessLogs.LogsQL.parse(query_str)
-        {:ok, values} = TimelessLogs.field_names(filters)
 
-        json_resp(req, 200, %{values: values})
+        case TimelessLogs.LogsQL.parse(query_str) do
+          {:query, filters} ->
+            {:ok, values} = TimelessLogs.field_names(filters)
+            json_resp(req, 200, %{values: values})
+
+          {:error, {kind, message}} ->
+            json_resp(req, 400, %{error: to_string(kind), message: message})
+
+          _aggregate ->
+            json_resp(req, 400, %{error: "invalid_query", message: "expected a log query"})
+        end
     end
   end
 
@@ -500,6 +527,38 @@ defmodule TimelessLogs.HTTP do
       end)
 
     ndjson_resp(req, 200, body)
+  end
+
+  defp send_ndjson_maps(req, rows) do
+    body = Enum.map_join(rows, "\n", &json_encode!/1)
+    ndjson_resp(req, 200, body)
+  end
+
+  defp grouped_query_stream(filters) do
+    Stream.resource(
+      fn -> 0 end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        offset ->
+          opts =
+            Keyword.merge(filters, limit: 1_000, offset: offset, order: :asc, count_total: false)
+
+          case TimelessLogs.query(opts) do
+            {:ok, %{entries: []}} ->
+              {:halt, :done}
+
+            {:ok, %{entries: entries, has_more: has_more}} ->
+              next = if has_more, do: offset + length(entries), else: :done
+              {entries, next}
+
+            {:error, _reason} ->
+              {:halt, :done}
+          end
+      end,
+      fn _ -> :ok end
+    )
   end
 
   defp default_backup_dir do

@@ -65,6 +65,7 @@ defmodule TimelessLogs.LibsqlFacadeTest do
 
     assert error_entry.metadata["service"] == "api"
     assert {:ok, 2} = TimelessLogs.count(metadata: %{"service" => "api"})
+    assert {:ok, 1} = TimelessLogs.count(message: "BOOM")
 
     # stream + the stream-derived field aggregations.
     assert TimelessLogs.stream(metadata: %{"service" => "api"}) |> Enum.count() == 2

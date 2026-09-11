@@ -50,6 +50,14 @@ defmodule TimelessLogs.BackpressureTest do
     assert total == 100
   end
 
+  test "shard names are precomputed and large fallback messages remain shardable" do
+    names = :persistent_term.get({TimelessLogs.BufferShard, :names})
+    assert TimelessLogs.BufferShard.name(0) == elem(names, 0)
+
+    entry = hd(entries(1, String.duplicate("large-message", 100_000)))
+    assert TimelessLogs.BufferShard.shard_for(entry) == 0
+  end
+
   test "ingest above the watermark paces the producer, loses nothing" do
     Application.put_env(:timeless_logs, :ingest_soft_watermark, 50)
     # Nothing drains until the explicit flush below, so cap the wait
@@ -91,6 +99,29 @@ defmodule TimelessLogs.BackpressureTest do
 
     TimelessLogs.IngestPressure.set_raw_debt(0)
     refute TimelessLogs.IngestPressure.overloaded?(0)
+  end
+
+  test "single-entry ingest applies the same backpressure policy" do
+    Application.put_env(:timeless_logs, :ingest_soft_watermark, 1)
+    Application.put_env(:timeless_logs, :ingest_backpressure_timeout, 20)
+    handler_id = {:single_bp_test, make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:timeless_logs, :ingest, :backpressure],
+      fn _event, measurements, meta, _cfg ->
+        send(parent, {:single_backpressure, measurements.entry_count, meta.shard})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    TimelessLogs.IngestPressure.add(0, 1)
+    assert :ok = TimelessLogs.Buffer.log(hd(entries(1, "single")))
+    assert_receive {:single_backpressure, 1, 0}
+    TimelessLogs.IngestPressure.sub(0, 2)
   end
 
   defp wait_until(fun, attempts \\ 200) do

@@ -120,6 +120,17 @@ Each line is a JSON object with:
 - `level`: log level string
 - All metadata fields as additional keys
 
+The POST endpoint accepts the supported LogsQL subset, including bare or
+quoted message terms, level/metadata/time filters, `sort`, `limit`, `offset`,
+`stats count()`, and grouped counts with extraction:
+
+```text
+"DHCP NAK" | extract "MAC: <mac>, ciaddr" from _msg | stats by (mac) count() as n
+```
+
+Unsupported pipes and logical operators (`AND`, `OR`, `NOT`, in any case)
+return HTTP 400 rather than being silently reinterpreted.
+
 ### Examples
 
 ```bash

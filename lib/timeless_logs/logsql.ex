@@ -8,8 +8,9 @@ defmodule TimelessLogs.LogsQL do
       _time:24h | stats count() as total
       *
 
-  Returns `{:query, filters}` or `{:stats_count, filters}` where filters
-  is a keyword list compatible with `TimelessLogs.query/1`.
+  Returns `{:query, filters}`, `{:stats_count, filters}`, or
+  `{:stats_group, filters, aggregate}` where filters is a keyword list
+  compatible with `TimelessLogs.query/1`.
   """
 
   @duration_units %{
@@ -19,71 +20,170 @@ defmodule TimelessLogs.LogsQL do
     "d" => 86400
   }
 
-  @spec parse(String.t()) :: {:query, keyword()} | {:stats_count, keyword()}
+  @levels %{
+    "debug" => :debug,
+    "info" => :info,
+    "notice" => :notice,
+    "warning" => :warning,
+    "warn" => :warning,
+    "error" => :error,
+    "critical" => :critical,
+    "alert" => :alert,
+    "emergency" => :emergency
+  }
+
+  @type parse_error :: {:invalid_query, String.t()} | {:unsupported_capability, String.t()}
+
+  @spec parse(String.t()) ::
+          {:query, keyword()}
+          | {:stats_count, keyword()}
+          | {:stats_group, keyword(), map()}
+          | {:error, parse_error()}
   def parse(query) when is_binary(query) do
     query = String.trim(query)
-
     {filter_part, pipes} = split_pipes(query)
 
-    {pipe_opts, stats?} = parse_pipes(pipes)
+    with {:ok, filter_opts} <- parse_filters(filter_part),
+         {:ok, pipe_opts, command} <- parse_pipes(pipes) do
+      filters = Keyword.merge(filter_opts, pipe_opts)
 
-    filter_opts = parse_filters(filter_part)
-
-    filters = Keyword.merge(filter_opts, pipe_opts)
-
-    if stats? do
-      {:stats_count, filters}
-    else
-      {:query, filters}
+      case command do
+        :query -> {:query, filters}
+        :stats_count -> {:stats_count, filters}
+        {:stats_group, aggregate} -> {:stats_group, filters, aggregate}
+      end
     end
   end
 
-  # Split on " | " to separate filter section from pipe commands
+  # Split on a pipe with optional surrounding whitespace, but never on a
+  # literal pipe inside a quoted value or a time-range bracket.
   defp split_pipes(query) do
-    case String.split(query, " | ", parts: 2) do
-      [filters, pipes] -> {String.trim(filters), String.split(pipes, " | ")}
-      [filters] -> {String.trim(filters), []}
+    case split_pipe_parts(query) do
+      [filters | pipes] -> {String.trim(filters), Enum.map(pipes, &String.trim/1)}
+      [] -> {"", []}
     end
+  end
+
+  defp split_pipe_parts(query) do
+    {parts, current, _quoted, _escaped, _bracket_depth} =
+      query
+      |> String.graphemes()
+      |> Enum.reduce({[], [], false, false, 0}, fn char,
+                                                   {parts, current, quoted, escaped, depth} ->
+        cond do
+          escaped ->
+            {parts, [char | current], quoted, false, depth}
+
+          quoted and char == "\\" ->
+            {parts, [char | current], quoted, true, depth}
+
+          char == "\"" ->
+            {parts, [char | current], not quoted, false, depth}
+
+          not quoted and char == "[" ->
+            {parts, [char | current], quoted, false, depth + 1}
+
+          not quoted and depth > 0 and char in ["]", ")"] ->
+            {parts, [char | current], quoted, false, depth - 1}
+
+          not quoted and depth == 0 and char == "|" ->
+            {[current |> Enum.reverse() |> Enum.join() | parts], [], quoted, false, depth}
+
+          true ->
+            {parts, [char | current], quoted, false, depth}
+        end
+      end)
+
+    [current |> Enum.reverse() |> Enum.join() | parts]
+    |> Enum.reverse()
   end
 
   defp parse_pipes(pipes) do
-    Enum.reduce(pipes, {[], false}, fn pipe, {opts, stats?} ->
-      pipe = String.trim(pipe)
+    initial = %{opts: [], stats: nil, extracts: []}
 
-      cond do
-        String.starts_with?(pipe, "sort by") ->
-          order = if String.ends_with?(pipe, "asc"), do: :asc, else: :desc
-          {[{:order, order} | opts], stats?}
+    with {:ok, state} <- Enum.reduce_while(pipes, {:ok, initial}, &parse_pipe/2) do
+      command =
+        case state.stats do
+          nil ->
+            :query
 
-        String.starts_with?(pipe, "limit") ->
-          case Integer.parse(String.trim_leading(pipe, "limit ")) do
-            {n, _} -> {[{:limit, n} | opts], stats?}
-            :error -> {opts, stats?}
-          end
+          %{group_by: nil} ->
+            :stats_count
 
-        String.starts_with?(pipe, "offset") ->
-          case Integer.parse(String.trim_leading(pipe, "offset ")) do
-            {n, _} -> {[{:offset, n} | opts], stats?}
-            :error -> {opts, stats?}
-          end
+          stats ->
+            {:stats_group, Map.put(stats, :extracts, Enum.reverse(state.extracts))}
+        end
 
-        String.starts_with?(pipe, "stats count(") ->
-          {opts, true}
-
-        true ->
-          {opts, stats?}
-      end
-    end)
+      {:ok, Enum.reverse(state.opts), command}
+    end
   end
 
-  defp parse_filters("*"), do: []
-  defp parse_filters(""), do: []
+  defp parse_pipe(pipe, {:ok, state}) do
+    pipe = String.trim(pipe)
+
+    cond do
+      captures = Regex.run(~r/^sort\s+by\s+\(_time\)\s+(asc|desc)$/i, pipe) ->
+        order = captures |> Enum.at(1) |> String.downcase() |> String.to_atom()
+        {:cont, {:ok, %{state | opts: [{:order, order} | state.opts]}}}
+
+      captures = Regex.run(~r/^limit\s+(\d+)$/i, pipe) ->
+        {:cont, {:ok, put_pipe_integer(state, :limit, Enum.at(captures, 1))}}
+
+      captures = Regex.run(~r/^offset\s+(\d+)$/i, pipe) ->
+        {:cont, {:ok, put_pipe_integer(state, :offset, Enum.at(captures, 1))}}
+
+      Regex.match?(~r/^stats\s+count\(\)(?:\s+as\s+[A-Za-z_][\w]*)?$/i, pipe) ->
+        {:cont, {:ok, %{state | stats: %{group_by: nil, as: stats_alias(pipe)}}}}
+
+      captures =
+          Regex.run(
+            ~r/^stats\s+by\s+\(([A-Za-z_][\w.-]*)\)\s+count\(\)(?:\s+as\s+([A-Za-z_][\w]*))?$/i,
+            pipe
+          ) ->
+        aggregate = %{group_by: Enum.at(captures, 1), as: Enum.at(captures, 2) || "count"}
+        {:cont, {:ok, %{state | stats: aggregate}}}
+
+      captures =
+          Regex.run(
+            ~r/^extract\s+"((?:\\.|[^"])*)"\s+from\s+([A-Za-z_][\w.-]*)$/i,
+            pipe
+          ) ->
+        case build_extract(Enum.at(captures, 1), Enum.at(captures, 2)) do
+          {:ok, extract} ->
+            {:cont, {:ok, %{state | extracts: [extract | state.extracts]}}}
+
+          {:error, message} ->
+            {:halt, {:error, {:invalid_query, message}}}
+        end
+
+      true ->
+        {:halt, {:error, {:unsupported_capability, "unsupported LogsQL pipe #{inspect(pipe)}"}}}
+    end
+  end
+
+  defp put_pipe_integer(state, key, value) do
+    {integer, ""} = Integer.parse(value)
+    %{state | opts: [{key, integer} | state.opts]}
+  end
+
+  defp stats_alias(pipe) do
+    case Regex.run(~r/\s+as\s+([A-Za-z_][\w]*)$/i, pipe) do
+      [_, name] -> name
+      _ -> "total"
+    end
+  end
+
+  defp parse_filters("*"), do: {:ok, []}
+  defp parse_filters(""), do: {:ok, []}
 
   defp parse_filters(filter_str) do
     filter_str
     |> tokenize()
-    |> Enum.reduce([], fn token, acc ->
-      parse_token(token, acc)
+    |> Enum.reduce_while({:ok, []}, fn token, {:ok, acc} ->
+      case parse_token(token, acc) do
+        {:ok, next} -> {:cont, {:ok, next}}
+        {:error, _} = error -> {:halt, error}
+      end
     end)
   end
 
@@ -144,32 +244,134 @@ defmodule TimelessLogs.LogsQL do
 
   # Parse individual tokens into filter opts
   defp parse_token("_time:" <> value, acc) do
-    parse_time_filter(value, acc)
+    {:ok, parse_time_filter(value, acc)}
   end
 
   defp parse_token("level:" <> value, acc) do
-    level = value |> unquote_value() |> String.to_existing_atom()
-    [{:level, level} | acc]
+    original = unquote_value(value)
+
+    case Map.fetch(@levels, String.downcase(original)) do
+      {:ok, level} -> {:ok, [{:level, level} | acc]}
+      :error -> {:error, {:invalid_query, "unknown log level #{inspect(original)}"}}
+    end
   end
 
   # Bare quoted string → message search
   defp parse_token("\"" <> _ = token, acc) do
     msg = token |> String.trim("\"")
-    [{:message, msg} | acc]
+    {:ok, [{:message, msg} | acc]}
   end
 
   # Other field:value → metadata
   defp parse_token(token, acc) do
+    cond do
+      String.downcase(token) in ["and", "or", "not"] ->
+        operator = String.downcase(token)
+
+        {:error,
+         {:unsupported_capability,
+          "LogsQL logical operator #{inspect(operator)} is not implemented yet"}}
+
+      token == "*" ->
+        {:ok, acc}
+
+      true ->
+        parse_field_or_message(token, acc)
+    end
+  end
+
+  defp parse_field_or_message(token, acc) do
     case String.split(token, ":", parts: 2) do
-      [field, value] ->
+      [field, value] when field != "" and value != "" ->
         # String keys: filter and term lookup handle both shapes, and
         # query fields are client-controlled (no atom creation).
         meta = Keyword.get(acc, :metadata, %{})
         val = unquote_value(value)
-        Keyword.put(acc, :metadata, Map.put(meta, field, val))
+        {:ok, Keyword.put(acc, :metadata, Map.put(meta, field, val))}
 
       _ ->
-        acc
+        # VictoriaLogs accepts unquoted words as message terms. Keeping each
+        # as a separate keyword entry gives the existing Filter its AND
+        # semantics without silently broadening the query.
+        {:ok, [{:message, token} | acc]}
+    end
+  end
+
+  @doc false
+  def aggregate_grouped(entries, %{group_by: group_by, as: as, extracts: extracts}) do
+    entries
+    |> Enum.reduce(%{}, fn entry, counts ->
+      extracted = apply_extracts(entry, extracts)
+      value = Map.get(extracted, group_by) || entry_field(entry, group_by)
+
+      if is_nil(value), do: counts, else: Map.update(counts, value, 1, &(&1 + 1))
+    end)
+    |> Enum.map(fn {value, count} -> %{group_by => value, as => count} end)
+    |> Enum.sort_by(&to_string(Map.fetch!(&1, group_by)))
+  end
+
+  defp apply_extracts(entry, extracts) do
+    Enum.reduce(extracts, %{}, fn %{source: source, regex: regex}, fields ->
+      case entry_field(entry, source) do
+        value when is_binary(value) ->
+          Map.merge(fields, Regex.named_captures(regex, value) || %{})
+
+        _ ->
+          fields
+      end
+    end)
+  end
+
+  defp entry_field(entry, "_msg"), do: entry.message
+  defp entry_field(entry, "_time"), do: entry.timestamp
+  defp entry_field(entry, "level"), do: entry.level
+
+  defp entry_field(entry, field) do
+    metadata = Map.get(entry, :metadata, %{})
+
+    case Map.fetch(metadata, field) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        try do
+          Map.get(metadata, String.to_existing_atom(field))
+        rescue
+          ArgumentError -> nil
+        end
+    end
+  end
+
+  defp build_extract(pattern, source) do
+    pattern = String.replace(pattern, "\\\"", "\"")
+    {regex_source, fields} = extract_regex(pattern, [], [])
+
+    if fields == [] do
+      {:error, "extract pattern must contain at least one <field> capture"}
+    else
+      case Regex.compile(IO.iodata_to_binary(regex_source), "u") do
+        {:ok, regex} -> {:ok, %{source: source, regex: regex}}
+        {:error, reason} -> {:error, "invalid extract pattern: #{inspect(reason)}"}
+      end
+    end
+  end
+
+  defp extract_regex(pattern, source, fields) do
+    case Regex.run(~r/<([A-Za-z_][A-Za-z0-9_]*)>/, pattern, return: :index) do
+      [{start, length}, {field_start, field_length}] ->
+        literal = binary_part(pattern, 0, start)
+        field = binary_part(pattern, field_start, field_length)
+        rest_start = start + length
+        rest = binary_part(pattern, rest_start, byte_size(pattern) - rest_start)
+
+        extract_regex(
+          rest,
+          [source, Regex.escape(literal), "(?<", field, ">.+?)"],
+          [field | fields]
+        )
+
+      nil ->
+        {[source, Regex.escape(pattern)], fields}
     end
   end
 

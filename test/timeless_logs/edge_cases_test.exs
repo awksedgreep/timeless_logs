@@ -36,6 +36,39 @@ defmodule TimelessLogs.EdgeCasesTest do
     test "flushing empty buffer is a no-op" do
       assert :ok = TimelessLogs.flush()
     end
+
+    test "an index transaction error is returned without crashing the Index server" do
+      index = Process.whereis(TimelessLogs.Index)
+
+      invalid_meta = %{
+        block_id: self(),
+        file_path: nil,
+        byte_size: 1,
+        entry_count: 1,
+        ts_min: 1,
+        ts_max: 1,
+        format: :raw
+      }
+
+      assert {:error, _reason} = TimelessLogs.Index.index_block(invalid_meta, [], %{})
+      assert Process.alive?(index)
+      assert Process.whereis(TimelessLogs.Index) == index
+    end
+
+    test "an exited parallel block task returns an error instead of crashing the reducer" do
+      for id <- [8_000_001, 8_000_002] do
+        {:ok, _} =
+          TimelessLogs.DB.write(
+            TimelessLogs.DB,
+            "INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, NULL, 0, 1, 1, 1, 'raw', 1)",
+            [id]
+          )
+      end
+
+      assert {:error, {:query_task_failed, reason}} = TimelessLogs.query(limit: 1)
+      assert match?({:function_clause, _stacktrace}, reason)
+      assert Process.alive?(Process.whereis(TimelessLogs.Index))
+    end
   end
 
   describe "special characters" do

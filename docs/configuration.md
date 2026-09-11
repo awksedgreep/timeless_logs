@@ -11,6 +11,8 @@ All configuration is set via `config :timeless_logs` in your `config/config.exs`
 | `flush_interval` | integer (ms) | `1_000` | Buffer flush interval |
 | `max_buffer_size` | integer | `1_000` | Max entries before auto-flush |
 | `query_timeout` | integer (ms) | `30_000` | Query operation timeout |
+| `query_concurrency` | integer | half the online schedulers | Parallel block reads per query |
+| `field_scan_limit` | integer | `100_000` | Default entry sample cap for field name/value discovery |
 | `zstd_compression_level` | integer (1-22) | `3` | Zstd compression level |
 | `openzl_compression_level` | integer (1-22) | `9` | OpenZL columnar compression level |
 | `compaction_format` | atom | `:openzl` | Compaction output format: `:zstd` or `:openzl` |
@@ -33,6 +35,8 @@ config :timeless_logs,
   data_dir: "/var/lib/my_app/logs",
   flush_interval: 2_000,
   max_buffer_size: 2_000,
+  query_timeout: 30_000,
+  field_scan_limit: 100_000,
   zstd_compression_level: 5,
   compaction_format: :openzl,
   openzl_compression_level: 9,

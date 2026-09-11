@@ -38,9 +38,9 @@ defmodule TimelessLogs.StorageEngine do
   # GenServer.cast to an unregistered name returns :ok, so every log line was
   # silently discarded and no subscriber was ever notified.
   #
-  # The elixir branch stays on Buffer.log/1 rather than ingest/1's log_many/1:
-  # log_many/1 can block the caller on backpressure, and a Logger handler runs
-  # in the calling process. Preserving log/1 here keeps that path unchanged.
+  # The elixir branch stays on Buffer.log/1 so the single-entry handler path
+  # avoids batch grouping overhead. Both Buffer entry points apply the same
+  # bounded producer pacing when the durable pipeline is overloaded.
   def ingest_one(entry) do
     case engine() do
       :libsql -> libsql_ingest_one(entry)
@@ -127,7 +127,12 @@ defmodule TimelessLogs.StorageEngine do
           fn -> 0 end,
           fn offset ->
             case TimelessLogs.LibsqlEngine.query(
-                   Keyword.merge(search, limit: @stream_page, offset: offset, order: :asc)
+                   Keyword.merge(search,
+                     limit: @stream_page,
+                     offset: offset,
+                     order: :asc,
+                     count_total: false
+                   )
                  ) do
               {:ok, %TimelessLogs.Result{entries: []}} -> {:halt, offset}
               {:ok, %TimelessLogs.Result{entries: entries}} -> {entries, offset + length(entries)}

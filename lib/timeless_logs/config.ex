@@ -79,6 +79,13 @@ defmodule TimelessLogs.Config do
     Application.get_env(:timeless_logs, :query_timeout, 30_000)
   end
 
+  # Field discovery endpoints intentionally sample by default. Their result
+  # cardinality is otherwise bounded only by the size of the entire store.
+  @spec field_scan_limit() :: pos_integer()
+  def field_scan_limit do
+    Application.get_env(:timeless_logs, :field_scan_limit, 100_000)
+  end
+
   # Queued entries per shard (buffer + pending batches + in-flight flushes)
   # above which batch ingest switches from cast to call, pacing producers
   # to the durable drain rate. Sized to absorb bursts at full speed.

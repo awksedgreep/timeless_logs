@@ -176,20 +176,24 @@ defmodule TimelessLogs.Writer do
 
   @doc false
   def columnar_serialize(entries, opts \\ []) do
-    {ts_bin, levels_bin, msg_concat, msg_lengths_bin} =
-      Enum.reduce(entries, {<<>>, <<>>, <<>>, <<>>}, fn entry,
-                                                        {ts_acc, lv_acc, msg_acc, msg_len_acc} ->
+    {ts_parts, level_parts, msg_parts, msg_length_parts} =
+      Enum.reduce(entries, {[], [], [], []}, fn entry, {ts_acc, lv_acc, msg_acc, msg_len_acc} ->
         ts = entry.timestamp
         level_int = Map.get(@level_to_int, entry.level, 1)
         msg = entry.message
 
         {
-          <<ts_acc::binary, ts::little-unsigned-64>>,
-          <<lv_acc::binary, level_int::unsigned-8>>,
-          <<msg_acc::binary, msg::binary>>,
-          <<msg_len_acc::binary, byte_size(msg)::little-unsigned-32>>
+          [<<ts::little-unsigned-64>> | ts_acc],
+          [<<level_int::unsigned-8>> | lv_acc],
+          [msg | msg_acc],
+          [<<byte_size(msg)::little-unsigned-32>> | msg_len_acc]
         }
       end)
+
+    ts_bin = ts_parts |> Enum.reverse() |> IO.iodata_to_binary()
+    levels_bin = level_parts |> Enum.reverse() |> IO.iodata_to_binary()
+    msg_concat = msg_parts |> Enum.reverse() |> IO.iodata_to_binary()
+    msg_lengths_bin = msg_length_parts |> Enum.reverse() |> IO.iodata_to_binary()
 
     # Batch all metadata into a single term_to_binary call for atom sharing
     meta_bin = :erlang.term_to_binary(Enum.map(entries, & &1.metadata))
@@ -299,23 +303,38 @@ defmodule TimelessLogs.Writer do
     split_by_lengths(data, lengths) |> Enum.map(&:erlang.binary_to_term/1)
   end
 
-  defp unpack_u64_le(<<>>), do: []
-
-  defp unpack_u64_le(<<val::little-unsigned-64, rest::binary>>),
-    do: [val | unpack_u64_le(rest)]
-
-  defp unpack_u8(<<>>), do: []
-  defp unpack_u8(<<val::unsigned-8, rest::binary>>), do: [val | unpack_u8(rest)]
-
-  defp unpack_native_u32(<<>>), do: []
-
-  defp unpack_native_u32(<<val::native-unsigned-32, rest::binary>>),
-    do: [val | unpack_native_u32(rest)]
-
-  defp split_by_lengths(_bin, []), do: []
-
-  defp split_by_lengths(bin, [len | rest]) do
-    <<chunk::binary-size(^len), remaining::binary>> = bin
-    [chunk | split_by_lengths(remaining, rest)]
+  defp unpack_u64_le(bin) when rem(byte_size(bin), 8) == 0 do
+    for <<val::little-unsigned-64 <- bin>>, do: val
   end
+
+  defp unpack_u64_le(_bin), do: raise(ArgumentError, "invalid u64 column length")
+
+  defp unpack_u8(bin) do
+    for <<val::unsigned-8 <- bin>>, do: val
+  end
+
+  defp unpack_native_u32(bin) when rem(byte_size(bin), 4) == 0 do
+    for <<val::native-unsigned-32 <- bin>>, do: val
+  end
+
+  defp unpack_native_u32(_bin), do: raise(ArgumentError, "invalid u32 column length")
+
+  defp split_by_lengths(bin, lengths) do
+    {chunks, _remaining} =
+      Enum.map_reduce(lengths, bin, fn len, remaining ->
+        <<chunk::binary-size(^len), rest::binary>> = remaining
+        {chunk, rest}
+      end)
+
+    chunks
+  end
+
+  @doc false
+  def format_atom("raw"), do: :raw
+  def format_atom("zstd"), do: :zstd
+  def format_atom("openzl"), do: :openzl
+  def format_atom(:raw), do: :raw
+  def format_atom(:zstd), do: :zstd
+  def format_atom(:openzl), do: :openzl
+  def format_atom(_), do: :zstd
 end

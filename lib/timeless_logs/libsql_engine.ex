@@ -204,11 +204,7 @@ defmodule TimelessLogs.LibsqlEngine do
   end
 
   def handle_call({:count, filters}, _from, state) do
-    result =
-      case run_query(state.conn, Keyword.merge(filters, limit: 0, offset: 0)) do
-        {:ok, %TimelessLogs.Result{total: total}} -> {:ok, total}
-        {:error, _} = error -> error
-      end
+    result = run_count(state.conn, filters)
 
     {:reply, result, state}
   end
@@ -266,6 +262,24 @@ defmodule TimelessLogs.LibsqlEngine do
                 ~w(debug info notice warning warn error critical alert emergency),
                 &{&1, String.to_atom(&1)}
               )
+
+  defp run_count(conn, filters) do
+    {_pagination, search} = Enum.split_with(filters, fn {key, _} -> key in @pagination_keys end)
+
+    if engine_exact?(search) do
+      {where_sql, params} = select_where(search)
+
+      case LibsqlCandidate.execute(conn, "SELECT COUNT(*) FROM #{@table}#{where_sql}", params) do
+        {:ok, [[total]]} -> {:ok, total}
+        {:error, _} = error -> error
+      end
+    else
+      case run_query(conn, Keyword.merge(filters, limit: 0, offset: 0)) do
+        {:ok, %TimelessLogs.Result{total: total}} -> {:ok, total}
+        {:error, _} = error -> error
+      end
+    end
+  end
 
   defp run_query(conn, filters) do
     {pagination, search} = Enum.split_with(filters, fn {k, _} -> k in @pagination_keys end)
@@ -351,6 +365,18 @@ defmodule TimelessLogs.LibsqlEngine do
   # ts_min/ts_max + the level partition term index); the shared Filter
   # re-checks everything, so pushdown is purely an optimization.
   defp select_entries(conn, search, order, fetch) do
+    {where_sql, params} = select_where(search)
+    order_sql = if order == :desc, do: " ORDER BY ts DESC", else: " ORDER BY ts ASC"
+    limit_sql = if is_integer(fetch), do: " LIMIT #{fetch}", else: ""
+
+    LibsqlCandidate.execute(
+      conn,
+      "SELECT ts, level, message, metadata FROM #{@table}#{where_sql}#{order_sql}#{limit_sql}",
+      params
+    )
+  end
+
+  defp select_where(search) do
     {where, params} =
       Enum.reduce(search, {[], []}, fn
         {:since, ts}, {w, p} ->
@@ -401,14 +427,7 @@ defmodule TimelessLogs.LibsqlEngine do
       end)
 
     where_sql = if where == [], do: "", else: " WHERE " <> Enum.join(Enum.reverse(where), " AND ")
-    order_sql = if order == :desc, do: " ORDER BY ts DESC", else: " ORDER BY ts ASC"
-    limit_sql = if is_integer(fetch), do: " LIMIT #{fetch}", else: ""
-
-    LibsqlCandidate.execute(
-      conn,
-      "SELECT ts, level, message, metadata FROM #{@table}#{where_sql}#{order_sql}#{limit_sql}",
-      params
-    )
+    {where_sql, params}
   end
 
   defp decode_row([ts, level, message, metadata_json]) do

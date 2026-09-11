@@ -16,7 +16,8 @@ defmodule TimelessLogs.Index do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec index_block(TimelessLogs.Writer.block_meta(), [map()], [String.t()]) :: :ok
+  @spec index_block(TimelessLogs.Writer.block_meta(), [map()], [String.t()]) ::
+          :ok | {:error, term()}
   def index_block(block_meta, entries, terms) do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries, terms})
   end
@@ -31,24 +32,25 @@ defmodule TimelessLogs.Index do
     GenServer.cast(__MODULE__, {:index_block, block_meta, entries, terms, shard})
   end
 
-  # --- Read functions (use DB reader pool, run in caller's process via DB GenServer) ---
+  # --- Read functions (fan out directly across the DB reader workers) ---
 
-  @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()}
+  @spec query(keyword()) :: {:ok, TimelessLogs.Result.t()} | {:error, term()}
   def query(filters) do
     db = :persistent_term.get({__MODULE__, :db})
     storage = :persistent_term.get({__MODULE__, :storage})
 
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
+    prepared_filters = TimelessLogs.Filter.prepare(search_filters)
 
     # Partition by the hot-tail boundary: memory serves ts >= boundary,
     # disk serves ts < boundary — exact union, no dedup.
     boundary = TimelessLogs.HotTail.boundary()
 
     {tail_entries, tail_total, disk_time_filters} =
-      tail_partition(search_filters, time_filters, boundary, pagination)
+      tail_partition(prepared_filters, time_filters, boundary, pagination)
 
-    do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, search_filters,
+    do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, prepared_filters,
       tail_entries: tail_entries,
       tail_total: tail_total
     )
@@ -168,7 +170,7 @@ defmodule TimelessLogs.Index do
   count is answered from per-term index counts plus a scan of only the
   time-boundary blocks. Otherwise falls back to the scanning query path.
   """
-  @spec count(keyword()) :: {:ok, non_neg_integer()}
+  @spec count(keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def count(filters) do
     db = :persistent_term.get({__MODULE__, :db})
     storage = :persistent_term.get({__MODULE__, :storage})
@@ -179,27 +181,32 @@ defmodule TimelessLogs.Index do
 
     boundary = TimelessLogs.HotTail.boundary()
 
+    prepared_filters = TimelessLogs.Filter.prepare(search_filters)
+
     {_tail_entries, tail_total, disk_time_filters} =
-      tail_partition(search_filters, time_filters, boundary, count_total: true, limit: 0)
+      tail_partition(prepared_filters, time_filters, boundary, count_total: true, limit: 0)
 
     disk_until = Keyword.fetch!(disk_time_filters, :until)
-    disk_search_filters = [{:until, disk_until} | search_filters]
+    disk_search_filters = tighten_until(prepared_filters, disk_until)
 
-    {:ok, disk_total} =
+    disk_result =
       if index_countable?(search_filters, terms) do
         count_via_index(db, storage, terms, disk_time_filters, disk_search_filters)
       else
         # query/1 sees until < boundary, so its own tail partition is
         # empty — no double count.
-        {:ok, %{total: total}} =
-          search_filters
-          |> Keyword.merge(until: disk_until, limit: 1, count_total: true)
-          |> query()
-
-        {:ok, total}
+        case search_filters
+             |> Keyword.merge(until: disk_until, limit: 1, count_total: true)
+             |> query() do
+          {:ok, %{total: total}} -> {:ok, total}
+          {:error, _} = error -> error
+        end
       end
 
-    {:ok, disk_total + tail_total}
+    case disk_result do
+      {:ok, disk_total} -> {:ok, disk_total + tail_total}
+      {:error, _} = error -> error
+    end
   end
 
   defp index_countable?(search_filters, terms) do
@@ -257,7 +264,10 @@ defmodule TimelessLogs.Index do
 
     scan_blocks = Enum.map(scan_rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
 
-    {:ok, covered_total + scan_count(scan_blocks, db, storage, search_filters)}
+    case scan_count(scan_blocks, db, storage, search_filters) do
+      {:ok, scanned_total} -> {:ok, covered_total + scanned_total}
+      {:error, _} = error -> error
+    end
   end
 
   defp time_cond(nil, _op), do: []
@@ -266,11 +276,12 @@ defmodule TimelessLogs.Index do
   defp and_clause([]), do: "1 = 1"
   defp and_clause(conds), do: Enum.join(conds, " AND ")
 
-  defp scan_count([], _db, _storage, _search_filters), do: 0
+  defp scan_count([], _db, _storage, _search_filters), do: {:ok, 0}
 
   defp scan_count(blocks, db, storage, search_filters) do
-    blocks
-    |> Task.async_stream(
+    Task.Supervisor.async_stream_nolink(
+      TimelessLogs.FlushSupervisor,
+      blocks,
       fn {block_id, file_path, format} ->
         read_result =
           case storage do
@@ -293,9 +304,19 @@ defmodule TimelessLogs.Index do
         end
       end,
       max_concurrency: TimelessLogs.Config.query_concurrency(),
-      ordered: false
+      ordered: false,
+      timeout: TimelessLogs.Config.query_timeout(),
+      on_timeout: :kill_task
     )
-    |> Enum.reduce(0, fn {:ok, n}, acc -> acc + n end)
+    |> Enum.reduce_while({:ok, 0}, fn
+      {:ok, n}, acc ->
+        {:ok, total} = acc
+        {:cont, {:ok, total + n}}
+
+      {:exit, reason}, _acc ->
+        task_error(:count, reason)
+        {:halt, {:error, {:query_task_failed, reason}}}
+    end)
   end
 
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
@@ -391,7 +412,7 @@ defmodule TimelessLogs.Index do
           [integer()],
           [{TimelessLogs.Writer.block_meta(), [map()], [String.t()]}],
           {non_neg_integer(), non_neg_integer()}
-        ) :: :ok
+        ) :: :ok | {:error, term()}
   def compact_blocks(old_block_ids, new_terms_list, compression_sizes \\ {0, 0}) do
     GenServer.call(
       __MODULE__,
@@ -405,7 +426,7 @@ defmodule TimelessLogs.Index do
     GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
   end
 
-  @spec sync() :: :ok
+  @spec sync() :: :ok | {:error, term()}
   def sync, do: GenServer.call(__MODULE__, :sync, TimelessLogs.Config.query_timeout())
 
   # --- GenServer callbacks ---
@@ -442,8 +463,8 @@ defmodule TimelessLogs.Index do
   @impl true
   def handle_call({:index_block, meta, _entries, terms}, _from, state) do
     state = flush_pending(state)
-    do_index_block(state.db, state.storage, meta, terms)
-    {:reply, :ok, state}
+    result = do_index_block(state.db, state.storage, meta, terms)
+    {:reply, result, state}
   end
 
   def handle_call({:delete_before, cutoff}, _from, state) do
@@ -494,7 +515,7 @@ defmodule TimelessLogs.Index do
         []
       end
 
-    {:ok, _} =
+    transaction_result =
       TimelessLogs.DB.write_transaction(state.db, fn conn ->
         # Delete old blocks
         if old_block_ids != [] do
@@ -538,27 +559,45 @@ defmodule TimelessLogs.Index do
         update_compression_stats_sql(conn, raw_in, compressed_out)
       end)
 
-    # Delete old disk files outside the transaction
-    if state.storage == :disk do
-      Enum.each(old_file_paths, &File.rm/1)
-    end
+    case transaction_result do
+      {:ok, _} ->
+        # Delete old disk files only after the replacement is committed.
+        if state.storage == :disk do
+          Enum.each(old_file_paths, &File.rm/1)
+        end
 
-    {:reply, :ok, state}
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        report_write_error(:compact_blocks, reason)
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:backup, target_path}, _from, state) do
     state = flush_pending(state)
 
-    case TimelessLogs.DB.backup(state.db, target_path) do
-      {:ok, _} -> {:reply, :ok, state}
-      error -> {:reply, error, state}
+    if state.pending == [] do
+      case TimelessLogs.DB.backup(state.db, target_path) do
+        {:ok, _} -> {:reply, :ok, state}
+        error -> {:reply, error, state}
+      end
+    else
+      {:reply, {:error, :pending_index_write_failed}, state}
     end
   end
 
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
-    TimelessLogs.DB.write(state.db, "PRAGMA wal_checkpoint(TRUNCATE)")
-    {:reply, :ok, state}
+
+    if state.pending == [] do
+      case TimelessLogs.DB.write(state.db, "PRAGMA wal_checkpoint(TRUNCATE)") do
+        {:ok, _} -> {:reply, :ok, state}
+        {:error, _} = error -> {:reply, error, state}
+      end
+    else
+      {:reply, {:error, :pending_index_write_failed}, state}
+    end
   end
 
   # --- handle_cast ---
@@ -650,19 +689,25 @@ defmodule TimelessLogs.Index do
   defp block_path_reason({:error, reason}), do: reason
 
   defp do_index_block(db, storage, meta, terms) do
-    {:ok, _} =
-      TimelessLogs.DB.write_transaction(db, fn conn ->
-        insert_block_sql(conn, meta)
-        insert_terms_sql(conn, terms, meta.block_id)
+    case TimelessLogs.DB.write_transaction(db, fn conn ->
+           insert_block_sql(conn, meta)
+           insert_terms_sql(conn, terms, meta.block_id)
 
-        if storage == :memory and meta[:data] do
-          TimelessLogs.DB.execute(
-            conn,
-            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
-            [meta.block_id, meta[:data]]
-          )
-        end
-      end)
+           if storage == :memory and meta[:data] do
+             TimelessLogs.DB.execute(
+               conn,
+               "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+               [meta.block_id, meta[:data]]
+             )
+           end
+         end) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        report_write_error(:index_block, reason)
+        {:error, reason}
+    end
   end
 
   defp insert_block_sql(conn, meta) do
@@ -733,20 +778,13 @@ defmodule TimelessLogs.Index do
         cutoff
       ])
 
-    TimelessLogs.HotTail.prune_before(cutoff)
-
     if rows == [] do
+      TimelessLogs.HotTail.prune_before(cutoff)
       0
     else
       block_ids = Enum.map(rows, fn [bid, _fp] -> bid end)
       file_paths = for [_bid, fp] <- rows, is_binary(fp), do: fp
-      delete_block_set(db, block_ids)
-
-      if storage == :disk do
-        Enum.each(file_paths, &File.rm/1)
-      end
-
-      length(block_ids)
+      finish_block_deletion(db, block_ids, file_paths, storage, cutoff)
     end
   end
 
@@ -778,14 +816,7 @@ defmodule TimelessLogs.Index do
         block_ids = Enum.map(to_delete, fn {bid, _fp, _ts} -> bid end)
         file_paths = for {_bid, fp, _ts} <- to_delete, is_binary(fp), do: fp
         max_ts = to_delete |> Enum.map(fn {_bid, _fp, ts} -> ts end) |> Enum.max()
-        delete_block_set(db, block_ids)
-        TimelessLogs.HotTail.prune_before(max_ts + 1)
-
-        if storage == :disk do
-          Enum.each(file_paths, &File.rm/1)
-        end
-
-        length(to_delete)
+        finish_block_deletion(db, block_ids, file_paths, storage, max_ts + 1)
       end
     end
   end
@@ -820,14 +851,7 @@ defmodule TimelessLogs.Index do
         block_ids = Enum.map(to_delete, fn {bid, _fp, _ts} -> bid end)
         file_paths = for {_bid, fp, _ts} <- to_delete, is_binary(fp), do: fp
         max_ts = to_delete |> Enum.map(fn {_bid, _fp, ts} -> ts end) |> Enum.max()
-        delete_block_set(db, block_ids)
-        TimelessLogs.HotTail.prune_before(max_ts + 1)
-
-        if storage == :disk do
-          Enum.each(file_paths, &File.rm/1)
-        end
-
-        length(to_delete)
+        finish_block_deletion(db, block_ids, file_paths, storage, max_ts + 1)
       end
     end
   end
@@ -835,22 +859,38 @@ defmodule TimelessLogs.Index do
   defp delete_block_set(db, block_ids) do
     ph = placeholders(block_ids)
 
-    {:ok, _} =
-      TimelessLogs.DB.write_transaction(db, fn conn ->
-        TimelessLogs.DB.execute(
-          conn,
-          "DELETE FROM term_index WHERE block_id IN (#{ph})",
-          block_ids
-        )
+    TimelessLogs.DB.write_transaction(db, fn conn ->
+      TimelessLogs.DB.execute(
+        conn,
+        "DELETE FROM term_index WHERE block_id IN (#{ph})",
+        block_ids
+      )
 
-        TimelessLogs.DB.execute(
-          conn,
-          "DELETE FROM block_data WHERE block_id IN (#{ph})",
-          block_ids
-        )
+      TimelessLogs.DB.execute(
+        conn,
+        "DELETE FROM block_data WHERE block_id IN (#{ph})",
+        block_ids
+      )
 
-        TimelessLogs.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", block_ids)
-      end)
+      TimelessLogs.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", block_ids)
+    end)
+  end
+
+  defp finish_block_deletion(db, block_ids, file_paths, storage, tail_cutoff) do
+    case delete_block_set(db, block_ids) do
+      {:ok, _} ->
+        TimelessLogs.HotTail.prune_before(tail_cutoff)
+
+        if storage == :disk do
+          Enum.each(file_paths, &File.rm/1)
+        end
+
+        length(block_ids)
+
+      {:error, reason} ->
+        report_write_error(:delete_blocks, reason)
+        0
+    end
   end
 
   # --- SQL read helpers ---
@@ -949,7 +989,7 @@ defmodule TimelessLogs.Index do
         {[block_row | bp], term_rows ++ tp, data_rows ++ dp}
       end)
 
-    {:ok, _} =
+    transaction_result =
       TimelessLogs.DB.write_transaction(state.db, fn conn ->
         TimelessLogs.DB.execute_batch(
           conn,
@@ -974,20 +1014,27 @@ defmodule TimelessLogs.Index do
         end
       end)
 
-    # Entries are durable and visible now — credit the ingest gauge.
-    Enum.each(resolved, fn
-      {meta, _entries, _terms, shard} when is_integer(shard) ->
-        TimelessLogs.IngestPressure.sub(shard, meta.entry_count)
+    case transaction_result do
+      {:ok, _} ->
+        # Entries are durable and visible now — credit the ingest gauge.
+        Enum.each(resolved, fn
+          {meta, _entries, _terms, shard} when is_integer(shard) ->
+            TimelessLogs.IngestPressure.sub(shard, meta.entry_count)
 
-      _ ->
-        :ok
-    end)
+          _ ->
+            :ok
+        end)
 
-    if state.flush_timer do
-      Process.cancel_timer(state.flush_timer)
+        if state.flush_timer do
+          Process.cancel_timer(state.flush_timer)
+        end
+
+        %{state | pending: [], flush_timer: nil}
+
+      {:error, reason} ->
+        report_write_error(:flush_pending, reason)
+        schedule_index_flush(%{state | flush_timer: nil})
     end
-
-    %{state | pending: [], flush_timer: nil}
   end
 
   defp schedule_index_flush(%{flush_timer: nil} = state) do
@@ -1180,11 +1227,11 @@ defmodule TimelessLogs.Index do
       end
 
     boundary_until = Keyword.fetch!(disk_time_filters, :until)
-    disk_search_filters = [{:until, boundary_until} | search_filters]
+    disk_search_filters = tighten_until(search_filters, boundary_until)
 
-    {collected, disk_total, blocks_read} =
+    collection_result =
       if disk_need == 0 and not count_total do
-        {[], 0, 0}
+        {:ok, {[], 0, 0}}
       else
         block_ids = find_matching_blocks(db, term_filters, disk_time_filters, order)
 
@@ -1199,10 +1246,46 @@ defmodule TimelessLogs.Index do
         )
       end
 
+    case collection_result do
+      {:ok, {collected, disk_total, blocks_read}} ->
+        finish_query(
+          collected,
+          disk_total,
+          blocks_read,
+          tail_sorted,
+          tail_total,
+          limit,
+          offset,
+          order,
+          count_total,
+          need,
+          start_time,
+          search_filters
+        )
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp finish_query(
+         collected,
+         disk_total,
+         blocks_read,
+         tail_sorted,
+         tail_total,
+         limit,
+         offset,
+         order,
+         count_total,
+         need,
+         start_time,
+         search_filters
+       ) do
     sorted =
       case order do
-        :asc -> Enum.sort_by(collected ++ tail_sorted, & &1.timestamp, :asc)
-        :desc -> Enum.sort_by(tail_sorted ++ collected, & &1.timestamp, :desc)
+        :asc -> sort_entries(collected ++ tail_sorted, :asc)
+        :desc -> sort_entries(tail_sorted ++ collected, :desc)
       end
 
     total = disk_total + tail_total
@@ -1234,15 +1317,16 @@ defmodule TimelessLogs.Index do
     if storage == :disk and length(block_ids) > 1 do
       collect_parallel_early_exit(block_ids, search_filters, need, count_total, order)
     else
-      collect_sequential_early_exit(
-        block_ids,
-        db,
-        storage,
-        search_filters,
-        need,
-        count_total,
-        order
-      )
+      {:ok,
+       collect_sequential_early_exit(
+         block_ids,
+         db,
+         storage,
+         search_filters,
+         need,
+         count_total,
+         order
+       )}
     end
   end
 
@@ -1303,10 +1387,11 @@ defmodule TimelessLogs.Index do
 
     block_ids
     |> Enum.chunk_every(batch_size)
-    |> Enum.reduce_while({[], 0, 0}, fn batch, {acc, total, count} ->
-      batch_results =
-        batch
-        |> Task.async_stream(
+    |> Enum.reduce_while({:ok, {[], 0, 0}}, fn batch, {:ok, {acc, total, count}} ->
+      batch_result =
+        Task.Supervisor.async_stream_nolink(
+          TimelessLogs.FlushSupervisor,
+          batch,
           fn {_block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
@@ -1327,40 +1412,50 @@ defmodule TimelessLogs.Index do
             end
           end,
           max_concurrency: batch_size,
-          ordered: false
+          ordered: false,
+          timeout: TimelessLogs.Config.query_timeout(),
+          on_timeout: :kill_task
         )
-        |> Enum.flat_map(fn {:ok, entries} -> entries end)
-        |> sort_entries(order)
+        |> Enum.reduce_while({:ok, []}, fn
+          {:ok, entries}, {:ok, collected} ->
+            {:cont, {:ok, entries ++ collected}}
 
-      new_total = total + length(batch_results)
-      new_count = count + length(batch)
-      remaining = max(need - length(acc), 0)
-      new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
+          {:exit, reason}, _acc ->
+            task_error(:query, reason)
+            {:halt, {:error, {:query_task_failed, reason}}}
+        end)
 
-      result = {new_acc, new_total, new_count}
+      case batch_result do
+        {:ok, entries} ->
+          batch_results = sort_entries(entries, order)
+          new_total = total + length(batch_results)
+          new_count = count + length(batch)
+          remaining = max(need - length(acc), 0)
+          new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
 
-      if count_total or length(new_acc) < need do
-        {:cont, result}
-      else
-        {:halt, result}
+          result = {:ok, {new_acc, new_total, new_count}}
+
+          if count_total or length(new_acc) < need do
+            {:cont, result}
+          else
+            {:halt, result}
+          end
+
+        {:error, _} = error ->
+          {:halt, error}
       end
     end)
   end
 
-  defp sort_entries(entries, :asc), do: Enum.sort(entries, &entry_before?(&1, &2, :asc))
-  defp sort_entries(entries, :desc), do: Enum.sort(entries, &entry_before?(&1, &2, :desc))
-
-  defp entry_before?(left, right, :asc) do
-    left.timestamp < right.timestamp or
-      (left.timestamp == right.timestamp and entry_tie_key(left) <= entry_tie_key(right))
+  defp sort_entries(entries, :asc) do
+    Enum.sort_by(entries, &{&1.timestamp, &1.message, &1.level, &1.metadata})
   end
 
-  defp entry_before?(left, right, :desc) do
-    left.timestamp > right.timestamp or
-      (left.timestamp == right.timestamp and entry_tie_key(left) <= entry_tie_key(right))
+  # Keep the established tie ordering (timestamp descending, tie key
+  # ascending) while constructing the key only once per entry.
+  defp sort_entries(entries, :desc) do
+    Enum.sort_by(entries, &{-&1.timestamp, &1.message, &1.level, &1.metadata})
   end
-
-  defp entry_tie_key(entry), do: {entry.message, entry.level, entry.metadata}
 
   # --- Query building ---
 
@@ -1485,13 +1580,34 @@ defmodule TimelessLogs.Index do
 
   defp to_unix(ts), do: TimelessLogs.Timestamp.to_microseconds(ts)
 
-  defp to_format_atom("raw"), do: :raw
-  defp to_format_atom("zstd"), do: :zstd
-  defp to_format_atom("openzl"), do: :openzl
-  defp to_format_atom(:raw), do: :raw
-  defp to_format_atom(:zstd), do: :zstd
-  defp to_format_atom(:openzl), do: :openzl
-  defp to_format_atom(_), do: :zstd
+  defp to_format_atom(format), do: TimelessLogs.Writer.format_atom(format)
+
+  defp tighten_until(filters, boundary) do
+    filters
+    |> Keyword.delete(:until)
+    |> Keyword.put(:until, boundary)
+  end
+
+  defp task_error(operation, reason) do
+    TimelessLogs.Telemetry.event(
+      [:timeless_logs, :query, :task_error],
+      %{},
+      %{operation: operation, reason: reason}
+    )
+  end
+
+  defp report_write_error(operation, reason) do
+    Logger.error(
+      "TimelessLogs: index #{operation} transaction failed: #{inspect(reason)}",
+      timeless_logs_skip: true
+    )
+
+    TimelessLogs.Telemetry.event(
+      [:timeless_logs, :index, :write_error],
+      %{},
+      %{operation: operation, reason: reason}
+    )
+  end
 
   defp file_size(path) do
     case File.stat(path) do

@@ -38,7 +38,9 @@ defmodule TimelessLogs.Application do
       File.mkdir_p!(blocks_dir)
     end
 
-    TimelessLogs.IngestPressure.install(TimelessLogs.BufferShard.count())
+    shard_count = TimelessLogs.BufferShard.count()
+    TimelessLogs.BufferShard.install_names(shard_count)
+    TimelessLogs.IngestPressure.install(shard_count)
 
     [
       {Registry, keys: :duplicate, name: TimelessLogs.Registry},

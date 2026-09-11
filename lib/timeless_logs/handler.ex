@@ -21,6 +21,8 @@ defmodule TimelessLogs.Handler do
   def changing_config(:update, old, new), do: {:ok, Map.merge(old, new)}
 
   @spec log(map(), map()) :: :ok
+  def log(%{meta: %{timeless_logs_skip: true}}, _config), do: :ok
+
   def log(%{level: level, msg: msg, meta: meta}, _config) do
     # Canonical unit is microseconds; logger meta time is already µs.
     timestamp =

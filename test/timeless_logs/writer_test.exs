@@ -106,6 +106,12 @@ defmodule TimelessLogs.WriterTest do
     end
   end
 
+  test "stored block formats are normalized through a closed allowlist" do
+    assert TimelessLogs.Writer.format_atom("raw") == :raw
+    assert TimelessLogs.Writer.format_atom("openzl") == :openzl
+    assert TimelessLogs.Writer.format_atom("novel-client-format") == :zstd
+  end
+
   describe "openzl format" do
     test "writes openzl block to disk with .ozl extension" do
       entries = [
@@ -325,6 +331,21 @@ defmodule TimelessLogs.WriterTest do
       {:ok, meta} = TimelessLogs.Writer.write_block(entries, :memory, :openzl)
       {:ok, read_entries} = TimelessLogs.Writer.decompress_block(meta.data, :openzl)
       assert read_entries == entries
+    end
+
+    test "large columnar batches serialize and unpack without per-entry recursion" do
+      entries =
+        for i <- 1..10_000 do
+          %{
+            timestamp: 10_000 + i,
+            level: :info,
+            message: "batch-#{i}",
+            metadata: %{"batch" => div(i, 100)}
+          }
+        end
+
+      assert {:ok, compressed} = TimelessLogs.Writer.columnar_serialize(entries)
+      assert {:ok, ^entries} = TimelessLogs.Writer.decompress_block(compressed, :openzl)
     end
   end
 

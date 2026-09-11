@@ -335,6 +335,8 @@ config :logger, :default_handler, %{level: :debug}
 | `flush_interval` | `1_000` | Buffer flush interval in ms |
 | `max_buffer_size` | `1_000` | Max entries before auto-flush |
 | `query_timeout` | `30_000` | Query timeout in ms |
+| `query_concurrency` | half the online schedulers | Parallel block reads per query |
+| `field_scan_limit` | `100_000` | Entry sample cap for field discovery |
 | `compaction_format` | `:openzl` | Compression format (`:openzl` or `:zstd`) |
 | `openzl_compression_level` | `9` | OpenZL compression level (1-22) |
 | `zstd_compression_level` | `3` | Zstd compression level (1-22) |

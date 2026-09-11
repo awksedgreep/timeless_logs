@@ -117,6 +117,38 @@ defmodule TimelessLogs.HotTailTest do
     assert size <= 100
   end
 
+  test "bounded selective takes preserve range and order across ETS chunks" do
+    base = System.os_time(:microsecond) - 1_000_000
+
+    rows =
+      for i <- 1..12_000 do
+        %{
+          timestamp: base + i,
+          level: if(rem(i, 2_000) == 0, do: :error, else: :info),
+          message: "selective #{i}",
+          metadata: %{"service" => "selective"}
+        }
+      end
+
+    TimelessLogs.HotTail.insert_many(rows)
+
+    taken =
+      TimelessLogs.HotTail.take(
+        [level: :error, metadata: %{"service" => "selective"}],
+        base + 1,
+        base + 12_000,
+        :desc,
+        4
+      )
+
+    assert Enum.map(taken, & &1.message) == [
+             "selective 12000",
+             "selective 10000",
+             "selective 8000",
+             "selective 6000"
+           ]
+  end
+
   test "retention purge removes tail entries too" do
     TimelessLogs.ingest(entries(20, "doomed"))
     :ok = TimelessLogs.flush()

@@ -237,6 +237,20 @@ defmodule TimelessLogs.HTTPTest do
       assert :json.decode(hd(lines))["_msg"] == "error boom"
     end
 
+    test "returns a client error for invalid levels and logical operators" do
+      for query_text <- ["level:foo", ~s("one" OR "two")] do
+        query = URI.encode_query(%{"query" => query_text})
+
+        resp =
+          post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
+
+        assert resp.status == 400
+
+        assert json_body(resp)["message"] =~
+                 if(query_text == "level:foo", do: "level", else: "or")
+      end
+    end
+
     test "stats count query returns total" do
       query = URI.encode_query(%{"query" => "* | stats count() as total"})
 
@@ -246,6 +260,46 @@ defmodule TimelessLogs.HTTPTest do
       assert resp.status == 200
       body = :json.decode(resp.body)
       assert body["total"] == 3
+    end
+
+    test "groups a count by an extracted field" do
+      :ok =
+        TimelessLogs.ingest([
+          %{
+            timestamp: System.os_time(:microsecond),
+            level: :info,
+            message: "MAC: aa, ciaddr 1",
+            metadata: %{}
+          },
+          %{
+            timestamp: System.os_time(:microsecond),
+            level: :info,
+            message: "MAC: aa, ciaddr 2",
+            metadata: %{}
+          },
+          %{
+            timestamp: System.os_time(:microsecond),
+            level: :info,
+            message: "MAC: bb, ciaddr 3",
+            metadata: %{}
+          }
+        ])
+
+      query_text = ~s{* | extract "MAC: <mac>, ciaddr" from _msg | stats by (mac) count() as n}
+      query = URI.encode_query(%{"query" => query_text})
+
+      resp =
+        post("/select/logsql/query", query, content_type: "application/x-www-form-urlencoded")
+
+      assert resp.status == 200
+
+      assert resp.body
+             |> String.split("\n", trim: true)
+             |> Enum.map(&:json.decode/1)
+             |> Enum.sort_by(& &1["mac"]) == [
+               %{"mac" => "aa", "n" => 2},
+               %{"mac" => "bb", "n" => 1}
+             ]
     end
 
     test "respects limit pipe" do

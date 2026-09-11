@@ -92,6 +92,8 @@ defmodule TimelessLogs.HotTail do
         0
 
       {table, _floor} ->
+        search_filters = TimelessLogs.Filter.prepare(search_filters)
+
         safe(
           fn ->
             table
@@ -124,58 +126,35 @@ defmodule TimelessLogs.HotTail do
         []
 
       {table, _floor} ->
+        search_filters = TimelessLogs.Filter.prepare(search_filters)
+
         safe(
           fn ->
-            start_key =
+            selection =
               case order do
-                # :infinity compares greater than any integer uniq, so
-                # prev/next land on the edge key inside the range.
-                :desc ->
-                  case until_us do
-                    nil -> :ets.last(table)
-                    ts -> :ets.prev(table, {ts, :infinity})
-                  end
-
-                :asc ->
-                  case since_us do
-                    nil -> :ets.first(table)
-                    ts -> :ets.next(table, {ts - 1, :infinity})
-                  end
+                :desc -> :ets.select_reverse(table, range_spec(since_us, until_us), 5_000)
+                :asc -> :ets.select(table, range_spec(since_us, until_us), 5_000)
               end
 
-            walk(table, start_key, since_us, until_us, order, search_filters, max, [])
+            take_chunks(selection, search_filters, max, [])
           end,
           []
         )
     end
   end
 
-  defp walk(_table, :"$end_of_table", _since, _until, _order, _filters, _max, acc),
-    do: Enum.reverse(acc)
+  defp take_chunks(:"$end_of_table", _filters, _max, acc), do: Enum.reverse(acc)
+  defp take_chunks(_selection, _filters, 0, acc), do: Enum.reverse(acc)
 
-  defp walk(_table, _key, _since, _until, _order, _filters, 0, acc), do: Enum.reverse(acc)
+  defp take_chunks({chunk, continuation}, filters, max, acc) do
+    matches = chunk |> Enum.filter(&TimelessLogs.Filter.matches?(&1, filters)) |> Enum.take(max)
+    next_acc = Enum.reverse(matches, acc)
+    remaining = max - length(matches)
 
-  defp walk(table, {ts, _uniq} = key, since_us, until_us, order, filters, max, acc) do
-    out_of_range =
-      (order == :desc and since_us != nil and ts < since_us) or
-        (order == :asc and until_us != nil and ts > until_us)
-
-    if out_of_range do
-      Enum.reverse(acc)
+    if remaining == 0 do
+      Enum.reverse(next_acc)
     else
-      {acc, max} =
-        case :ets.lookup(table, key) do
-          [{^key, entry}] ->
-            if TimelessLogs.Filter.matches?(entry, filters),
-              do: {[entry | acc], max - 1},
-              else: {acc, max}
-
-          _ ->
-            {acc, max}
-        end
-
-      next_key = if order == :desc, do: :ets.prev(table, key), else: :ets.next(table, key)
-      walk(table, next_key, since_us, until_us, order, filters, max, acc)
+      take_chunks(:ets.select(continuation), filters, remaining, next_acc)
     end
   end
 
@@ -237,7 +216,7 @@ defmodule TimelessLogs.HotTail do
     over = :ets.info(table, :size) - cap
 
     if over > 0 do
-      case nth_key(table, :ets.first(table), over) do
+      case key_at_offset(table, over) do
         :"$end_of_table" ->
           :ok
 
@@ -265,9 +244,21 @@ defmodule TimelessLogs.HotTail do
     end
   end
 
-  defp nth_key(_table, key, 0), do: key
-  defp nth_key(_table, :"$end_of_table", _n), do: :"$end_of_table"
-  defp nth_key(table, key, n), do: nth_key(table, :ets.next(table, key), n - 1)
+  defp key_at_offset(table, offset) do
+    limit = min(offset + 1, 5_000)
+    selection = :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], limit)
+    key_at_offset_chunks(selection, offset)
+  end
+
+  defp key_at_offset_chunks(:"$end_of_table", _offset), do: :"$end_of_table"
+
+  defp key_at_offset_chunks({keys, continuation}, offset) do
+    if offset < length(keys) do
+      Enum.at(keys, offset)
+    else
+      key_at_offset_chunks(:ets.select(continuation), offset - length(keys))
+    end
+  end
 
   defp range_spec(since_us, until_us) do
     guards =
