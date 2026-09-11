@@ -3,6 +3,14 @@
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.2 (2026-09-11)
+
+**Pagination is stable across scheduler counts.** Parallel legacy-store reads
+now retain the globally best bounded result set across worker batches and only
+stop once the timestamp bounds of every remaining block cannot change it.
+Equal-timestamp pages therefore have the same contents with or without exact
+total counting, including on low-core hosts.
+
 ## 1.11.1 (2026-09-11)
 
 **The storage hot path is bounded and failure-aware.** libSQL reads fan out

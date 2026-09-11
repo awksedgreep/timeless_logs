@@ -325,7 +325,12 @@ defmodule TimelessLogs.Index do
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :asc)
-    find_matching_blocks(db, term_filters, time_filters, order)
+
+    db
+    |> find_matching_blocks(term_filters, time_filters, order)
+    |> Enum.map(fn {block_id, file_path, format, _ts_min, _ts_max} ->
+      {block_id, file_path, format}
+    end)
   end
 
   @spec raw_block_stats() :: %{
@@ -898,13 +903,20 @@ defmodule TimelessLogs.Index do
   defp find_matching_blocks(db, term_filters, time_filters, order) do
     terms = build_query_terms(term_filters)
     order_dir = if order == :asc, do: "ASC", else: "DESC"
+    order_bound = if order == :asc, do: "ts_min", else: "ts_max"
 
     {conditions, params} = build_block_conditions(terms, time_filters)
     where = if conditions == [], do: "", else: " WHERE " <> Enum.join(conditions, " AND ")
-    sql = "SELECT block_id, file_path, format FROM blocks#{where} ORDER BY ts_min #{order_dir}"
+
+    sql =
+      "SELECT block_id, file_path, format, ts_min, ts_max FROM blocks#{where} " <>
+        "ORDER BY #{order_bound} #{order_dir}, block_id ASC"
 
     {:ok, rows} = TimelessLogs.DB.read(db, sql, params)
-    Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
+
+    Enum.map(rows, fn [bid, fp, fmt, ts_min, ts_max] ->
+      {bid, fp, to_format_atom(fmt), ts_min, ts_max}
+    end)
   end
 
   defp build_block_conditions(terms, time_filters) do
@@ -1339,46 +1351,48 @@ defmodule TimelessLogs.Index do
          count_total,
          order
        ) do
-    Enum.reduce_while(block_ids, {[], 0, 0}, fn {block_id, file_path, format},
-                                                {acc, total, count} ->
-      format_atom = to_format_atom(format)
+    block_ids
+    |> pair_with_next()
+    |> Enum.reduce_while({[], 0, 0}, fn
+      {{block_id, file_path, format, _ts_min, _ts_max}, next_block}, {acc, total, count} ->
+        format_atom = to_format_atom(format)
 
-      read_result =
-        case storage do
-          :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
-          :memory -> read_block_from_db(db, block_id)
-        end
-
-      case read_result do
-        {:ok, entries} ->
-          filtered =
-            entries
-            |> TimelessLogs.Filter.filter(search_filters)
-            |> Enum.map(&TimelessLogs.Entry.from_map/1)
-            |> sort_entries(order)
-
-          new_total = total + length(filtered)
-          new_count = count + 1
-          remaining = max(need - length(acc), 0)
-          new_acc = if remaining > 0, do: acc ++ Enum.take(filtered, remaining), else: acc
-
-          result = {new_acc, new_total, new_count}
-
-          if count_total or length(new_acc) < need do
-            {:cont, result}
-          else
-            {:halt, result}
+        read_result =
+          case storage do
+            :disk -> TimelessLogs.Writer.read_block(file_path, format_atom)
+            :memory -> read_block_from_db(db, block_id)
           end
 
-        {:error, reason} ->
-          TimelessLogs.Telemetry.event(
-            [:timeless_logs, :block, :error],
-            %{},
-            %{file_path: file_path, reason: reason}
-          )
+        result =
+          case read_result do
+            {:ok, entries} ->
+              filtered =
+                entries
+                |> TimelessLogs.Filter.filter(search_filters)
+                |> Enum.map(&TimelessLogs.Entry.from_map/1)
 
-          {:cont, {acc, total, count + 1}}
-      end
+              new_total = total + length(filtered)
+              new_count = count + 1
+              new_acc = retain_best_entries(acc, filtered, need, order)
+              {new_acc, new_total, new_count}
+
+            {:error, reason} ->
+              TimelessLogs.Telemetry.event(
+                [:timeless_logs, :block, :error],
+                %{},
+                %{file_path: file_path, reason: reason}
+              )
+
+              {acc, total, count + 1}
+          end
+
+        remaining = if next_block, do: [next_block], else: []
+
+        if continue_block_scan?(remaining, result, need, count_total, order) do
+          {:cont, result}
+        else
+          {:halt, result}
+        end
     end)
   end
 
@@ -1387,12 +1401,13 @@ defmodule TimelessLogs.Index do
 
     block_ids
     |> Enum.chunk_every(batch_size)
-    |> Enum.reduce_while({:ok, {[], 0, 0}}, fn batch, {:ok, {acc, total, count}} ->
+    |> pair_with_next()
+    |> Enum.reduce_while({:ok, {[], 0, 0}}, fn {batch, next_batch}, {:ok, {acc, total, count}} ->
       batch_result =
         Task.Supervisor.async_stream_nolink(
           TimelessLogs.FlushSupervisor,
           batch,
-          fn {_block_id, file_path, format} ->
+          fn {_block_id, file_path, format, _ts_min, _ts_max} ->
             format_atom = to_format_atom(format)
 
             case TimelessLogs.Writer.read_block(file_path, format_atom) do
@@ -1427,15 +1442,14 @@ defmodule TimelessLogs.Index do
 
       case batch_result do
         {:ok, entries} ->
-          batch_results = sort_entries(entries, order)
-          new_total = total + length(batch_results)
+          new_total = total + length(entries)
           new_count = count + length(batch)
-          remaining = max(need - length(acc), 0)
-          new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
+          new_acc = retain_best_entries(acc, entries, need, order)
+          bounded_result = {new_acc, new_total, new_count}
+          result = {:ok, bounded_result}
+          remaining = next_batch || []
 
-          result = {:ok, {new_acc, new_total, new_count}}
-
-          if count_total or length(new_acc) < need do
+          if continue_block_scan?(remaining, bounded_result, need, count_total, order) do
             {:cont, result}
           else
             {:halt, result}
@@ -1446,6 +1460,42 @@ defmodule TimelessLogs.Index do
       end
     end)
   end
+
+  defp pair_with_next([]), do: []
+  defp pair_with_next(items), do: Enum.zip(items, tl(items) ++ [nil])
+
+  defp retain_best_entries(acc, entries, need, order) do
+    (acc ++ entries)
+    |> sort_entries(order)
+    |> Enum.take(need)
+  end
+
+  defp continue_block_scan?(_remaining, _result, _need, true, _order), do: true
+  defp continue_block_scan?([], _result, _need, false, _order), do: false
+
+  defp continue_block_scan?(
+         remaining,
+         {acc, _total, _count},
+         need,
+         false,
+         order
+       ) do
+    length(acc) < need or remaining_blocks_may_displace?(remaining, List.last(acc), order)
+  end
+
+  defp remaining_blocks_may_displace?(
+         [{_id, _path, _format, ts_min, _ts_max} | _],
+         worst,
+         :asc
+       ),
+       do: ts_min <= worst.timestamp
+
+  defp remaining_blocks_may_displace?(
+         [{_id, _path, _format, _ts_min, ts_max} | _],
+         worst,
+         :desc
+       ),
+       do: ts_max >= worst.timestamp
 
   defp sort_entries(entries, :asc) do
     Enum.sort_by(entries, &{&1.timestamp, &1.message, &1.level, &1.metadata})
