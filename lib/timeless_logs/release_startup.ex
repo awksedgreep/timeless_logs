@@ -319,10 +319,6 @@ defmodule TimelessLogs.ReleaseStartup do
               {:error, reason} ->
                 {:state, :corruption,
                  %{error: "cannot validate #{role} logs database: #{inspect(reason)}", path: path}}
-
-              other ->
-                {:state, :corruption,
-                 %{error: "invalid #{role} logs database: #{inspect(other)}", path: path}}
             end
           after
             Exqlite.Sqlite3.close(conn)
