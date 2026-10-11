@@ -3,6 +3,16 @@
 This changelog starts at 1.5.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.3 (2026-10-11)
+
+**Release startup checks a store's integrity before loading the extension,
+and once.** `ReleaseStartup.prepare/2` ran `PRAGMA integrity_check` with the
+extension loaded, which connects the virtual table and so opens the engine,
+and `stats/2` then ran the whole detection again. The pragma now runs
+before the extension is loaded, and `stats/2` skips it: the same pages are
+checked, once. The same change in timeless_metrics took its startup check
+from 24.6 s to 2.65 s on a 3.1 GB store (awksedgreep/timeless_metrics#19).
+
 ## 1.11.2 (2026-09-11)
 
 **Pagination is stable across scheduler counts.** Parallel legacy-store reads
